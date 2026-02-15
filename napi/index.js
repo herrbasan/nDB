@@ -76,14 +76,17 @@ function findNativeBinary() {
   }
   
   throw new Error(
-    `Native binary not found. Searched:\n` +
+    `Native binary not found. The native module must be built after cloning.\n\n` +
+    `Searched:\n` +
     searchPaths.map(p => `  - ${p}`).join('\n') +
-    `\n\nBuild instructions:\n` +
+    `\n\nTo build, run:\n` +
+    `  cd ndb/napi && node setup.js\n` +
+    `\nOr manually:\n` +
     `  cargo build --release -p ndb-node\n` +
-    `\nThen either:\n` +
-    `  - Copy target/release/ndb_node.dll to ${binaryName}\n` +
-    `  - Or create a symlink\n` +
-    `  - Or set NODE_NDB_NATIVE_PATH environment variable`
+    `  copy target/release/ndb_node.dll napi/${binaryName}  (Windows)\n` +
+    `  ln -s target/release/libndb_node.so napi/${binaryName}  (Linux)\n` +
+    `\nYou can also set the environment variable:\n` +
+    `  NODE_NDB_NATIVE_PATH=/path/to/native/binary`
   );
 }
 

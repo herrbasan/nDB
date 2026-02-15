@@ -9,9 +9,9 @@ Native Node.js bindings for nDB - a high-performance embedded vector database.
 git submodule add https://github.com/ndb/ndb.git ndb
 git submodule update --init --recursive
 
-# Build the native module
-cd ndb
-cargo build --release -p ndb-node
+# Build the native module (REQUIRED - binary is not committed)
+cd ndb/napi
+node setup.js
 
 # For Windows: copy/symlink the DLL to the expected name
 copy target\release\ndb_node.dll napi\ndb-node.win32-x64-msvc.node
@@ -186,6 +186,8 @@ your-project/
 
 - Node.js >= 16
 - Rust >= 1.75
+
+> **Note:** The native binary (`*.node`) is not committed to git. You must run `node setup.js` after cloning or pulling updates.
 - For Windows: Visual Studio Build Tools or MSVC
 - For Linux: GCC/Clang
 - For macOS: Xcode Command Line Tools
