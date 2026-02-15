@@ -8,7 +8,11 @@ New to nDB? Start here:
 
 1. **[User Guide](user-guide.md)** - Complete API reference and usage examples
 2. **[Integration Guide](integration-guide.md)** - Production integration patterns
-3. **[Examples](../examples/)** - Working code examples
+3. **[Integrations](./integrations/)** - Language/environment specific guides
+   - [N-API (Node.js native)](./integrations/napi.md) - Maximum performance for Node.js
+   - [WebAssembly](./integrations/wasm.md) - Browser and Edge compatibility
+   - [gRPC](./integrations/grpc.md) - Multi-language and distributed systems
+4. **[Examples](../examples/)** - Working code examples
 
 ## Documentation Index
 
@@ -18,12 +22,14 @@ New to nDB? Start here:
 |----------|-------------|
 | [User Guide](user-guide.md) | Complete API reference, configuration, best practices |
 | [Integration Guide](integration-guide.md) | Integration patterns, platform setup, deployment |
+| [Integrations](./integrations/) | Language-specific integration guides (Node.js, WASM, gRPC) |
 | [Test Documentation](test-documentation.md) | Test suite documentation |
 
 ### Architecture & Design
 
 | Document | Description |
 |----------|-------------|
+| [Scope and Boundaries](scope-and-boundaries.md) | What nDB is and isn't (no embedding generation) |
 | [ADR 001: LSM-Lite Storage](adr/001-lsm-lite-storage.md) | Storage architecture decisions |
 | [ADR 002: HNSW Index](adr/002-hnsw-index.md) | Approximate search design |
 | [ADR 003: SIMD Distance](adr/003-simd-distance.md) | SIMD computation choices |
