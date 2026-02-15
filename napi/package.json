@@ -1,0 +1,21 @@
+{
+  "name": "ndb-node",
+  "version": "0.1.0",
+  "description": "Node.js native bindings for nDB - high-performance embedded vector database (git submodule version)",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ndb/ndb.git"
+  },
+  "keywords": [
+    "vector",
+    "database",
+    "embedding",
+    "native"
+  ],
+  "engines": {
+    "node": ">= 16"
+  }
+}

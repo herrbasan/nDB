@@ -49,7 +49,7 @@ use serde_json::Value;
 ///
 /// If a filter references a field that doesn't exist in the document's
 /// payload, the filter evaluates to `false` and the document is excluded.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Filter {
     /// Equality: field == value
     Eq { field: String, value: Value },
@@ -65,6 +65,9 @@ pub enum Filter {
 
     /// Less than or equal: field <= value
     Lte { field: String, value: Value },
+
+    /// Not equal: field != value
+    Ne { field: String, value: Value },
 
     /// In array: field IN values
     In { field: String, values: Vec<Value> },
@@ -127,6 +130,14 @@ impl Filter {
     /// Create a less-than-or-equal filter.
     pub fn lte(field: impl Into<String>, value: impl Into<Value>) -> Self {
         Self::Lte {
+            field: field.into(),
+            value: value.into(),
+        }
+    }
+
+    /// Create a not-equal filter.
+    pub fn ne(field: impl Into<String>, value: impl Into<Value>) -> Self {
+        Self::Ne {
             field: field.into(),
             value: value.into(),
         }
@@ -230,6 +241,12 @@ impl Filter {
                         let cmp = compare_values(field_value, value);
                         cmp == Some(Ordering::Less) || cmp == Some(Ordering::Equal)
                     }
+                    None => false,
+                }
+            }
+            Self::Ne { field, value } => {
+                match get_field(payload, field) {
+                    Some(field_value) => !values_equal(field_value, value),
                     None => false,
                 }
             }

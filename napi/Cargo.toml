@@ -1,0 +1,35 @@
+[package]
+name = "ndb-node"
+version = "0.1.0"
+edition = "2021"
+authors = ["nDB Contributors"]
+description = "Node.js native bindings for nDB - high-performance vector database"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ndb/ndb"
+keywords = ["vector", "database", "embedding", "nodejs", "native"]
+categories = ["database", "external-ffi-bindings"]
+rust-version = "1.75"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# napi-rs for Node.js bindings
+napi = { version = "2.16", default-features = false, features = ["napi8", "serde-json", "tokio_rt"] }
+napi-derive = "2.16"
+
+# Core nDB library
+ndb = { path = ".." }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Build dependencies removed for MSRV 1.75 compatibility
+# napi-build = "2.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
