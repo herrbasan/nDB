@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target
+
+# Rust/Cargo specific
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test data (if generated)
+/test_data/
+*.ndb
+*.log
+*.hnsw
+
+# rustup-init.exe (downloaded tool)
+rustup-init.exe

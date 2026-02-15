@@ -1,0 +1,57 @@
+[package]
+name = "ndb"
+version = "0.1.0"
+edition = "2021"
+authors = ["nDB Contributors"]
+description = "High-performance embedded vector database"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ndb/ndb"
+keywords = ["vector", "database", "embedding", "simd", "hnsw"]
+categories = ["database", "data-structures"]
+rust-version = "1.75"
+
+[dependencies]
+memmap2 = "0.9"
+rkyv = { version = "0.7", features = ["validation"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+arc-swap = "1.6"
+wide = "0.7"
+thiserror = "1.0"
+crc32fast = "1.3"
+parking_lot = "0.12"
+blake3 = "1.5"
+byteorder = "1.5"
+bincode = "1.3"
+fastrand = "2.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.4"
+tempfile = "3.9"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+debug = true
+
+[[bench]]
+name = "bench_search"
+harness = false
+
+[[bench]]
+name = "bench_insert"
+harness = false
+
+[[bench]]
+name = "bench_recovery"
+harness = false
