@@ -1,4 +1,4 @@
-// Type definitions for @ngdb/ndb
+// Type definitions for ndb
 // Human-readable document database for the AI age
 // Part of the nGDB platform ecosystem.
 //

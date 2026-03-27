@@ -1,13 +1,11 @@
 # nDB Node.js API Reference
 
-> Complete API documentation for the `@ngdb/ndb` Node.js native addon.
-
----
+> Complete API documentation for the `ndb` Node.js native addon.---
 
 ## Installation
 
 ```bash
-npm install @ngdb/ndb
+npm install ndb
 ```
 
 The package includes prebuilt native binaries for:
@@ -20,7 +18,7 @@ The package includes prebuilt native binaries for:
 ## Quick Start
 
 ```js
-const { Database } = require('@ngdb/ndb');
+const { Database } = require('ndb');
 
 // Open a database
 const db = new Database('./mydata.jsonl');

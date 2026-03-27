@@ -107,7 +107,7 @@ try {
  * nDB Database - Human-readable document database.
  *
  * ```js
- * const { Database } = require('@ngdb/ndb');
+ * const { Database } = require('ndb');
  * const db = Database.open('./my-data');
  * const id = db.insert({ title: 'Hello World' });
  * ```

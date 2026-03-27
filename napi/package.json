@@ -1,7 +1,7 @@
 {
-  "name": "@ngdb/ndb",
+  "name": "ndb",
   "version": "0.1.0",
-  "description": "Human-readable document database for the AI age. Part of the nGDB platform ecosystem.",
+  "description": "Human-readable document database for the AI age. Standalone embeddable database for Node.js and Electron.",
   "main": "index.js",
   "types": "index.d.ts",
   "scripts": {

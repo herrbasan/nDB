@@ -2,7 +2,7 @@
 
 > Human-readable document database for the AI age.
 
-nDB is an **in-memory document database** with JSON Lines persistence, layered query API, and and file bucket support. Part of the [nGDB](https://github.com/nickel-org/ngdb) platform ecosystem.
+nDB is an **in-memory document database** with JSON Lines persistence, layered query API, and file bucket support. Standalone embeddable database for Node.js and Electron applications.
 
 ## Features
 
@@ -42,7 +42,7 @@ db.restore(&id)?;
 
 ### Node.js
 ```js
-const { Database } = require('@ngdb/ndb');
+const { Database } = require('ndb');
 
 const db = new Database('./mydata.jsonl');
 
