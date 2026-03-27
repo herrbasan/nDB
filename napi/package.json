@@ -1,0 +1,36 @@
+{
+  "name": "@ngdb/ndb",
+  "version": "0.1.0",
+  "description": "Human-readable document database for the AI age. Part of the nGDB platform ecosystem.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "setup": "node setup.js",
+    "build": "cargo build --release -p ndb-node",
+    "test": "node test/test-napi.js"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "setup.js",
+    "prebuilds/*.node",
+    "src/*.rs",
+    "Cargo.toml",
+    "build.rs"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/herrbasan/nDB.git"
+  },
+  "keywords": [
+    "document",
+    "database",
+    "json",
+    "embedded",
+    "native"
+  ],
+  "engines": {
+    "node": ">= 16"
+  }
+}
