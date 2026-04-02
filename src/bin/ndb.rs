@@ -318,7 +318,7 @@ fn handle_export(args: &[String]) {
     let snapshot_json = format!(
         "{{\n  \"type\": \"ndb\",\n  \"version\": 1,\n  \"timestamp\": {},\n  \"original_path\": \"{}\"\n}}\n",
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
-        src_path.display()
+        src_path.display().to_string().replace('\\', "\\\\")
     );
     
     if let Err(e) = fs::write(dest_path.join("snapshot.json"), snapshot_json) {
