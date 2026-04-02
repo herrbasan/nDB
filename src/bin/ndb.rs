@@ -138,12 +138,27 @@ fn handle_init(args: &[String]) {
     println!("Destroyed database at {}", path.display());
     process::exit(EXIT_SUCCESS);
 }
+use std::io::Write;
+
 fn handle_destroy(args: &[String]) {
-    if args.len() < 2 || args[1] != "--force" {
-        eprintln!("Usage: ndb destroy <path> --force");
+    if args.is_empty() {
+        eprintln!("Usage: ndb destroy <path> [--force]");
         process::exit(EXIT_GENERAL_ERROR);
     }
+    
     let path = Path::new(&args[0]);
+    let force = args.len() > 1 && args[1] == "--force";
+
+    if !force {
+        print!("Are you sure you want to permanently destroy the database at {}? Type 'yes' to confirm: ", path.display());
+        std::io::stdout().flush().unwrap();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+        if input.trim() != "yes" {
+            eprintln!("Aborted.");
+            process::exit(EXIT_GENERAL_ERROR);
+        }
+    }
     if !path.join("meta.json").exists() {
         eprintln!("Error: Target is not a valid nDB folder.");
         process::exit(EXIT_GENERAL_ERROR);
