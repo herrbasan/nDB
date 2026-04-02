@@ -149,6 +149,11 @@ fn handle_destroy(args: &[String]) {
         process::exit(EXIT_GENERAL_ERROR);
     }
 
+    if path.join(".lock").exists() {
+        eprintln!("Error: Database is currently active and locked. Please stop the database before destroying.");
+        process::exit(EXIT_LOCKED);
+    }
+
     if let Err(e) = fs::remove_dir_all(path) {
         eprintln!("Failed to destroy database: {}", e);
         process::exit(EXIT_GENERAL_ERROR);
