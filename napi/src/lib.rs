@@ -7,9 +7,61 @@
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use ndb::{Database as RustDatabase, Persistence, SortDir, QueryOptions};
+
+// ─── Async Tasks ───────────────────────────────────────────────
+
+pub struct CompactTask {
+    db: Arc<RustDatabase>,
+}
+
+#[napi]
+impl Task for CompactTask {
+    type Output = ();
+    type JsValue = ();
+    fn compute(&mut self) -> Result<Self::Output> {
+         self.db.compact().map_err(|e| Error::from_reason(format!("Compact failed: {}", e)))
+    }
+    fn resolve(&mut self, _env: Env, _output: Self::Output) -> Result<Self::JsValue> {
+         Ok(())
+    }
+}
+
+pub struct QueryTask {
+    db: Arc<RustDatabase>,
+    ast: serde_json::Value,
+}
+
+#[napi]
+impl Task for QueryTask {
+    type Output = Vec<serde_json::Value>;
+    type JsValue = String;
+    fn compute(&mut self) -> Result<Self::Output> {
+        Ok(self.db.query(self.ast.clone()))
+    }
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        serde_json::to_string(&output).map_err(|e| Error::from_reason(format!("Serialization failed: {}", e)))
+    }
+}
+
+pub struct ExportTask {
+    db: Arc<RustDatabase>,
+    dest: std::path::PathBuf,
+}
+
+#[napi]
+impl Task for ExportTask {
+    type Output = ();
+    type JsValue = ();
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.db.export_snapshot(&self.dest).map_err(|e| Error::from_reason(format!("Export failed: {}", e)))
+    }
+    fn resolve(&mut self, _env: Env, _output: Self::Output) -> Result<Self::JsValue> {
+        Ok(())
+    }
+}
 
 // ─── Helper: JSON round-trip through napi ────────────────────────────
 // napi-rs serde-json feature gives us serde_json::Value transfer,
@@ -21,7 +73,13 @@ use ndb::{Database as RustDatabase, Persistence, SortDir, QueryOptions};
 /// All documents are represented as plain JSON objects.
 #[napi]
 pub struct Database {
-    inner: Arc<RustDatabase>,
+    inner: RwLock<Option<Arc<RustDatabase>>>,
+}
+
+impl Database {
+    fn inner(&self) -> Result<Arc<RustDatabase>> {
+        self.inner.read().unwrap().clone().ok_or_else(|| Error::from_reason("Database closed"))
+    }
 }
 
 #[napi]
@@ -36,7 +94,7 @@ impl Database {
         let inner = RustDatabase::open(&path)
             .map_err(|e| Error::from_reason(format!("Failed to open database: {}", e)))?;
         Ok(Self {
-            inner: Arc::new(inner),
+            inner: RwLock::new(Some(Arc::new(inner))),
         })
     }
 
@@ -71,7 +129,7 @@ impl Database {
         }
 
         Ok(Self {
-            inner: Arc::new(db),
+            inner: RwLock::new(Some(Arc::new(db))),
         })
     }
 
@@ -85,8 +143,16 @@ impl Database {
         let inner = RustDatabase::open_in_memory()
             .map_err(|e| Error::from_reason(format!("Failed to create in-memory database: {}", e)))?;
         Ok(Self {
-            inner: Arc::new(inner),
+            inner: RwLock::new(Some(Arc::new(inner))),
         })
+    }
+
+    /// Close the database and instantly release any holds (OS locks, memory).
+    /// Safe to call multiple times. Subsequent operations will throw "Database closed".
+    #[napi]
+    pub fn close(&self) -> Result<()> {
+        *self.inner.write().unwrap() = None;
+        Ok(())
     }
 
     // ─── Layer 1: Core Operations ──────────────────────────────────
@@ -100,8 +166,7 @@ impl Database {
     pub fn insert(&self, doc: String) -> Result<String> {
         let value: serde_json::Value = serde_json::from_str(&doc)
             .map_err(|e| Error::from_reason(format!("Invalid JSON document: {}", e)))?;
-        self.inner
-            .insert(value)
+        self.inner()?.insert(value)
             .map_err(|e| Error::from_reason(format!("Insert failed: {}", e)))
     }
 
@@ -115,8 +180,7 @@ impl Database {
     pub fn insert_with_prefix(&self, prefix: String, doc: String) -> Result<String> {
         let value: serde_json::Value = serde_json::from_str(&doc)
             .map_err(|e| Error::from_reason(format!("Invalid JSON document: {}", e)))?;
-        self.inner
-            .insert_with_prefix(&prefix, value)
+        self.inner()?.insert_with_prefix(&prefix, value)
             .map_err(|e| Error::from_reason(format!("Insert with prefix failed: {}", e)))
     }
 
@@ -127,8 +191,7 @@ impl Database {
     /// ```
     #[napi]
     pub fn get(&self, id: String) -> Result<String> {
-        self.inner
-            .get(&id)
+        self.inner()?.get(&id)
             .map_err(|e| Error::from_reason(format!("Get failed: {}", e)))
             .and_then(|v| {
                 serde_json::to_string(&v)
@@ -145,8 +208,7 @@ impl Database {
     pub fn update(&self, id: String, doc: String) -> Result<()> {
         let value: serde_json::Value = serde_json::from_str(&doc)
             .map_err(|e| Error::from_reason(format!("Invalid JSON document: {}", e)))?;
-        self.inner
-            .update(&id, value)
+        self.inner()?.update(&id, value)
             .map_err(|e| Error::from_reason(format!("Update failed: {}", e)))
     }
 
@@ -157,8 +219,7 @@ impl Database {
     /// ```
     #[napi]
     pub fn delete(&self, id: String) -> Result<()> {
-        self.inner
-            .delete(&id)
+        self.inner()?.delete(&id)
             .map_err(|e| Error::from_reason(format!("Delete failed: {}", e)))
     }
 
@@ -171,28 +232,22 @@ impl Database {
     /// ```
     #[napi]
     pub fn iter(&self) -> Result<String> {
-        let docs = self.inner.iter();
+        let docs = self.inner()?.iter();
         serde_json::to_string(&docs)
             .map_err(|e| Error::from_reason(format!("Serialization failed: {}", e)))
     }
 
     /// Get document count.
     #[napi]
-    pub fn len(&self) -> u32 {
-        self.inner.len() as u32
-    }
+    pub fn len(&self) -> Result<u32> { Ok(self.inner()?.len() as u32) }
 
     /// Check if database is empty.
     #[napi]
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
+    pub fn is_empty(&self) -> Result<bool> { Ok(self.inner()?.is_empty()) }
 
     /// Check if a document exists by ID.
     #[napi]
-    pub fn contains(&self, id: String) -> bool {
-        self.inner.contains(&id)
-    }
+    pub fn contains(&self, id: String) -> Result<bool> { Ok(self.inner()?.contains(&id)) }
 
     // ─── Layer 2: Single Field Queries ─────────────────────────────
 
@@ -207,7 +262,7 @@ impl Database {
     pub fn find(&self, field: String, value: String) -> Result<String> {
         let val: serde_json::Value = serde_json::from_str(&value)
             .map_err(|e| Error::from_reason(format!("Invalid JSON value: {}", e)))?;
-        let results = self.inner.find(&field, &val);
+        let results = self.inner()?.find(&field, &val);
         serde_json::to_string(&results)
             .map_err(|e| Error::from_reason(format!("Serialization failed: {}", e)))
     }
@@ -223,17 +278,17 @@ impl Database {
             .map_err(|e| Error::from_reason(format!("Invalid JSON min value: {}", e)))?;
         let max_val: serde_json::Value = serde_json::from_str(&max)
             .map_err(|e| Error::from_reason(format!("Invalid JSON max value: {}", e)))?;
-        let results = self.inner.find_range(&field, &min_val, &max_val);
+        let results = self.inner()?.find_range(&field, &min_val, &max_val);
         serde_json::to_string(&results)
             .map_err(|e| Error::from_reason(format!("Serialization failed: {}", e)))
     }
 
     // ─── Layer 3: JSON AST Queries ─────────────────────────────────
 
-    /// Execute a JSON AST query. Returns JSON array string.
+    /// Execute a JSON AST query limit. Returns JSON array string asynchronously.
     ///
     /// ```js
-    /// const results = JSON.parse(db.query({
+    /// const results = JSON.parse(await db.query({
     ///   "$and": [
     ///     { "user_id": { "$eq": "alice" } },
     ///     { "score": { "$gt": 100 } }
@@ -241,12 +296,10 @@ impl Database {
     /// }));
     /// ```
     #[napi]
-    pub fn query(&self, ast: String) -> Result<String> {
+    pub fn query(&self, ast: String) -> Result<AsyncTask<QueryTask>> {
         let ast_value: serde_json::Value = serde_json::from_str(&ast)
             .map_err(|e| Error::from_reason(format!("Invalid JSON AST: {}", e)))?;
-        let results = self.inner.query(ast_value);
-        serde_json::to_string(&results)
-            .map_err(|e| Error::from_reason(format!("Serialization failed: {}", e)))
+        Ok(AsyncTask::new(QueryTask { db: self.inner()?, ast: ast_value }))
     }
 
     /// Execute a JSON AST query with options (limit, offset, sort).
@@ -284,7 +337,7 @@ impl Database {
             sort_by: sort_by.map(|f| (f, dir)),
         };
 
-        let results = self.inner.query_with(ast_value, opts);
+        let results = self.inner()?.query_with(ast_value, opts);
         serde_json::to_string(&results)
             .map_err(|e| Error::from_reason(format!("Serialization failed: {}", e)))
     }
@@ -294,64 +347,53 @@ impl Database {
     /// Create a hash index on a field for O(1) equality lookups.
     #[napi]
     pub fn create_index(&self, field: String) -> Result<()> {
-        self.inner
-            .create_index(&field)
+        self.inner()?.create_index(&field)
             .map_err(|e| Error::from_reason(format!("Create index failed: {}", e)))
     }
 
     /// Create a BTree index on a field for range queries.
     #[napi]
     pub fn create_btree_index(&self, field: String) -> Result<()> {
-        self.inner
-            .create_btree_index(&field)
+        self.inner()?.create_btree_index(&field)
             .map_err(|e| Error::from_reason(format!("Create BTree index failed: {}", e)))
     }
 
     /// Drop an index, freeing memory.
     #[napi]
     pub fn drop_index(&self, field: String) -> Result<()> {
-        self.inner
-            .drop_index(&field)
+        self.inner()?.drop_index(&field)
             .map_err(|e| Error::from_reason(format!("Drop index failed: {}", e)))
     }
 
     /// Check if an index exists for a field.
     #[napi]
-    pub fn has_index(&self, field: String) -> bool {
-        self.inner.has_index(&field)
-    }
+    pub fn has_index(&self, field: String) -> Result<bool> { Ok(self.inner()?.has_index(&field)) }
 
     // ─── Compaction & Trash ────────────────────────────────────────
 
-    /// Compact the database: rewrite active docs, archive deleted to trash.
+    /// Compact the database asynchronously.
     #[napi]
-    pub fn compact(&self) -> Result<()> {
-        self.inner
-            .compact()
-            .map_err(|e| Error::from_reason(format!("Compact failed: {}", e)))
+    pub fn compact(&self) -> Result<AsyncTask<CompactTask>> {
+        Ok(AsyncTask::new(CompactTask { db: self.inner()? }))
     }
 
     /// Flush data to disk.
     #[napi]
     pub fn flush(&self) -> Result<()> {
-        self.inner
-            .flush()
+        self.inner()?.flush()
             .map_err(|e| Error::from_reason(format!("Flush failed: {}", e)))
     }
 
     /// Restore a deleted document from trash by ID.
     #[napi]
     pub fn restore(&self, id: String) -> Result<()> {
-        self.inner
-            .restore(&id)
+        self.inner()?.restore(&id)
             .map_err(|e| Error::from_reason(format!("Restore failed: {}", e)))
     }
 
     /// Get list of deleted document IDs.
     #[napi]
-    pub fn deleted_ids(&self) -> Vec<String> {
-        self.inner.deleted_ids()
-    }
+    pub fn deleted_ids(&self) -> Result<Vec<String>> { Ok(self.inner()?.deleted_ids()) }
 
     // ─── File Buckets ──────────────────────────────────────────────
 
@@ -368,7 +410,7 @@ impl Database {
         data: Buffer,
         mime_type: String,
     ) -> Result<String> {
-        let bkt = self.inner.bucket(&bucket);
+        let bkt = self.inner()?.bucket(&bucket);
         let meta = bkt
             .store(&name, &data, &mime_type)
             .map_err(|e| Error::from_reason(format!("Store file failed: {}", e)))?;
@@ -383,7 +425,7 @@ impl Database {
     /// ```
     #[napi]
     pub fn get_file(&self, bucket: String, hash: String, ext: String) -> Result<Buffer> {
-        let bkt = self.inner.bucket(&bucket);
+        let bkt = self.inner()?.bucket(&bucket);
         let data = bkt
             .get_by_hash(&hash, &ext)
             .map_err(|e| Error::from_reason(format!("Get file failed: {}", e)))?;
@@ -393,7 +435,7 @@ impl Database {
     /// Delete a file from a bucket (moves to trash).
     #[napi]
     pub fn delete_file(&self, bucket: String, hash: String, ext: String) -> Result<()> {
-        let bkt = self.inner.bucket(&bucket);
+        let bkt = self.inner()?.bucket(&bucket);
         let file_ref = ndb::FileRef {
             bucket,
             id: hash,
@@ -406,7 +448,7 @@ impl Database {
     /// List files in a bucket.
     #[napi]
     pub fn list_files(&self, bucket: String) -> Result<Vec<String>> {
-        let bkt = self.inner.bucket(&bucket);
+        let bkt = self.inner()?.bucket(&bucket);
         bkt.list()
             .map_err(|e| Error::from_reason(format!("List files failed: {}", e)))
     }
@@ -420,3 +462,4 @@ pub struct DatabaseOptions {
     /// Interval in seconds for scheduled persistence. Default: 60.
     pub interval: Option<u32>,
 }
+

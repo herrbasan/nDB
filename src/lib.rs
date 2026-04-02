@@ -880,6 +880,54 @@ impl Database {
         Ok(())
     }
 
+    /// Export a pristine snapshot of the database to a target directory.
+    /// Functions similarly to compaction, but writes exactly the active 
+    /// docs, metadata, and files to a completely new folder without trash.
+    pub fn export_snapshot<P: AsRef<Path>>(&self, target_dir: P) -> Result<()> {
+        let _guard = self.writer.lock();
+        let target = target_dir.as_ref();
+        
+        let docs = self.docs.read();
+        let active: Vec<&Value> = docs.values().collect();
+        
+        // 1. Write the clean JSON line docs
+        let target_db = target.join(self.path.file_name().unwrap());
+        storage::rewrite_atomic(&target_db, &active)?;
+        
+        // 2. Copy the meta.json across
+        let meta_src = self.base_dir.join("meta.json");
+        let meta_dst = target.join("meta.json");
+        if meta_src.exists() {
+            fs::copy(&meta_src, &meta_dst).map_err(Error::io_err(&meta_dst, "copy meta.json for snapshot"))?;
+        }
+        
+        // 3. Create the clean buckets folder & stream the active files
+        let buckets_src = self.base_dir.join("buckets");
+        let buckets_dst = target.join("buckets");
+        if buckets_src.exists() {
+            // Find only buckets natively active in this DB
+            for entry in fs::read_dir(&buckets_src).map_err(Error::io_err(&buckets_src, "read buckets dir"))? {
+                let entry = entry.map_err(Error::io_err(&buckets_src, "read bucket entry"))?;
+                if entry.file_type().map_or(false, |t| t.is_dir()) {
+                    let bucket_name = entry.file_name();
+                    let dst_bucket = buckets_dst.join(&bucket_name);
+                    fs::create_dir_all(&dst_bucket).map_err(Error::io_err(&dst_bucket, "create snapshot bucket"))?;
+                    
+                    // Copy non-trash binaries
+                    for file_entry in fs::read_dir(entry.path()).map_err(Error::io_err(&entry.path(), "read bucket files"))? {
+                        let f = file_entry.map_err(Error::io_err(&entry.path(), "read active binary"))?;
+                        let file_name = f.file_name();
+                        if file_name != "_trash" && f.file_type().map_or(false, |t| t.is_file()) {
+                            fs::copy(f.path(), dst_bucket.join(&file_name)).map_err(Error::io_err(f.path(), "copy file to snapshot"))?;
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
     /// Get the trash directory path.
     pub fn trash_dir(&self) -> PathBuf {
         self.base_dir.join("_trash").join("docs")
@@ -888,6 +936,11 @@ impl Database {
     /// List deleted document IDs.
     pub fn deleted_ids(&self) -> Vec<String> {
         self.deleted.read().iter().cloned().collect()
+    }
+
+    /// Get all active document IDs.
+    pub fn get_all_ids(&self) -> Vec<String> {
+        self.docs.read().keys().cloned().collect()
     }
 
     /// Restore a deleted document from trash by ID.
