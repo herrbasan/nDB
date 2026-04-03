@@ -249,8 +249,8 @@ class Database {
    * @param {object} ast - Query AST.
    * @returns {object[]}
    */
-  query(ast) {
-    return JSON.parse(this._native.query(JSON.stringify(ast)));
+  async query(ast) {
+    return JSON.parse(await this._native.query(JSON.stringify(ast)));
   }
 
   /**
@@ -263,9 +263,9 @@ class Database {
    * @param {string} [options.sortDir] - "asc" or "desc".
    * @returns {object[]}
    */
-  queryWith(ast, options) {
+  async queryWith(ast, options) {
     const opts = options || {};
-    return JSON.parse(this._native.queryWith(
+    return JSON.parse(await this._native.queryWith(
       JSON.stringify(ast),
       opts.limit,
       opts.offset,
@@ -310,8 +310,8 @@ class Database {
   /**
    * Compact the database.
    */
-  compact() {
-    this._native.compact();
+  async compact() {
+    await this._native.compact();
   }
 
   /**

@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process;
 
 // Core Philosophy Exit Codes
@@ -809,7 +809,7 @@ fn handle_config(args: &[String]) {
         eprintln!("Usage: ndb config <get|set> <key> [value]");
         process::exit(EXIT_GENERAL_ERROR);
     }
-    let path = Path::new("."); // By default config usually has the path passed or assumes current directory? 
+    let _path = Path::new("."); // By default config usually has the path passed or assumes current directory? 
     // Wait, the spec says `ndb config get display.title`. That assumes the command needs to know the db path or runs in it.
     // Actually wait, let me look at `cli-spec.md` again for `config`:
     // `$ ndb config get display.title`
@@ -866,7 +866,7 @@ fn handle_config(args: &[String]) {
             other => println!("{}", other),
         }
     } else if action == "set" {
-        if let Some(mut value_str) = val {
+        if let Some(value_str) = val {
             let parsed_val: serde_json::Value = if value_str.contains(',') && key == "buckets" {
                 let vec: Vec<serde_json::Value> = value_str.split(',').map(|s| serde_json::Value::String(s.trim().to_string())).collect();
                 serde_json::Value::Array(vec)

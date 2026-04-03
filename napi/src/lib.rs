@@ -46,6 +46,24 @@ impl Task for QueryTask {
     }
 }
 
+pub struct QueryWithTask {
+    db: Arc<RustDatabase>,
+    ast: serde_json::Value,
+    opts: QueryOptions,
+}
+
+#[napi]
+impl Task for QueryWithTask {
+    type Output = Vec<serde_json::Value>;
+    type JsValue = String;
+    fn compute(&mut self) -> Result<Self::Output> {
+        Ok(self.db.query_with(self.ast.clone(), self.opts.clone()))
+    }
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        serde_json::to_string(&output).map_err(|e| Error::from_reason(format!("Serialization failed: {}", e)))
+    }
+}
+
 pub struct ExportTask {
     db: Arc<RustDatabase>,
     dest: std::path::PathBuf,
@@ -319,7 +337,7 @@ impl Database {
         offset: Option<u32>,
         sort_by: Option<String>,
         sort_dir: Option<String>,
-    ) -> Result<String> {
+    ) -> Result<AsyncTask<QueryWithTask>> {
         let ast_value: serde_json::Value = serde_json::from_str(&ast)
             .map_err(|e| Error::from_reason(format!("Invalid JSON AST: {}", e)))?;
 
@@ -337,9 +355,11 @@ impl Database {
             sort_by: sort_by.map(|f| (f, dir)),
         };
 
-        let results = self.inner()?.query_with(ast_value, opts);
-        serde_json::to_string(&results)
-            .map_err(|e| Error::from_reason(format!("Serialization failed: {}", e)))
+        Ok(AsyncTask::new(QueryWithTask {
+            db: self.inner()?,
+            ast: ast_value,
+            opts,
+        }))
     }
 
     // ─── Index Management ──────────────────────────────────────────
