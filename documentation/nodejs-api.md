@@ -131,7 +131,13 @@ Replace a document. The `_id` field is preserved.
 ```js
 db.update(id, { name: 'Updated Name', age: 32 });
 ```
+### `arrayPush(id, field, value) -> void`
 
+Append a single element to an array field. This creates a highly optimized delta write to the JSON Lines file rather than rewriting the entire document, which is critical for large documents like conversations.
+
+```js
+db.arrayPush(id, 'messages', { role: 'user', content: 'Hello' });
+```
 ### `delete(id) → void`
 
 Soft delete a document (tombstone).

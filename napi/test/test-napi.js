@@ -57,6 +57,7 @@ function createTempDir() {
 
 // ─── Tests ───────────────────────────────────────────────────────────
 
+(async () => {
 console.log('nDB N-API Integration Tests');
 console.log('='.repeat(70));
 
@@ -64,7 +65,7 @@ console.log('='.repeat(70));
 
 section('Phase 1: Core CRUD');
 
-test('open creates database file', () => {
+test('open creates database file', async () => {
   const dir = createTempDir();
   const path = join(dir, 'test.jsonl');
   const db = new Database(path);
@@ -73,27 +74,27 @@ test('open creates database file', () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('openInMemory creates in-memory database', () => {
+test('openInMemory creates in-memory database', async () => {
   const db = Database.openInMemory();
   assert(db.isEmpty(), 'In-memory database should be empty');
   assertEqual(db.len(), 0, 'Length should be 0');
 });
 
-test('insert returns NanoID', () => {
+test('insert returns NanoID', async () => {
   const db = Database.openInMemory();
   const id = db.insert({ title: 'Hello' });
   assertEqual(id.length, 16, 'ID should be 16 chars');
   assert(/^[a-zA-Z0-9]+$/.test(id), 'ID should be base62');
 });
 
-test('insert with prefix returns prefixed NanoID', () => {
+test('insert with prefix returns prefixed NanoID', async () => {
   const db = Database.openInMemory();
   const id = db.insertWithPrefix('conv', { msg: 'hi' });
   assert(id.startsWith('conv_'), 'ID should start with prefix');
   assertEqual(id.length, 21, 'Prefixed ID should be 21 chars (prefix_ + 16)');
 });
 
-test('get by ID returns document', () => {
+test('get by ID returns document', async () => {
   const db = Database.openInMemory();
   const id = db.insert({ title: 'Test', value: 42 });
   const doc = db.get(id);
@@ -102,7 +103,7 @@ test('get by ID returns document', () => {
   assertEqual(doc._id, id, '_id should match');
 });
 
-test('get throws for nonexistent ID', () => {
+test('get throws for nonexistent ID', async () => {
   const db = Database.openInMemory();
   let threw = false;
   try {
@@ -113,7 +114,7 @@ test('get throws for nonexistent ID', () => {
   assert(threw, 'Should throw for nonexistent ID');
 });
 
-test('update replaces document', () => {
+test('update replaces document', async () => {
   const db = Database.openInMemory();
   const id = db.insert({ v: 1 });
   db.update(id, { v: 2 });
@@ -122,7 +123,7 @@ test('update replaces document', () => {
   assertEqual(doc._id, id, '_id should be preserved');
 });
 
-test('update throws for nonexistent ID', () => {
+test('update throws for nonexistent ID', async () => {
   const db = Database.openInMemory();
   let threw = false;
   try {
@@ -133,7 +134,7 @@ test('update throws for nonexistent ID', () => {
   assert(threw, 'Should throw for nonexistent ID');
 });
 
-test('delete soft-deletes document', () => {
+test('delete soft-deletes document', async () => {
   const db = Database.openInMemory();
   const id = db.insert({ x: 1 });
   assertEqual(db.len(), 1, 'Should have 1 doc');
@@ -148,7 +149,7 @@ test('delete soft-deletes document', () => {
   assert(threw, 'Should throw when getting deleted doc');
 });
 
-test('delete throws for nonexistent ID', () => {
+test('delete throws for nonexistent ID', async () => {
   const db = Database.openInMemory();
   let threw = false;
   try {
@@ -159,7 +160,7 @@ test('delete throws for nonexistent ID', () => {
   assert(threw, 'Should throw for nonexistent ID');
 });
 
-test('iter returns all documents', () => {
+test('iter returns all documents', async () => {
   const db = Database.openInMemory();
   db.insert({ a: 1 });
   db.insert({ b: 2 });
@@ -168,14 +169,14 @@ test('iter returns all documents', () => {
   assertEqual(docs.length, 3, 'Should return 3 docs');
 });
 
-test('contains checks existence', () => {
+test('contains checks existence', async () => {
   const db = Database.openInMemory();
   const id = db.insert({ x: 1 });
   assert(db.contains(id), 'Should contain inserted ID');
   assert(!db.contains('nonexistent'), 'Should not contain random ID');
 });
 
-test('len returns correct count', () => {
+test('len returns correct count', async () => {
   const db = Database.openInMemory();
   assertEqual(db.len(), 0, 'Empty db');
   db.insert({ a: 1 });
@@ -184,7 +185,7 @@ test('len returns correct count', () => {
   assertEqual(db.len(), 2, '2 docs');
 });
 
-test('isEmpty works correctly', () => {
+test('isEmpty works correctly', async () => {
   const db = Database.openInMemory();
   assert(db.isEmpty(), 'Should be empty');
   db.insert({ a: 1 });
@@ -195,7 +196,7 @@ test('isEmpty works correctly', () => {
 
 section('Phase 2: Persistence & Reload');
 
-test('data persists across database reopen', () => {
+test('data persists across database reopen', async () => {
   const dir = createTempDir();
   const path = join(dir, 'persist.jsonl');
 
@@ -216,7 +217,7 @@ test('data persists across database reopen', () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('update persists across reopen', () => {
+test('update persists across reopen', async () => {
   const dir = createTempDir();
   const path = join(dir, 'update.jsonl');
 
@@ -235,7 +236,7 @@ test('update persists across reopen', () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('delete persists across reopen', () => {
+test('delete persists across reopen', async () => {
   const dir = createTempDir();
   const path = join(dir, 'delete.jsonl');
 
@@ -255,7 +256,7 @@ test('delete persists across reopen', () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('deletedIds returns soft-deleted IDs', () => {
+test('deletedIds returns soft-deleted IDs', async () => {
   const db = Database.openInMemory();
   const id1 = db.insert({ x: 1 });
   const id2 = db.insert({ x: 2 });
@@ -269,7 +270,7 @@ test('deletedIds returns soft-deleted IDs', () => {
 
 section('Phase 3: Field Queries (Layer 2)');
 
-test('find by field equality', () => {
+test('find by field equality', async () => {
   const db = Database.openInMemory();
   db.insert({ name: 'Alice', age: 30 });
   db.insert({ name: 'Bob', age: 25 });
@@ -279,7 +280,7 @@ test('find by field equality', () => {
   assertEqual(results.length, 2, 'Should find 2 Alices');
 });
 
-test('find by numeric value', () => {
+test('find by numeric value', async () => {
   const db = Database.openInMemory();
   db.insert({ name: 'Alice', age: 30 });
   db.insert({ name: 'Bob', age: 25 });
@@ -289,14 +290,14 @@ test('find by numeric value', () => {
   assertEqual(results[0].name, 'Bob', 'Should be Bob');
 });
 
-test('find returns empty for no match', () => {
+test('find returns empty for no match', async () => {
   const db = Database.openInMemory();
   db.insert({ name: 'Alice' });
   const results = db.find('name', 'Charlie');
   assertEqual(results.length, 0, 'Should find 0 docs');
 });
 
-test('findRange returns documents in range', () => {
+test('findRange returns documents in range', async () => {
   const db = Database.openInMemory();
   db.insert({ name: 'A', score: 10 });
   db.insert({ name: 'B', score: 50 });
@@ -311,33 +312,33 @@ test('findRange returns documents in range', () => {
 
 section('Phase 4: JSON AST Queries (Layer 3)');
 
-test('query with $eq', () => {
+test('query with $eq', async () => {
   const db = Database.openInMemory();
   db.insert({ status: 'active', name: 'A' });
   db.insert({ status: 'deleted', name: 'B' });
   db.insert({ status: 'active', name: 'C' });
 
-  const results = db.query({ status: { $eq: 'active' } });
+  const results = await db.query({ status: { $eq: 'active' } });
   assertEqual(results.length, 2, 'Should find 2 active');
 });
 
-test('query with $gt', () => {
+test('query with $gt', async () => {
   const db = Database.openInMemory();
   db.insert({ name: 'A', score: 10 });
   db.insert({ name: 'B', score: 50 });
   db.insert({ name: 'C', score: 90 });
 
-  const results = db.query({ score: { $gt: 40 } });
+  const results = await db.query({ score: { $gt: 40 } });
   assertEqual(results.length, 2, 'Should find 2 with score > 40');
 });
 
-test('query with $and', () => {
+test('query with $and', async () => {
   const db = Database.openInMemory();
   db.insert({ user: 'alice', status: 'active', score: 100 });
   db.insert({ user: 'bob', status: 'active', score: 50 });
   db.insert({ user: 'alice', status: 'deleted', score: 200 });
 
-  const results = db.query({
+  const results = await db.query({
     $and: [
       { user: { $eq: 'alice' } },
       { status: { $eq: 'active' } }
@@ -347,13 +348,13 @@ test('query with $and', () => {
   assertEqual(results[0].score, 100, 'Score should be 100');
 });
 
-test('query with $or', () => {
+test('query with $or', async () => {
   const db = Database.openInMemory();
   db.insert({ status: 'active' });
   db.insert({ status: 'pending' });
   db.insert({ status: 'deleted' });
 
-  const results = db.query({
+  const results = await db.query({
     $or: [
       { status: { $eq: 'active' } },
       { status: { $eq: 'pending' } }
@@ -362,43 +363,43 @@ test('query with $or', () => {
   assertEqual(results.length, 2, 'Should find 2 matching $or');
 });
 
-test('query with $not', () => {
+test('query with $not', async () => {
   const db = Database.openInMemory();
   db.insert({ status: 'active' });
   db.insert({ status: 'deleted' });
 
-  const results = db.query({
+  const results = await db.query({
     $not: { status: { $eq: 'deleted' } }
   });
   assertEqual(results.length, 1, 'Should find 1 not deleted');
 });
 
-test('query with $in', () => {
+test('query with $in', async () => {
   const db = Database.openInMemory();
   db.insert({ status: 'active' });
   db.insert({ status: 'pending' });
   db.insert({ status: 'deleted' });
 
-  const results = db.query({ status: { $in: ['active', 'pending'] } });
+  const results = await db.query({ status: { $in: ['active', 'pending'] } });
   assertEqual(results.length, 2, 'Should find 2 in array');
 });
 
-test('query with $exists', () => {
+test('query with $exists', async () => {
   const db = Database.openInMemory();
   db.insert({ name: 'A', avatar: 'yes' });
   db.insert({ name: 'B' });
 
-  const results = db.query({ avatar: { $exists: true } });
+  const results = await db.query({ avatar: { $exists: true } });
   assertEqual(results.length, 1, 'Should find 1 with avatar');
 });
 
-test('queryWith with limit and sort', () => {
+test('queryWith with limit and sort', async () => {
   const db = Database.openInMemory();
   db.insert({ name: 'C', score: 30 });
   db.insert({ name: 'A', score: 10 });
   db.insert({ name: 'B', score: 20 });
 
-  const results = db.queryWith(
+  const results = await db.queryWith(
     {},
     { limit: 2, sortBy: 'score', sortDir: 'asc' }
   );
@@ -407,13 +408,13 @@ test('queryWith with limit and sort', () => {
   assertEqual(results[1].name, 'B', 'Second should be B');
 });
 
-test('queryWith with offset', () => {
+test('queryWith with offset', async () => {
   const db = Database.openInMemory();
   db.insert({ name: 'A', score: 10 });
   db.insert({ name: 'B', score: 20 });
   db.insert({ name: 'C', score: 30 });
 
-  const results = db.queryWith(
+  const results = await db.queryWith(
     {},
     { sortBy: 'score', sortDir: 'asc', offset: 1 }
   );
@@ -421,13 +422,13 @@ test('queryWith with offset', () => {
   assertEqual(results[0].name, 'B', 'First should be B (offset 1)');
 });
 
-test('queryWith with desc sort', () => {
+test('queryWith with desc sort', async () => {
   const db = Database.openInMemory();
   db.insert({ name: 'A', score: 10 });
   db.insert({ name: 'B', score: 20 });
   db.insert({ name: 'C', score: 30 });
 
-  const results = db.queryWith(
+  const results = await db.queryWith(
     {},
     { sortBy: 'score', sortDir: 'desc' }
   );
@@ -439,7 +440,7 @@ test('queryWith with desc sort', () => {
 
 section('Phase 5: Index Management');
 
-test('createIndex and hasIndex', () => {
+test('createIndex and hasIndex', async () => {
   const db = Database.openInMemory();
   db.insert({ name: 'Alice', age: 30 });
   db.createIndex('name');
@@ -447,7 +448,7 @@ test('createIndex and hasIndex', () => {
   assert(!db.hasIndex('age'), 'Should not have age index');
 });
 
-test('find uses index', () => {
+test('find uses index', async () => {
   const db = Database.openInMemory();
   db.insert({ name: 'Alice', age: 30 });
   db.insert({ name: 'Bob', age: 25 });
@@ -458,7 +459,7 @@ test('find uses index', () => {
   assertEqual(results[0].name, 'Alice', 'Name should match');
 });
 
-test('dropIndex removes index', () => {
+test('dropIndex removes index', async () => {
   const db = Database.openInMemory();
   db.createIndex('name');
   assert(db.hasIndex('name'), 'Should exist');
@@ -466,7 +467,7 @@ test('dropIndex removes index', () => {
   assert(!db.hasIndex('name'), 'Should be gone');
 });
 
-test('createBTreeIndex works', () => {
+test('createBTreeIndex works', async () => {
   const db = Database.openInMemory();
   db.insert({ name: 'A', score: 10 });
   db.insert({ name: 'B', score: 50 });
@@ -478,7 +479,7 @@ test('createBTreeIndex works', () => {
 
 section('Phase 6: Compaction & Trash');
 
-test('compact removes deleted docs from file', () => {
+test('compact removes deleted docs from file', async () => {
   const dir = createTempDir();
   const path = join(dir, 'compact.jsonl');
 
@@ -500,7 +501,7 @@ test('compact removes deleted docs from file', () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('restore recovers deleted document', () => {
+test('restore recovers deleted document', async () => {
   const dir = createTempDir();
   const path = join(dir, 'restore.jsonl');
 
@@ -525,7 +526,7 @@ test('restore recovers deleted document', () => {
 
 section('Phase 7: File Buckets');
 
-test('storeFile and getFile round-trip', () => {
+test('storeFile and getFile round-trip', async () => {
   const dir = createTempDir();
   const path = join(dir, 'bucket.jsonl');
   const db = new Database(path);
@@ -547,7 +548,7 @@ test('storeFile and getFile round-trip', () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('listFiles returns stored files', () => {
+test('listFiles returns stored files', async () => {
   const dir = createTempDir();
   const path = join(dir, 'list.jsonl');
   const db = new Database(path);
@@ -561,7 +562,7 @@ test('listFiles returns stored files', () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('deleteFile removes file', () => {
+test('deleteFile removes file', async () => {
   const dir = createTempDir();
   const path = join(dir, 'del.jsonl');
   const db = new Database(path);
@@ -580,7 +581,7 @@ test('deleteFile removes file', () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('file deduplication by content hash', () => {
+test('file deduplication by content hash', async () => {
   const dir = createTempDir();
   const path = join(dir, 'dedup.jsonl');
   const db = new Database(path);
@@ -602,7 +603,7 @@ test('file deduplication by content hash', () => {
 
 section('Phase 8: Complex Scenarios');
 
-test('full lifecycle: insert, query, update, delete, compact', () => {
+test('full lifecycle: insert, query, update, delete, compact', async () => {
   const dir = createTempDir();
   const path = join(dir, 'lifecycle.jsonl');
   const db = new Database(path);
@@ -615,7 +616,7 @@ test('full lifecycle: insert, query, update, delete, compact', () => {
   assertEqual(db.len(), 10, 'Should have 10 docs');
 
   // Query
-  const aliceDocs = db.query({ user: { $eq: 'alice' } });
+  const aliceDocs = await db.query({ user: { $eq: 'alice' } });
   assertEqual(aliceDocs.length, 5, 'Should find 5 alice docs');
 
   // Update
@@ -639,40 +640,40 @@ test('full lifecycle: insert, query, update, delete, compact', () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('nested document fields with dot notation in queries', () => {
+test('nested document fields with dot notation in queries', async () => {
   const db = Database.openInMemory();
   db.insert({ user: { name: 'Alice', address: { city: 'Berlin' } } });
   db.insert({ user: { name: 'Bob', address: { city: 'Tokyo' } } });
 
-  const results = db.query({ 'user.name': { $eq: 'Alice' } });
+  const results = await db.query({ 'user.name': { $eq: 'Alice' } });
   assertEqual(results.length, 1, 'Should find 1 with dot notation');
   assertEqual(results[0].user.address.city, 'Berlin', 'Nested field should work');
 });
 
-test('query with $ne, $gte, $lte, $nin', () => {
+test('query with $ne, $gte, $lte, $nin', async () => {
   const db = Database.openInMemory();
   db.insert({ status: 'active', score: 10 });
   db.insert({ status: 'pending', score: 50 });
   db.insert({ status: 'deleted', score: 90 });
 
   // $ne
-  const notDeleted = db.query({ status: { $ne: 'deleted' } });
+  const notDeleted = await db.query({ status: { $ne: 'deleted' } });
   assertEqual(notDeleted.length, 2, '$ne should find 2');
 
   // $gte
-  const gte = db.query({ score: { $gte: 50 } });
+  const gte = await db.query({ score: { $gte: 50 } });
   assertEqual(gte.length, 2, '$gte should find 2');
 
   // $lte
-  const lte = db.query({ score: { $lte: 50 } });
+  const lte = await db.query({ score: { $lte: 50 } });
   assertEqual(lte.length, 2, '$lte should find 2');
 
   // $nin
-  const nin = db.query({ status: { $nin: ['deleted', 'pending'] } });
+  const nin = await db.query({ status: { $nin: ['deleted', 'pending'] } });
   assertEqual(nin.length, 1, '$nin should find 1');
 });
 
-test('Database.open with persistence option', () => {
+test('Database.open with persistence option', async () => {
   const dir = createTempDir();
   const path = join(dir, 'opts.jsonl');
   const db = Database.open(path, { persistence: 'lazy' });
@@ -682,7 +683,7 @@ test('Database.open with persistence option', () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('concurrent operations sequence', () => {
+test('concurrent operations sequence', async () => {
   const db = Database.openInMemory();
   
   // Rapid insert/update/delete cycle
@@ -715,3 +716,4 @@ if (failed > 0) {
   console.log('\nAll tests passed! ✓');
   process.exit(0);
 }
+})();

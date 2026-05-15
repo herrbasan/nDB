@@ -230,6 +230,15 @@ impl Database {
             .map_err(|e| Error::from_reason(format!("Update failed: {}", e)))
     }
 
+    /// Append an element to an array field.
+    #[napi]
+    pub fn array_push(&self, id: String, field: String, value: String) -> Result<()> {
+        let val: serde_json::Value = serde_json::from_str(&value)
+            .map_err(|e| Error::from_reason(format!("Invalid JSON value: {}", e)))?;
+        self.inner()?.array_push(&id, &field, val)
+            .map_err(|e| Error::from_reason(format!("Array push failed: {}", e)))
+    }
+
     /// Delete a document by ID (soft delete / tombstone).
     ///
     /// ```js

@@ -362,7 +362,7 @@ impl Database {
         let raw_docs = storage::read_all(&path)?;
 
         // Build in-memory state: last write wins
-        let mut docs = HashMap::new();
+        let mut docs: HashMap<String, Value> = HashMap::new();
         let mut deleted = HashSet::new();
 
         for doc in raw_docs {
@@ -371,6 +371,21 @@ impl Database {
                     // Tombstone entry
                     deleted.insert(id.to_string());
                     docs.remove(id);
+                } else if let Some("array_push") = doc.get("_op").and_then(|v| v.as_str()) {
+                    // Array push patch
+                    if let Some(field) = doc.get("field").and_then(|v| v.as_str()) {
+                        if let Some(value) = doc.get("value") {
+                            if let Some(existing) = docs.get_mut(id) {
+                                if let Some(obj) = existing.as_object_mut() {
+                                    if let Some(arr) = obj.get_mut(field).and_then(|v| v.as_array_mut()) {
+                                        arr.push(value.clone());
+                                    } else {
+                                        obj.insert(field.to_string(), serde_json::json!([value.clone()]));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 } else {
                     deleted.remove(id);
                     docs.insert(id.to_string(), doc);
@@ -590,6 +605,50 @@ impl Database {
         // Update in-memory store
         let mut docs = self.docs.write();
         docs.insert(id.to_string(), new_doc);
+
+        Ok(())
+    }
+
+    /// Append an element to an array field. O(1) file write.
+    pub fn array_push(&self, id: &str, field: &str, value: Value) -> Result<()> {
+        let _guard = self.writer.lock();
+
+        {
+            let mut docs = self.docs.write();
+            if let Some(doc) = docs.get_mut(id) {
+                if let Some(obj) = doc.as_object_mut() {
+                    if let Some(arr) = obj.get_mut(field).and_then(|v| v.as_array_mut()) {
+                        arr.push(value.clone());
+                    } else {
+                        obj.insert(field.to_string(), serde_json::json!([value.clone()]));
+                    }
+                }
+            } else {
+                return Err(Error::not_found(id));
+            }
+        }
+
+        // Write patch to file
+        if !self.is_in_memory() {
+            let patch = serde_json::json!({
+                "_id": id,
+                "_op": "array_push",
+                "field": field,
+                "value": value
+            });
+            let line = serde_json::to_string(&patch)?;
+            let mut handle = self.get_file_handle()?;
+            if let Some(ref mut file) = *handle {
+                match self.persistence {
+                    Persistence::Immediate => {
+                        storage::append_line_sync(file, &self.path, &line)?;
+                    }
+                    _ => {
+                        storage::append_line(file, &self.path, &line)?;
+                    }
+                }
+            }
+        }
 
         Ok(())
     }

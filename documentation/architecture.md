@@ -6,7 +6,9 @@
 
 ## Overview
 
-nDB is an **in-memory document database** with JSON Lines persistence. Every document lives in a `HashMap<String, Value>` at runtime, providing O(1) lookups by `_id`. Persistence is achieved through an append-only JSON Lines file.
+**v3 Architecture Note:** nDB utilizes a **Database-as-a-Folder** architecture. Opening a database creates an encapsulated directory (`meta.json`, `data.jsonl`, `_trash/`, `_files/`).
+
+nDB operates as an in-memory document database backed by these structured directories. Every document lives in a `HashMap<String, Value>` at runtime, providing O(1) lookups by `_id`. Persistence is achieved through an append-only JSON Lines file.
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -226,3 +228,8 @@ mydb/
         └── avatars/        # Archived deleted files
             └── a1b2c3d4.png
 ```
+
+
+## v3 Breaking Changes
+- **Atomic Deltas:** Replaced O(N^2) I/O re-writes with `array_push` log patching.
+- **File Buckets & nURI:** `avatars:a1b2c3.png` strings are deduplicated natively.

@@ -4,10 +4,23 @@
 
 nDB is an **in-memory document database** with JSON Lines persistence, layered query API, and file bucket support. Standalone embeddable database for Node.js and Electron applications.
 
+
+> **⚠️ BREAKING CHANGE (v3 Architecture)**
+> nDB has transitioned to a **Database-as-a-Folder** architecture. It is no longer just a flat `.jsonl` file.
+> Opening a database now treats the path as a directory containing:
+> - `meta.json` (Schema and bucket definitions)
+> - `data.jsonl` (The append-only document store)
+> - `_trash/` (Soft-deleted documents and files)
+> - `_files/` (Managed binary buckets with SHA-256 deduplication)
+> 
+> This removes the need for upper-layer management wrappers (like the deprecated nGDB). nDB now natively handles **Delta patch operations** (e.g. `array_push`) for large objects, **opt-in schema enforcement**, **nURI Links** (`bucket:hash.ext`), and **bucket garbage collection**.
+
+
 ## Features
 
 - **O(1) CRUD** — All core operations are HashMap lookups
-- **JSON Lines storage** — Human-readable, append-only, crash-safe
+- **Database-as-a-Folder** — Encapsulated `meta.json`, `data.jsonl`, `_files`, and `_trash` directories.
+- **Atomic Delta Updates** — Native `array_push` and patching for massive documents to avoid O(N²) I/O bloat.
 - **3-layer query API** — From simple lookups to complex JSON AST queries
 - **Opt-in indexes** — Hash indexes for equality, BTree indexes for ranges
 - **File buckets** — Binary storage with SHA-256 deduplication
