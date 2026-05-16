@@ -481,6 +481,31 @@ impl Database {
         bkt.list()
             .map_err(|e| Error::from_reason(format!("List files failed: {}", e)))
     }
+
+    /// Safely delete a file from a bucket if no active document references it.
+    /// Traverses the in-memory documents to guarantee it's unused. Returns boolean true if deleted.
+    /// 
+    /// ```js
+    /// const didTrash = db.releaseFile('images:a1b2c3d4.png');
+    /// ```
+    #[napi]
+    pub fn release_file(&self, file_ref_str: String) -> Result<bool> {
+        self.inner()?.release_file(&file_ref_str)
+            .map_err(|e| Error::from_reason(format!("Release file failed: {}", e)))
+    }
+
+    /// Perform a full garbage collection of all buckets.
+    /// Returns the number of physical files moved to the trash.
+    /// 
+    /// ```js
+    /// const trashedCount = db.gcBuckets();
+    /// ```
+    #[napi]
+    pub fn gc_buckets(&self) -> Result<u32> {
+        self.inner()?.gc_buckets()
+            .map(|c| c as u32)
+            .map_err(|e| Error::from_reason(format!("GC buckets failed: {}", e)))
+    }
 }
 
 /// Database options for `Database.open()`.

@@ -1077,6 +1077,117 @@ impl Database {
     pub fn bucket(&self, name: &str) -> FileBucket {
         FileBucket::new(name, &self.base_dir)
     }
+
+    /// Check if a string occurs anywhere in a JSON value
+    fn value_contains_string(value: &Value, target: &str) -> bool {
+        match value {
+            Value::String(s) => s.contains(target),
+            Value::Array(a) => a.iter().any(|v| Self::value_contains_string(v, target)),
+            Value::Object(o) => o.values().any(|v| Self::value_contains_string(v, target)),
+            _ => false,
+        }
+    }
+
+    /// Targets a specific file reference string (e.g. `images:a1b2c3d4.png`)
+    /// and safely removes it from the bucket if no active document references it.
+    /// Returns true if it was safely deleted.
+    pub fn release_file(&self, file_ref_str: &str) -> Result<bool> {
+        let file_ref = FileRef::from_compact(file_ref_str)
+            .ok_or_else(|| Error::invalid_arg("Invalid file ref format, expected bucket:hash.ext"))?;
+
+        // Fast sweep of in-memory active documents
+        {
+            let docs = self.docs.read();
+            for val in docs.values() {
+                if Self::value_contains_string(val, file_ref_str) {
+                    // Another active document is using it, abort delete
+                    return Ok(false);
+                }
+            }
+        }
+
+        // Orphaned! Trash the file
+        let bkt = self.bucket(&file_ref.bucket);
+        bkt.delete(&file_ref)?;
+        Ok(true)
+    }
+
+    /// Perform a full maintenance garbage collection of all buckets.
+    /// Traverses all active documents, records `FileRef` patterns,
+    /// then sweeps all buckets moving unreferenced physical files to trash.
+    /// Returns the number of files moved to trash.
+    pub fn gc_buckets(&self) -> Result<usize> {
+        let mut active_refs = HashSet::new();
+        
+        // 1. Mark phase: extract all possible `{bucket}:{hash}.{ext}` strings
+        {
+            let docs = self.docs.read();
+            for val in docs.values() {
+                Self::extract_file_refs(val, &mut active_refs);
+            }
+        }
+
+        let mut trashed_count = 0;
+        let files_base = self.base_dir.join("_files");
+        
+        if files_base.exists() {
+            for entry in fs::read_dir(&files_base).map_err(Error::io_err(&files_base, "list base files"))? {
+                let entry = entry.map_err(Error::io_err(&files_base, "read bucket entry"))?;
+                if entry.file_type().unwrap().is_dir() {
+                    let bucket_name = entry.file_name().to_string_lossy().to_string();
+                    let bkt = self.bucket(&bucket_name);
+                    
+                    if let Ok(files) = bkt.list() {
+                        for filename in files {
+                            let ref_str = format!("{}:{}", bucket_name, filename);
+                            if !active_refs.contains(&ref_str) {
+                                // Missing from documents
+                                if let Some(dot_pos) = filename.rfind('.') {
+                                    let id = filename[..dot_pos].to_string();
+                                    let ext = filename[dot_pos + 1..].to_string();
+                                    let file_ref = FileRef {
+                                        bucket: bucket_name.clone(),
+                                        id,
+                                        ext,
+                                    };
+                                    let _ = bkt.delete(&file_ref); // Ignore deletion errors here
+                                    trashed_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(trashed_count)
+    }
+
+    fn extract_file_refs(value: &Value, refs: &mut HashSet<String>) {
+        match value {
+            Value::String(s) => {
+                // Heuristic: looks like "bucket:hash.ext"
+                // E.g. "images:a1b2c3d4.png"
+                if s.contains(':') && s.contains('.') {
+                    let parts: Vec<&str> = s.splitn(2, ':').collect();
+                    if parts.len() == 2 && parts[1].len() >= 8 {
+                        refs.insert(s.to_string());
+                    }
+                }
+            }
+            Value::Array(a) => {
+                for v in a {
+                    Self::extract_file_refs(v, refs);
+                }
+            }
+            Value::Object(o) => {
+                for v in o.values() {
+                    Self::extract_file_refs(v, refs);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Error {

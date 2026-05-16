@@ -361,6 +361,16 @@ class Database {
   }
 
   /**
+   * Safe garbage collecting release of a file from a bucket.
+   * If there are no active document references, the file is trashed.
+   * @param {string} fileRef - File reference id (e.g. images:b1a2c3.png)
+   * @returns {boolean} Whether the file was trashed.
+   */
+  releaseFile(fileRef) {
+    return this._native.releaseFile(fileRef);
+  }
+
+  /**
    * Delete a file from a bucket.
    * @param {string} bucket - Bucket name.
    * @param {string} hash - File hash.
