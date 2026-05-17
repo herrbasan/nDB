@@ -370,60 +370,57 @@ console.log('DB path:', db.path());
 
 ## File Buckets
 
-### `bucket(name) → FileBucket`
+The Node.js N-API wrapper exposes flat file bucket methods directly on the `Database` instance (unlike the Rust API which uses `db.bucket(name)` bridging).
 
-Get or create a named file bucket for binary storage.
+### `storeFile(bucket, name, data, mimeType) → FileMeta`
 
-```js
-const avatars = db.bucket('avatars');
-```
-
-### FileBucket Methods
-
-#### `store(name, data, mimeType) → FileMeta`
-
-Store a file. Returns metadata.
+Store binary data in a bucket. Files are deduplicated via SHA-256.
 
 ```js
 const fs = require('fs');
 const imageData = fs.readFileSync('./photo.png');
-const meta = avatars.store('photo.png', imageData, 'image/png');
+// Parameters: bucketName, originalFileName, bufferData, mimeType
+const meta = db.storeFile('avatars', 'photo.png', imageData, 'image/png');
 console.log(meta);
 // { _file: { bucket: 'avatars', id: 'a1b2c3d4', ext: 'png' },
 //   name: 'photo.png', size: 12345, type: 'image/png', created: 1711553200 }
 ```
 
-#### `get(fileRef) → Buffer`
+### `getFile(bucket, hash, ext) → Buffer`
 
-Retrieve file content by reference.
+Retrieve file content by hash and extension.
 
 ```js
-const data = avatars.get(meta._file);
-fs.writeFileSync('./retrieved.png', data);
+const buffer = db.getFile('avatars', 'a1b2c3d4', 'png');
+fs.writeFileSync('./retrieved.png', buffer);
 ```
 
-#### `delete(fileRef) → void`
+### `releaseFile(fileRefStr) → boolean`
 
-Move a file to trash.
+Safely soft-delete a file based on its `nURI` string representation (e.g. `bucket:hash.ext`). 
+
+Before deleting, `nDB` iteratively checks all active documents in memory. If no document references the file string in any value, the physical file is moved to the `_trash` folder. If *any* document still references it, the file is kept untouched. Returns `true` if the file was trashed, `false` otherwise.
 
 ```js
-avatars.delete(meta._file);
+const wasTrashed = db.releaseFile('avatars:a1b2c3d4.png');
 ```
 
-#### `restore(fileRef) → void`
+### `deleteFile(bucket, hash, ext) → void`
 
-Restore a file from trash.
+Immediate (hard) delete of a file directly from the bucket (moves to trash without checking references).
 
 ```js
-avatars.restore(meta._file);
+db.deleteFile('avatars', 'a1b2c3d4', 'png');
 ```
 
-#### `list() → FileMeta[]`
+### `listFiles(bucket) → string[]`
 
-List all files in the bucket.
+List all active files in a bucket.
 
 ```js
-const files = avatars.list();
+const files = db.listFiles('avatars');
+files.forEach(f => console.log(f));
+```
 files.forEach(f => console.log(f.name, f.size));
 ```
 
