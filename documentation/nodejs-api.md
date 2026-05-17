@@ -133,10 +133,54 @@ db.update(id, { name: 'Updated Name', age: 32 });
 ```
 ### `arrayPush(id, field, value) -> void`
 
-Append a single element to an array field. This creates a highly optimized delta write to the JSON Lines file rather than rewriting the entire document, which is critical for large documents like conversations.
+Append a single element to a top-level array field. This creates a highly optimized delta write to the JSON Lines file rather than rewriting the entire document, which is critical for large documents like conversations.
 
 ```js
 db.arrayPush(id, 'messages', { role: 'user', content: 'Hello' });
+```
+
+### `set(id, path, value) -> void`
+
+Set a value at a dot-separated path within a document. Creates a tiny delta patch instead of rewriting the entire document.
+
+- Path uses `.` to separate segments (e.g. `'messages.3.content'`)
+- Numeric segments address array elements by index
+- Creates new fields if the leaf key doesn't exist
+- Unresolvable paths are silently skipped
+
+```js
+// Top-level field
+db.set(id, 'title', 'New Title');
+
+// Nested field
+db.set(id, 'settings.theme', 'dark');
+
+// Array element by index
+db.set(id, 'messages.1.text', 'edited text');
+
+// Any JSON value type
+db.set(id, 'counter', 42);
+db.set(id, 'active', true);
+db.set(id, 'tags', ['a', 'b']);
+db.set(id, 'metadata', null);
+```
+
+### `remove(id, path) -> void`
+
+Remove a field or array element at a dot-separated path. Creates a tiny delta patch instead of rewriting the entire document.
+
+- For object fields: the key is removed
+- For array elements: the element is removed and remaining elements shift
+
+```js
+// Remove top-level field
+db.remove(id, 'temporary_data');
+
+// Remove nested field
+db.remove(id, 'settings.volume');
+
+// Remove array element (shifts remaining)
+db.remove(id, 'messages.2');
 ```
 ### `delete(id) → void`
 

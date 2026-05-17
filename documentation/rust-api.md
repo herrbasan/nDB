@@ -143,6 +143,67 @@ Replace a document. The `_id` field is preserved.
 db.update(&id, json!({"title": "Updated", "count": 43}))?;
 ```
 
+### `array_push(id: &str, field: &str, value: Value) -> Result<()>`
+
+Append an element to a top-level array field. O(1) file write.
+
+- If the field doesn't exist, creates a new single-element array
+- Persists as a tiny delta patch in the JSONL (not a full document rewrite)
+- Patches are replayed on load and baked into the base document on `compact()`
+- Returns `Error::NotFound` if ID doesn't exist
+
+```rust
+db.array_push(&id, "messages", json!({"role": "user", "content": "Hello"}))?;
+```
+
+### `set(id: &str, path: &str, value: Value) -> Result<()>`
+
+Set a value at a dot-separated path within a document. O(1) file write.
+
+- Path examples: `"title"`, `"settings.theme"`, `"messages.3.content"`, `"a.b.c.d"`
+- Numeric path segments address array elements by index
+- If the path doesn't resolve (missing field, out-of-bounds index), the in-memory mutation is silently skipped
+- Creates new fields if the leaf key doesn't exist
+- Persists as a tiny delta patch in the JSONL (not a full document rewrite)
+- Patches are replayed on load and baked into the base document on `compact()`
+- Returns `Error::NotFound` if ID doesn't exist
+
+```rust
+// Top-level field
+db.set(&id, "title", json!("New Title"))?;
+
+// Nested field
+db.set(&id, "settings.theme", json!("dark"))?;
+
+// Array element by index
+db.set(&id, "messages.1.text", json!("edited text"))?;
+
+// Deeply nested
+db.set(&id, "a.b.c.d", json!(42))?;
+```
+
+### `remove(id: &str, path: &str) -> Result<()>`
+
+Remove a field or array element at a dot-separated path. O(1) file write.
+
+- For object fields: the key is removed
+- For array elements: the element is removed and the array shifts (indices change)
+- If the path doesn't resolve, the in-memory mutation is silently skipped
+- Persists as a tiny delta patch in the JSONL (not a full document rewrite)
+- Patches are replayed on load and baked into the base document on `compact()`
+- Returns `Error::NotFound` if ID doesn't exist
+
+```rust
+// Remove top-level field
+db.remove(&id, "temporary_data")?;
+
+// Remove nested field
+db.remove(&id, "settings.volume")?;
+
+// Remove array element (shifts remaining elements)
+db.remove(&id, "messages.2")?;
+```
+
 ### `delete(id: &str) -> Result<()>`
 
 Soft delete (tombstone). The document is removed from the in-memory store and a tombstone entry is appended to the file.

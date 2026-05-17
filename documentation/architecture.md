@@ -37,6 +37,9 @@ nDB operates as an in-memory document database backed by these structured direct
 | `insert()` | `writer` Mutex | Exclusive write access |
 | `update()` | `writer` Mutex | Exclusive write access |
 | `delete()` | `writer` Mutex | Exclusive write access |
+| `array_push()` | `writer` Mutex | Exclusive write access |
+| `set()` | `writer` Mutex | Exclusive write access |
+| `remove()` | `writer` Mutex | Exclusive write access |
 | `get()` | `docs` RwLock (read) | Concurrent reads |
 | `find()` | `docs` RwLock (read) | Concurrent reads |
 | `query()` | `docs` RwLock (read) | Concurrent reads |
@@ -57,7 +60,9 @@ The database file is a sequence of JSON objects, one per line:
 {"_id":"V1StGXR8Z5jdHi6B","name":"Alice","age":30}
 {"_id":"k8Tm2pQw4xNvRj7L","name":"Bob","age":25}
 {"_id":"V1StGXR8Z5jdHi6B","name":"Alice Smith","age":31}
-{"_id":"V1StGXR8Z5jdHi6B","_deleted":1711553300}
+{"_id":"V1StGXR8Z5jdHi6B","_op":"set","path":"age","value":32}
+{"_id":"V1StGXR8Z5jdHi6B","_op":"remove","path":"name"}
+{"_id":"k8Tm2pQw4xNvRj7L","_deleted":1711553300}
 ```
 
 ### Rules
@@ -66,7 +71,8 @@ The database file is a sequence of JSON objects, one per line:
 2. Each subsequent line is a complete JSON object.
 3. **Last write wins**: if multiple lines have the same `_id`, the last one is the current version.
 4. **Tombstones**: a line with `_deleted` marks a document as deleted.
-5. **Append-only**: writes only append to the end of the file.
+5. **Delta patches**: lines with `_op` are patches applied on top of the base document during replay.
+6. **Append-only**: writes only append to the end of the file.
 
 ### Crash Recovery
 
@@ -231,5 +237,45 @@ mydb/
 
 
 ## v3 Breaking Changes
-- **Atomic Deltas:** Replaced O(N^2) I/O re-writes with `array_push` log patching.
+- **Atomic Deltas:** Three patch operations (`array_push`, `set`, `remove`) enable O(1) file writes for field-level edits without rewriting entire documents.
 - **File Buckets & nURI:** `avatars:a1b2c3.png` strings are deduplicated natively.
+
+## Delta Patch System
+
+### The Hammer vs The Scalpel
+
+nDB supports two distinct write patterns:
+
+1. **Full Replacements (Hammer):** `db.update(id, fullDoc)` appends the entire document to the JSONL. Simple and pure for small documents.
+
+2. **Delta Patches (Scalpel):** `db.set()`, `db.remove()`, and `db.arrayPush()` append tiny instructions instead of full documents. Essential for large documents (e.g. 3MB conversation objects).
+
+### Patch Format
+
+Patches are stored as regular JSONL lines with an `_op` field:
+
+```jsonl
+{"_id":"chat_123","_op":"array_push","field":"messages","value":{"text":"hi"}}
+{"_id":"chat_123","_op":"set","path":"messages.0.text","value":"hello"}
+{"_id":"chat_123","_op":"remove","path":"temporary_data"}
+```
+
+### Replay Engine
+
+On `Database::open()`, all JSONL lines are processed sequentially:
+
+1. **Full doc** → inserted into HashMap (last write wins)
+2. **Tombstone** (`_deleted`) → removed from HashMap
+3. **`array_push` patch** → pushes value to the specified array field
+4. **`set` patch** → walks the dot-path and sets the value
+5. **`remove` patch** → walks the dot-path and removes the target
+
+If a patch's path can't be resolved (missing field, out-of-bounds index), it is **silently skipped**. No data corruption is possible.
+
+### Compaction
+
+`db.compact()` bakes all patches into fresh base documents. The JSONL is rewritten containing only the current in-memory state of each document. All patches are eliminated.
+
+### Full Update Absorption
+
+If a `db.update()` (full replacement) occurs after patches, it overwrites the entire document. Any subsequent patches apply on top of the new base. This is correct because the replay engine processes entries in order.
