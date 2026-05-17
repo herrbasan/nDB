@@ -191,6 +191,35 @@ class Database {
   }
 
   /**
+   * Append a value to an array field.
+   * @param {string} id - Document ID.
+   * @param {string} field - Top-level array field name.
+   * @param {*} value - Value to append.
+   */
+  arrayPush(id, field, value) {
+    this._native.arrayPush(id, field, JSON.stringify(value));
+  }
+
+  /**
+   * Set a value at a dot-separated path within a document.
+   * @param {string} id - Document ID.
+   * @param {string} path - Dot-separated path (e.g. "messages.3.text").
+   * @param {*} value - Value to set.
+   */
+  set(id, path, value) {
+    this._native.set(id, path, JSON.stringify(value));
+  }
+
+  /**
+   * Remove a field or array element at a dot-separated path.
+   * @param {string} id - Document ID.
+   * @param {string} path - Dot-separated path (e.g. "messages.3" or "settings.theme").
+   */
+  remove(id, path) {
+    this._native.remove(id, path);
+  }
+
+  /**
    * Get all documents.
    * @returns {object[]}
    */

@@ -701,6 +701,187 @@ test('concurrent operations sequence', async () => {
   assertEqual(db.len(), 80, 'Should have 80 docs after mixed ops');
 });
 
+// ─── Phase 9: Atomic set / remove / arrayPush ───────────────────────
+
+section('Phase 9: Atomic set / remove / arrayPush');
+
+test('set updates top-level field', async () => {
+  const db = Database.openInMemory();
+  const id = db.insert({ title: 'old', count: 0 });
+  db.set(id, 'title', 'new');
+  const doc = db.get(id);
+  assertEqual(doc.title, 'new', 'Title should be updated');
+  assertEqual(doc.count, 0, 'Count should be unchanged');
+});
+
+test('set updates nested field', async () => {
+  const db = Database.openInMemory();
+  const id = db.insert({ settings: { theme: 'light', lang: 'en' } });
+  db.set(id, 'settings.theme', 'dark');
+  const doc = db.get(id);
+  assertEqual(doc.settings.theme, 'dark', 'Theme should be dark');
+  assertEqual(doc.settings.lang, 'en', 'Lang should be unchanged');
+});
+
+test('set updates array element by index', async () => {
+  const db = Database.openInMemory();
+  const id = db.insert({ messages: [
+    { text: 'hello', author: 'alice' },
+    { text: 'world', author: 'bob' }
+  ]});
+  db.set(id, 'messages.1.text', 'earth');
+  const doc = db.get(id);
+  assertEqual(doc.messages[1].text, 'earth', 'Second message text should be updated');
+  assertEqual(doc.messages[1].author, 'bob', 'Author should be unchanged');
+  assertEqual(doc.messages[0].text, 'hello', 'First message should be unchanged');
+});
+
+test('set creates new field', async () => {
+  const db = Database.openInMemory();
+  const id = db.insert({ existing: true });
+  db.set(id, 'newField', 42);
+  const doc = db.get(id);
+  assertEqual(doc.existing, true, 'Existing field should be unchanged');
+  assertEqual(doc.newField, 42, 'New field should be created');
+});
+
+test('set on nonexistent doc throws', async () => {
+  const db = Database.openInMemory();
+  let threw = false;
+  try { db.set('ghost', 'x', 1); } catch (e) { threw = true; }
+  assert(threw, 'Should throw for nonexistent doc');
+});
+
+test('remove deletes top-level field', async () => {
+  const db = Database.openInMemory();
+  const id = db.insert({ keep: true, drop: 'me' });
+  db.remove(id, 'drop');
+  const doc = db.get(id);
+  assertEqual(doc.keep, true, 'Keep should remain');
+  assert(doc.drop === undefined, 'Drop should be removed');
+});
+
+test('remove deletes nested field', async () => {
+  const db = Database.openInMemory();
+  const id = db.insert({ settings: { theme: 'dark', volume: 80 } });
+  db.remove(id, 'settings.volume');
+  const doc = db.get(id);
+  assertEqual(doc.settings.theme, 'dark', 'Theme should remain');
+  assert(doc.settings.volume === undefined, 'Volume should be removed');
+});
+
+test('remove shifts array elements', async () => {
+  const db = Database.openInMemory();
+  const id = db.insert({ items: [10, 20, 30, 40] });
+  db.remove(id, 'items.1');
+  const doc = db.get(id);
+  assertEqual(doc.items, [10, 30, 40], 'Array should shift after remove');
+});
+
+test('remove on nonexistent doc throws', async () => {
+  const db = Database.openInMemory();
+  let threw = false;
+  try { db.remove('ghost', 'x'); } catch (e) { threw = true; }
+  assert(threw, 'Should throw for nonexistent doc');
+});
+
+test('arrayPush appends to array field', async () => {
+  const db = Database.openInMemory();
+  const id = db.insert({ tags: ['a'] });
+  db.arrayPush(id, 'tags', 'b');
+  db.arrayPush(id, 'tags', 'c');
+  const doc = db.get(id);
+  assertEqual(doc.tags, ['a', 'b', 'c'], 'Tags should have all elements');
+});
+
+test('set + remove + arrayPush persist and replay', async () => {
+  const dir = createTempDir();
+  const path = join(dir, 'atomic_replay.jsonl');
+
+  const id = (() => {
+    const db = new Database(path);
+    const id = db.insert({ messages: [{ text: 'hi' }], title: 'init', count: 0 });
+    db.arrayPush(id, 'messages', { text: 'there' });
+    db.set(id, 'title', 'updated');
+    db.set(id, 'count', 2);
+    db.set(id, 'messages.0.text', 'hello');
+    db.remove(id, 'messages.1.text');
+    db.flush();
+    return id;
+  })();
+
+  const db2 = new Database(path);
+  const doc = db2.get(id);
+  assertEqual(doc.title, 'updated', 'Title should persist');
+  assertEqual(doc.count, 2, 'Count should persist');
+  assertEqual(doc.messages[0].text, 'hello', 'First message should be edited');
+  assertEqual(doc.messages[1].text, undefined, 'Second message text should be removed');
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('stress: rapid set same path', async () => {
+  const db = Database.openInMemory();
+  const id = db.insert({ counter: 0 });
+  for (let i = 1; i <= 500; i++) {
+    db.set(id, 'counter', i);
+  }
+  const doc = db.get(id);
+  assertEqual(doc.counter, 500, 'Counter should be 500 after 500 sets');
+});
+
+test('stress: set array elements then compact', async () => {
+  const dir = createTempDir();
+  const path = join(dir, 'stress_compact.jsonl');
+
+  const id = (() => {
+    const db = new Database(path);
+    const id = db.insert({ items: [] });
+    for (let i = 0; i < 100; i++) {
+      db.arrayPush(id, 'items', { v: i });
+    }
+    for (let i = 0; i < 50; i++) {
+      db.remove(id, 'items.0');
+    }
+    for (let i = 0; i < 50; i++) {
+      db.set(id, `items.${i}.v`, i * 100);
+    }
+    db.compact();
+    return id;
+  })();
+
+  const db2 = new Database(path);
+  const doc = db2.get(id);
+  assertEqual(doc.items.length, 50, 'Should have 50 items after removes');
+  assertEqual(doc.items[0].v, 0, 'First item v should be 0');
+  assertEqual(doc.items[49].v, 4900, 'Last item v should be 4900');
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('full update overwrites prior set patches', async () => {
+  const dir = createTempDir();
+  const path = join(dir, 'overwrite.jsonl');
+
+  const id = (() => {
+    const db = new Database(path);
+    const id = db.insert({ x: 1, y: 2 });
+    db.set(id, 'x', 99);
+    db.update(id, { z: 3 });
+    db.set(id, 'z', 42);
+    db.flush();
+    return id;
+  })();
+
+  const db2 = new Database(path);
+  const doc = db2.get(id);
+  assert(doc.x === undefined, 'x should not exist after full update');
+  assert(doc.y === undefined, 'y should not exist after full update');
+  assertEqual(doc.z, 42, 'z should be 42');
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
 // ─── Results ─────────────────────────────────────────────────────────
 
 console.log(`\n${'='.repeat(70)}`);

@@ -317,6 +317,78 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     }
 }
 
+// ─── Path-based Mutation Helpers ─────────────────────────────────────
+
+fn apply_path_set(doc: &mut Value, path: &str, value: Value) {
+    let segments: Vec<&str> = path.split('.').collect();
+    if segments.is_empty() {
+        return;
+    }
+    walk_and_set(doc, &segments, 0, value);
+}
+
+fn walk_and_set(current: &mut Value, segments: &[&str], depth: usize, value: Value) {
+    if depth >= segments.len() {
+        return;
+    }
+    let key = segments[depth];
+    let is_last = depth + 1 == segments.len();
+
+    if let Ok(idx) = key.parse::<usize>() {
+        if let Some(arr) = current.as_array_mut() {
+            if idx < arr.len() {
+                if is_last {
+                    arr[idx] = value;
+                } else {
+                    walk_and_set(&mut arr[idx], segments, depth + 1, value);
+                }
+            }
+        }
+    } else if let Some(obj) = current.as_object_mut() {
+        if is_last {
+            obj.insert(key.to_string(), value);
+        } else if obj.contains_key(key) {
+            let next = obj.get_mut(key).unwrap();
+            walk_and_set(next, segments, depth + 1, value);
+        }
+    }
+}
+
+fn apply_path_remove(doc: &mut Value, path: &str) {
+    let segments: Vec<&str> = path.split('.').collect();
+    if segments.is_empty() {
+        return;
+    }
+    walk_and_remove(doc, &segments, 0);
+}
+
+fn walk_and_remove(current: &mut Value, segments: &[&str], depth: usize) {
+    if depth >= segments.len() {
+        return;
+    }
+    let key = segments[depth];
+    let is_last = depth + 1 == segments.len();
+
+    if let Ok(idx) = key.parse::<usize>() {
+        if let Some(arr) = current.as_array_mut() {
+            if idx < arr.len() {
+                if is_last {
+                    arr.remove(idx);
+                } else {
+                    walk_and_remove(&mut arr[idx], segments, depth + 1);
+                }
+            }
+        }
+    } else if let Some(obj) = current.as_object_mut() {
+        if is_last {
+            obj.remove(key);
+        } else if obj.contains_key(key) {
+            let next = obj.get_mut(key).unwrap();
+            walk_and_remove(next, segments, depth + 1);
+        }
+    }
+}
+
 // ─── Database ───────────────────────────────────────────────────────
 
 /// The main nDB database.
@@ -371,20 +443,40 @@ impl Database {
                     // Tombstone entry
                     deleted.insert(id.to_string());
                     docs.remove(id);
-                } else if let Some("array_push") = doc.get("_op").and_then(|v| v.as_str()) {
-                    // Array push patch
-                    if let Some(field) = doc.get("field").and_then(|v| v.as_str()) {
-                        if let Some(value) = doc.get("value") {
-                            if let Some(existing) = docs.get_mut(id) {
-                                if let Some(obj) = existing.as_object_mut() {
-                                    if let Some(arr) = obj.get_mut(field).and_then(|v| v.as_array_mut()) {
-                                        arr.push(value.clone());
-                                    } else {
-                                        obj.insert(field.to_string(), serde_json::json!([value.clone()]));
+                } else if let Some(op) = doc.get("_op").and_then(|v| v.as_str()) {
+                    match op {
+                        "array_push" => {
+                            if let Some(field) = doc.get("field").and_then(|v| v.as_str()) {
+                                if let Some(value) = doc.get("value") {
+                                    if let Some(existing) = docs.get_mut(id) {
+                                        if let Some(obj) = existing.as_object_mut() {
+                                            if let Some(arr) = obj.get_mut(field).and_then(|v| v.as_array_mut()) {
+                                                arr.push(value.clone());
+                                            } else {
+                                                obj.insert(field.to_string(), serde_json::json!([value.clone()]));
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
+                        "set" => {
+                            if let Some(path) = doc.get("path").and_then(|v| v.as_str()) {
+                                if let Some(value) = doc.get("value") {
+                                    if let Some(existing) = docs.get_mut(id) {
+                                        apply_path_set(existing, path, value.clone());
+                                    }
+                                }
+                            }
+                        }
+                        "remove" => {
+                            if let Some(path) = doc.get("path").and_then(|v| v.as_str()) {
+                                if let Some(existing) = docs.get_mut(id) {
+                                    apply_path_remove(existing, path);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 } else {
                     deleted.remove(id);
@@ -635,6 +727,87 @@ impl Database {
                 "_op": "array_push",
                 "field": field,
                 "value": value
+            });
+            let line = serde_json::to_string(&patch)?;
+            let mut handle = self.get_file_handle()?;
+            if let Some(ref mut file) = *handle {
+                match self.persistence {
+                    Persistence::Immediate => {
+                        storage::append_line_sync(file, &self.path, &line)?;
+                    }
+                    _ => {
+                        storage::append_line(file, &self.path, &line)?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Set a value at a dot-separated path within a document. O(1) file write.
+    ///
+    /// Path examples: "title", "messages.3.content", "settings.theme"
+    /// Array indices are addressed by numeric path segments.
+    /// If the path doesn't resolve, the patch is silently skipped during replay.
+    pub fn set(&self, id: &str, path: &str, value: Value) -> Result<()> {
+        let _guard = self.writer.lock();
+
+        {
+            let mut docs = self.docs.write();
+            if let Some(doc) = docs.get_mut(id) {
+                apply_path_set(doc, path, value.clone());
+            } else {
+                return Err(Error::not_found(id));
+            }
+        }
+
+        if !self.is_in_memory() {
+            let patch = serde_json::json!({
+                "_id": id,
+                "_op": "set",
+                "path": path,
+                "value": value
+            });
+            let line = serde_json::to_string(&patch)?;
+            let mut handle = self.get_file_handle()?;
+            if let Some(ref mut file) = *handle {
+                match self.persistence {
+                    Persistence::Immediate => {
+                        storage::append_line_sync(file, &self.path, &line)?;
+                    }
+                    _ => {
+                        storage::append_line(file, &self.path, &line)?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove a field or array element at a dot-separated path. O(1) file write.
+    ///
+    /// Path examples: "title", "messages.3", "settings.theme"
+    /// For array elements, the index is removed and the array shifts.
+    /// If the path doesn't resolve, the patch is silently skipped during replay.
+    pub fn remove(&self, id: &str, path: &str) -> Result<()> {
+        let _guard = self.writer.lock();
+
+        {
+            let mut docs = self.docs.write();
+            if let Some(doc) = docs.get_mut(id) {
+                apply_path_remove(doc, path);
+            } else {
+                return Err(Error::not_found(id));
+            }
+        }
+
+        if !self.is_in_memory() {
+            let patch = serde_json::json!({
+                "_id": id,
+                "_op": "remove",
+                "path": path
             });
             let line = serde_json::to_string(&patch)?;
             let mut handle = self.get_file_handle()?;
@@ -1690,5 +1863,585 @@ mod tests {
             assert!(ids.insert(id), "duplicate ID generated");
         }
         assert_eq!(db.len(), 100);
+    }
+
+    // ─── Atomic set Operations ─────────────────────────────────────
+
+    #[test]
+    fn set_top_level_field() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"title": "old", "count": 0})).unwrap();
+        db.set(&id, "title", json!("new")).unwrap();
+        let doc = db.get(&id).unwrap();
+        assert_eq!(doc["title"], "new");
+        assert_eq!(doc["count"], 0);
+    }
+
+    #[test]
+    fn set_nested_field() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({
+            "settings": {"theme": "light", "lang": "en"}
+        })).unwrap();
+        db.set(&id, "settings.theme", json!("dark")).unwrap();
+        let doc = db.get(&id).unwrap();
+        assert_eq!(doc["settings"]["theme"], "dark");
+        assert_eq!(doc["settings"]["lang"], "en");
+    }
+
+    #[test]
+    fn set_deeply_nested() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({
+            "a": {"b": {"c": {"d": "old"}}}
+        })).unwrap();
+        db.set(&id, "a.b.c.d", json!("new")).unwrap();
+        let doc = db.get(&id).unwrap();
+        assert_eq!(doc["a"]["b"]["c"]["d"], "new");
+    }
+
+    #[test]
+    fn set_array_element_by_index() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({
+            "messages": [
+                {"text": "hello", "author": "alice"},
+                {"text": "world", "author": "bob"},
+                {"text": "foo", "author": "carol"}
+            ]
+        })).unwrap();
+        db.set(&id, "messages.1.text", json!("earth")).unwrap();
+        let doc = db.get(&id).unwrap();
+        assert_eq!(doc["messages"][1]["text"], "earth");
+        assert_eq!(doc["messages"][1]["author"], "bob");
+        assert_eq!(doc["messages"][0]["text"], "hello");
+        assert_eq!(doc["messages"][2]["text"], "foo");
+    }
+
+    #[test]
+    fn set_creates_new_field() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"existing": true})).unwrap();
+        db.set(&id, "new_field", json!(42)).unwrap();
+        let doc = db.get(&id).unwrap();
+        assert_eq!(doc["existing"], true);
+        assert_eq!(doc["new_field"], 42);
+    }
+
+    #[test]
+    fn set_nonexistent_doc_errors() {
+        let (db, _dir) = test_db();
+        let result = db.set("ghost", "field", json!("val"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn set_out_of_bounds_index_noop() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"items": [1, 2, 3]})).unwrap();
+        db.set(&id, "items.10", json!(99)).unwrap();
+        let doc = db.get(&id).unwrap();
+        let arr = doc["items"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0], 1);
+        assert_eq!(arr[1], 2);
+        assert_eq!(arr[2], 3);
+    }
+
+    #[test]
+    fn set_nonexistent_path_segment_noop() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"x": 1})).unwrap();
+        db.set(&id, "nonexistent.deep.path", json!("val")).unwrap();
+        let doc = db.get(&id).unwrap();
+        assert_eq!(doc["x"], 1);
+        assert!(doc.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn set_type_variety() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"s": "", "n": 0, "b": false, "a": [], "o": {}})).unwrap();
+        db.set(&id, "s", json!("string")).unwrap();
+        db.set(&id, "n", json!(3.14)).unwrap();
+        db.set(&id, "b", json!(true)).unwrap();
+        db.set(&id, "a", json!([1, 2, 3])).unwrap();
+        db.set(&id, "o", json!({"key": "val"})).unwrap();
+        db.set(&id, "null_val", json!(null)).unwrap();
+        let doc = db.get(&id).unwrap();
+        assert_eq!(doc["s"], "string");
+        assert_eq!(doc["n"], 3.14);
+        assert_eq!(doc["b"], true);
+        assert_eq!(doc["a"], json!([1, 2, 3]));
+        assert_eq!(doc["o"], json!({"key": "val"}));
+        assert!(doc["null_val"].is_null());
+    }
+
+    // ─── Atomic remove Operations ───────────────────────────────────
+
+    #[test]
+    fn remove_top_level_field() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"keep": true, "drop": "me"})).unwrap();
+        db.remove(&id, "drop").unwrap();
+        let doc = db.get(&id).unwrap();
+        assert_eq!(doc["keep"], true);
+        assert!(doc.get("drop").is_none());
+    }
+
+    #[test]
+    fn remove_nested_field() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({
+            "settings": {"theme": "dark", "lang": "en", "volume": 80}
+        })).unwrap();
+        db.remove(&id, "settings.volume").unwrap();
+        let doc = db.get(&id).unwrap();
+        assert_eq!(doc["settings"]["theme"], "dark");
+        assert_eq!(doc["settings"]["lang"], "en");
+        assert!(doc["settings"].get("volume").is_none());
+    }
+
+    #[test]
+    fn remove_array_element_shifts() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"items": [10, 20, 30, 40]})).unwrap();
+        db.remove(&id, "items.1").unwrap();
+        let doc = db.get(&id).unwrap();
+        assert_eq!(doc["items"], json!([10, 30, 40]));
+    }
+
+    #[test]
+    fn remove_array_first_and_last() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"items": [1, 2, 3]})).unwrap();
+        db.remove(&id, "items.0").unwrap();
+        assert_eq!(db.get(&id).unwrap()["items"], json!([2, 3]));
+        db.remove(&id, "items.1").unwrap();
+        assert_eq!(db.get(&id).unwrap()["items"], json!([2]));
+    }
+
+    #[test]
+    fn remove_out_of_bounds_noop() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"items": [1, 2]})).unwrap();
+        db.remove(&id, "items.5").unwrap();
+        assert_eq!(db.get(&id).unwrap()["items"], json!([1, 2]));
+    }
+
+    #[test]
+    fn remove_nonexistent_field_noop() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"x": 1})).unwrap();
+        db.remove(&id, "nonexistent").unwrap();
+        let doc = db.get(&id).unwrap();
+        assert_eq!(doc["x"], 1);
+        assert!(doc.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn remove_nonexistent_doc_errors() {
+        let (db, _dir) = test_db();
+        let result = db.remove("ghost", "field");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn remove_nested_array_element() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({
+            "conversations": [
+                {"messages": ["a", "b", "c"]},
+                {"messages": ["d", "e"]}
+            ]
+        })).unwrap();
+        db.remove(&id, "conversations.0.messages.1").unwrap();
+        let doc = db.get(&id).unwrap();
+        assert_eq!(doc["conversations"][0]["messages"], json!(["a", "c"]));
+        assert_eq!(doc["conversations"][1]["messages"], json!(["d", "e"]));
+    }
+
+    // ─── Persistence & Replay (set + remove) ─────────────────────────
+
+    #[test]
+    fn set_persists_and_replays() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("set_replay.jsonl");
+
+        let id = {
+            let db = Database::open(&path).unwrap();
+            let id = db.insert(json!({"title": "old", "score": 0})).unwrap();
+            db.set(&id, "title", json!("new")).unwrap();
+            db.set(&id, "score", json!(100)).unwrap();
+            db.flush().unwrap();
+            id
+        };
+
+        let db2 = Database::open(&path).unwrap();
+        let doc = db2.get(&id).unwrap();
+        assert_eq!(doc["title"], "new");
+        assert_eq!(doc["score"], 100);
+    }
+
+    #[test]
+    fn remove_persists_and_replays() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("remove_replay.jsonl");
+
+        let id = {
+            let db = Database::open(&path).unwrap();
+            let id = db.insert(json!({"a": 1, "b": 2, "c": 3})).unwrap();
+            db.remove(&id, "b").unwrap();
+            db.flush().unwrap();
+            id
+        };
+
+        let db2 = Database::open(&path).unwrap();
+        let doc = db2.get(&id).unwrap();
+        assert_eq!(doc["a"], 1);
+        assert_eq!(doc["c"], 3);
+        assert!(doc.get("b").is_none());
+    }
+
+    #[test]
+    fn mixed_ops_persist_and_replay() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mixed_replay.jsonl");
+
+        let id = {
+            let db = Database::open(&path).unwrap();
+            let id = db.insert(json!({
+                "messages": [{"text": "hi", "author": "alice"}],
+                "title": "Chat",
+                "count": 1
+            })).unwrap();
+            db.array_push(&id, "messages", json!({"text": "there", "author": "bob"})).unwrap();
+            db.set(&id, "title", json!("Updated Chat")).unwrap();
+            db.set(&id, "count", json!(2)).unwrap();
+            db.set(&id, "messages.0.text", json!("hello")).unwrap();
+            db.remove(&id, "messages.1.author").unwrap();
+            db.flush().unwrap();
+            id
+        };
+
+        let db2 = Database::open(&path).unwrap();
+        let doc = db2.get(&id).unwrap();
+        assert_eq!(doc["title"], "Updated Chat");
+        assert_eq!(doc["count"], 2);
+        assert_eq!(doc["messages"][0]["text"], "hello");
+        assert_eq!(doc["messages"][0]["author"], "alice");
+        assert_eq!(doc["messages"][1]["text"], "there");
+        assert!(doc["messages"][1].get("author").is_none());
+    }
+
+    #[test]
+    fn full_update_overwrites_patches() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("overwrite.jsonl");
+
+        let id = {
+            let db = Database::open(&path).unwrap();
+            let id = db.insert(json!({"x": 1, "y": 2})).unwrap();
+            db.set(&id, "x", json!(99)).unwrap();
+            db.update(&id, json!({"_id": id, "z": 3})).unwrap();
+            db.set(&id, "z", json!(42)).unwrap();
+            db.flush().unwrap();
+            id
+        };
+
+        let db2 = Database::open(&path).unwrap();
+        let doc = db2.get(&id).unwrap();
+        assert!(doc.get("x").is_none());
+        assert!(doc.get("y").is_none());
+        assert_eq!(doc["z"], 42);
+    }
+
+    #[test]
+    fn patches_after_tombstone_noop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tombstone_patch.jsonl");
+
+        let id = {
+            let db = Database::open(&path).unwrap();
+            let id = db.insert(json!({"val": 1})).unwrap();
+            db.delete(&id).unwrap();
+            assert!(db.set(&id, "val", json!(99)).is_err());
+            db.flush().unwrap();
+            id
+        };
+
+        let db2 = Database::open(&path).unwrap();
+        assert!(db2.get(&id).is_err());
+        assert_eq!(db2.len(), 0);
+    }
+
+    #[test]
+    fn compact_bakes_set_patches() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("compact_set.jsonl");
+
+        let id = {
+            let db = Database::open(&path).unwrap();
+            let id = db.insert(json!({"x": 0})).unwrap();
+            for i in 1..=50 {
+                db.set(&id, "x", json!(i)).unwrap();
+            }
+            db.compact().unwrap();
+            id
+        };
+
+        let file_content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = file_content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "compact should produce meta header + 1 doc");
+
+        let db2 = Database::open(&path).unwrap();
+        let doc = db2.get(&id).unwrap();
+        assert_eq!(doc["x"], 50);
+    }
+
+    #[test]
+    fn compact_bakes_remove_patches() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("compact_remove.jsonl");
+
+        let id = {
+            let db = Database::open(&path).unwrap();
+            let id = db.insert(json!({"a": 1, "b": 2, "c": 3, "d": 4})).unwrap();
+            db.remove(&id, "b").unwrap();
+            db.remove(&id, "d").unwrap();
+            db.compact().unwrap();
+            id
+        };
+
+        let file_content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = file_content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "compact should produce meta header + 1 doc");
+
+        let db2 = Database::open(&path).unwrap();
+        let doc = db2.get(&id).unwrap();
+        assert_eq!(doc["a"], 1);
+        assert_eq!(doc["c"], 3);
+        assert!(doc.get("b").is_none());
+        assert!(doc.get("d").is_none());
+    }
+
+    // ─── Stress Tests: set + remove ──────────────────────────────────
+
+    #[test]
+    fn stress_rapid_set_same_path() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"counter": 0})).unwrap();
+        for i in 1..=500 {
+            db.set(&id, "counter", json!(i)).unwrap();
+        }
+        let doc = db.get(&id).unwrap();
+        assert_eq!(doc["counter"], 500);
+    }
+
+    #[test]
+    fn stress_rapid_set_multiple_paths() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({
+            "a": 0, "b": 0, "c": 0, "d": 0, "e": 0
+        })).unwrap();
+        for i in 1..=200 {
+            db.set(&id, "a", json!(i)).unwrap();
+            db.set(&id, "b", json!(i * 2)).unwrap();
+            db.set(&id, "c", json!(i * 3)).unwrap();
+            db.set(&id, "d", json!(format!("val_{}", i))).unwrap();
+            db.set(&id, "e", json!(null)).unwrap();
+        }
+        let doc = db.get(&id).unwrap();
+        assert_eq!(doc["a"], 200);
+        assert_eq!(doc["b"], 400);
+        assert_eq!(doc["c"], 600);
+        assert_eq!(doc["d"], "val_200");
+        assert_eq!(doc["e"], Value::Null);
+    }
+
+    #[test]
+    fn stress_set_nested_array_elements() {
+        let (db, _dir) = test_db();
+        let items: Vec<Value> = (0..100).map(|i| json!({"v": i, "label": format!("item_{}", i)})).collect();
+        let id = db.insert(json!({"items": items.clone()})).unwrap();
+        for i in 0..100 {
+            db.set(&id, &format!("items.{}.v", i), json!(i * 10)).unwrap();
+            db.set(&id, &format!("items.{}.label", i), json!(format!("updated_{}", i))).unwrap();
+        }
+        let doc = db.get(&id).unwrap();
+        for i in 0..100 {
+            assert_eq!(doc["items"][i]["v"], i * 10);
+            assert_eq!(doc["items"][i]["label"], format!("updated_{}", i));
+        }
+    }
+
+    #[test]
+    fn stress_alternating_set_and_remove() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({
+            "keep": "forever",
+            "temp1": "a",
+            "temp2": "b",
+            "temp3": "c"
+        })).unwrap();
+        for i in 0..200 {
+            let field = format!("temp{}", (i % 3) + 1);
+            if i % 2 == 0 {
+                db.set(&id, &field, json!(format!("set_{}", i))).unwrap();
+            } else {
+                db.remove(&id, &field).unwrap();
+            }
+        }
+        let doc = db.get(&id).unwrap();
+        assert_eq!(doc["keep"], "forever");
+    }
+
+    #[test]
+    fn stress_array_push_then_set_elements() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"messages": []})).unwrap();
+        for i in 0..200 {
+            db.array_push(&id, "messages", json!({"text": format!("msg_{}", i), "edited": false})).unwrap();
+        }
+        for i in 0..200 {
+            if i % 5 == 0 {
+                db.set(&id, &format!("messages.{}.edited", i), json!(true)).unwrap();
+                db.set(&id, &format!("messages.{}.text", i), json!(format!("edited_{}", i))).unwrap();
+            }
+        }
+        let doc = db.get(&id).unwrap();
+        assert_eq!(doc["messages"].as_array().unwrap().len(), 200);
+        assert_eq!(doc["messages"][0]["text"], "edited_0");
+        assert_eq!(doc["messages"][0]["edited"], true);
+        assert_eq!(doc["messages"][1]["text"], "msg_1");
+        assert_eq!(doc["messages"][1]["edited"], false);
+        assert_eq!(doc["messages"][5]["text"], "edited_5");
+    }
+
+    #[test]
+    fn stress_persist_replay_large_set_chain() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("stress_replay.jsonl");
+
+        let id = {
+            let db = Database::open(&path).unwrap();
+            let id = db.insert(json!({
+                "counter": 0,
+                "values": [],
+                "label": "init"
+            })).unwrap();
+            for i in 1..=100 {
+                db.set(&id, "counter", json!(i)).unwrap();
+                db.set(&id, "label", json!(format!("step_{}", i))).unwrap();
+                db.array_push(&id, "values", json!(i)).unwrap();
+                if i % 10 == 0 {
+                    let idx = i - 10;
+                    db.set(&id, &format!("values.{}", idx), json!(i * 100)).unwrap();
+                }
+            }
+            db.flush().unwrap();
+            id
+        };
+
+        let db2 = Database::open(&path).unwrap();
+        let doc = db2.get(&id).unwrap();
+        assert_eq!(doc["counter"], 100);
+        assert_eq!(doc["label"], "step_100");
+        assert_eq!(doc["values"].as_array().unwrap().len(), 100);
+        assert_eq!(doc["values"][0], 1000);
+        assert_eq!(doc["values"][10], 2000);
+        assert_eq!(doc["values"][99], 100);
+    }
+
+    #[test]
+    fn stress_persist_replay_then_compact() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("stress_compact.jsonl");
+
+        let id = {
+            let db = Database::open(&path).unwrap();
+            let id = db.insert(json!({"items": []})).unwrap();
+            for i in 0..100 {
+                db.array_push(&id, "items", json!({"v": i})).unwrap();
+            }
+            for _ in 0..50 {
+                db.remove(&id, "items.0").unwrap();
+            }
+            for i in 0..50 {
+                db.set(&id, &format!("items.{}.v", i), json!(i * 100)).unwrap();
+            }
+            db.flush().unwrap();
+            db.compact().unwrap();
+
+            let doc = db.get(&id).unwrap();
+            assert_eq!(doc["items"].as_array().unwrap().len(), 50);
+            assert_eq!(doc["items"][0]["v"], 0);
+            assert_eq!(doc["items"][49]["v"], 4900);
+            id
+        };
+
+        let db2 = Database::open(&path).unwrap();
+        let doc = db2.get(&id).unwrap();
+        assert_eq!(doc["items"].as_array().unwrap().len(), 50);
+        assert_eq!(doc["items"][0]["v"], 0);
+        assert_eq!(doc["items"][49]["v"], 4900);
+    }
+
+    #[test]
+    fn stress_multiple_docs_concurrent_ops() {
+        let (db, _dir) = test_db();
+        let mut ids = Vec::new();
+        for d in 0..10 {
+            let id = db.insert(json!({
+                "doc_id": d,
+                "counter": 0,
+                "tags": [],
+                "meta": {"active": true}
+            })).unwrap();
+            ids.push(id);
+        }
+
+        for round in 0..50 {
+            for (idx, id) in ids.iter().enumerate() {
+                db.set(id, "counter", json!(round + 1)).unwrap();
+                db.array_push(id, "tags", json!(format!("r{}_{}", round, idx))).unwrap();
+                if round % 10 == 0 {
+                    db.set(id, "meta.active", json!(round % 20 != 0)).unwrap();
+                }
+            }
+        }
+
+        for (idx, id) in ids.iter().enumerate() {
+            let doc = db.get(id).unwrap();
+            assert_eq!(doc["counter"], 50);
+            assert_eq!(doc["tags"].as_array().unwrap().len(), 50);
+            assert_eq!(doc["tags"][0], format!("r0_{}", idx));
+            assert_eq!(doc["meta"]["active"], false);
+        }
+    }
+
+    #[test]
+    fn stress_remove_shifts_correctness() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"nums": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]})).unwrap();
+        db.remove(&id, "nums.0").unwrap();
+        assert_eq!(db.get(&id).unwrap()["nums"], json!([1, 2, 3, 4, 5, 6, 7, 8, 9]));
+        db.remove(&id, "nums.0").unwrap();
+        assert_eq!(db.get(&id).unwrap()["nums"], json!([2, 3, 4, 5, 6, 7, 8, 9]));
+        db.remove(&id, "nums.7").unwrap();
+        assert_eq!(db.get(&id).unwrap()["nums"], json!([2, 3, 4, 5, 6, 7, 8]));
+        db.remove(&id, "nums.3").unwrap();
+        assert_eq!(db.get(&id).unwrap()["nums"], json!([2, 3, 4, 6, 7, 8]));
+    }
+
+    #[test]
+    fn stress_remove_all_array_elements() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"items": [1, 2, 3]})).unwrap();
+        db.remove(&id, "items.0").unwrap();
+        db.remove(&id, "items.0").unwrap();
+        db.remove(&id, "items.0").unwrap();
+        let doc = db.get(&id).unwrap();
+        assert_eq!(doc["items"], json!([]));
     }
 }

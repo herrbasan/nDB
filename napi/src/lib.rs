@@ -239,6 +239,22 @@ impl Database {
             .map_err(|e| Error::from_reason(format!("Array push failed: {}", e)))
     }
 
+    /// Set a value at a dot-separated path within a document.
+    #[napi]
+    pub fn set(&self, id: String, path: String, value: String) -> Result<()> {
+        let val: serde_json::Value = serde_json::from_str(&value)
+            .map_err(|e| Error::from_reason(format!("Invalid JSON value: {}", e)))?;
+        self.inner()?.set(&id, &path, val)
+            .map_err(|e| Error::from_reason(format!("Set failed: {}", e)))
+    }
+
+    /// Remove a field or array element at a dot-separated path.
+    #[napi]
+    pub fn remove(&self, id: String, path: String) -> Result<()> {
+        self.inner()?.remove(&id, &path)
+            .map_err(|e| Error::from_reason(format!("Remove failed: {}", e)))
+    }
+
     /// Delete a document by ID (soft delete / tombstone).
     ///
     /// ```js
