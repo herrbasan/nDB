@@ -94,6 +94,15 @@ let db = Database::open("data.jsonl")?
     .with_trash_mode(TrashMode::TTL(Duration::from_secs(86400)));
 ```
 
+#### `with_trash_ttl(ttl: Duration, interval: Duration) -> Database`
+
+Set auto-trash TTL and the background interval to purge. The background thread will safely block until `Drop`.
+
+```rust
+let db = Database::open("data.jsonl")?
+    .with_trash_ttl(Duration::from_secs(86400), Duration::from_secs(3600)); // 1 day TTL, 1 hour purge check
+```
+
 ---
 
 ## Layer 1: Core Operations

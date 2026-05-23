@@ -404,6 +404,8 @@ pub struct Database {
     docs: RwLock<HashMap<String, Value>>,
     /// Set of deleted document IDs (tombstones).
     deleted: RwLock<HashSet<String>>,
+    /// In-memory file reference counter: nURI string → count.
+    file_refs: RwLock<HashMap<String, usize>>,
     /// Secondary indexes (opt-in).
     indexes: RwLock<HashMap<String, Box<dyn Index>>>,
     /// Single-writer mutex.
@@ -412,6 +414,14 @@ pub struct Database {
     persistence: Persistence,
     /// Trash mode.
     trash_mode: TrashMode,
+    /// Auto-purge TTL duration.
+    trash_ttl: Option<Duration>,
+    /// Interval for TTL background check.
+    trash_purge_interval: Option<Duration>,
+    /// Channel sender to wake/terminate the TTL thread on Drop.
+    ttl_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// Background thread handle for TTL purging.
+    ttl_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Append-only file handle (held open for writes).
     file_handle: Mutex<Option<fs::File>>,
 }
@@ -485,15 +495,30 @@ impl Database {
             }
         }
 
+        // Initialize file reference counter
+        let mut file_refs: HashMap<String, usize> = HashMap::new();
+        for doc in docs.values() {
+            let mut refs = HashSet::new();
+            Self::extract_file_refs(doc, &mut refs);
+            for r in refs {
+                *file_refs.entry(r).or_insert(0) += 1;
+            }
+        }
+
         Ok(Database {
             path,
             base_dir,
             docs: RwLock::new(docs),
             deleted: RwLock::new(deleted),
+            file_refs: RwLock::new(file_refs),
             indexes: RwLock::new(HashMap::new()),
             writer: Mutex::new(()),
             persistence: Persistence::Lazy,
             trash_mode: TrashMode::Manual,
+            trash_ttl: None,
+            trash_purge_interval: None,
+            ttl_tx: Mutex::new(None),
+            ttl_thread: Mutex::new(None),
             file_handle: Mutex::new(None),
         })
     }
@@ -505,10 +530,15 @@ impl Database {
             base_dir: PathBuf::new(),
             docs: RwLock::new(HashMap::new()),
             deleted: RwLock::new(HashSet::new()),
+            file_refs: RwLock::new(HashMap::new()),
             indexes: RwLock::new(HashMap::new()),
             writer: Mutex::new(()),
             persistence: Persistence::Lazy,
             trash_mode: TrashMode::Manual,
+            trash_ttl: None,
+            trash_purge_interval: None,
+            ttl_tx: Mutex::new(None),
+            ttl_thread: Mutex::new(None),
             file_handle: Mutex::new(None),
         })
     }
@@ -523,6 +553,105 @@ impl Database {
     pub fn with_trash_mode(mut self, mode: TrashMode) -> Self {
         self.trash_mode = mode;
         self
+    }
+
+    /// Set auto-trash TTL and the background interval to purge.
+    pub fn with_trash_ttl(mut self, ttl: Duration, interval: Duration) -> Self {
+        self.trash_ttl = Some(ttl);
+        self.trash_purge_interval = Some(interval);
+        self.start_ttl_thread();
+        self
+    }
+
+    /// Internal helper to start the TTL background thread using a cancellation channel.
+    fn start_ttl_thread(&mut self) {
+        if self.is_in_memory() {
+            return;
+        }
+        
+        let interval = self.trash_purge_interval.unwrap();
+        let base_dir = self.base_dir.clone();
+        let trash_file = self.trash_doc_path();
+        let mode = self.trash_mode;
+        let ttl_dur = self.trash_ttl.unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.ttl_tx.lock() = Some(tx);
+
+        let thread_handle = std::thread::spawn(move || {
+            loop {
+                match rx.recv_timeout(interval) {
+                    Ok(_) => break, // Cancellation signal received via tx.send(())
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // Time to purge
+                        let _ = Self::purge_trash_static(&base_dir, &trash_file, mode, Some(ttl_dur));
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break, // DB dropped
+                }
+            }
+        });
+
+        *self.ttl_thread.lock() = Some(thread_handle);
+    }
+
+    /// Static version of purge_trash that doesn't need `&self`, used by the background thread.
+    fn purge_trash_static(
+        base_dir: &Path,
+        trash_file: &Path,
+        trash_mode: TrashMode,
+        trash_ttl: Option<Duration>,
+    ) -> Result<usize> {
+        let ttl = match (trash_mode, trash_ttl) {
+            (TrashMode::TTL(t), _) => t,
+            (_, Some(t)) => t,
+            _ => Duration::ZERO,
+        };
+
+        if ttl == Duration::ZERO {
+            return Ok(0);
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cutoff = now.saturating_sub(ttl.as_secs());
+
+        let mut purged_count = 0;
+        if trash_file.exists() {
+            let all_trash = storage::read_trash(trash_file)?;
+            let mut keep: Vec<&Value> = Vec::new();
+            for doc in &all_trash {
+                if let Some(deleted) = doc.get("_deleted").and_then(|v| v.as_u64()) {
+                    if deleted > cutoff {
+                        keep.push(doc);
+                    } else {
+                        purged_count += 1;
+                    }
+                } else {
+                    keep.push(doc);
+                }
+            }
+            if purged_count > 0 {
+                storage::rewrite_atomic(trash_file, &keep)?;
+            }
+        }
+
+        let trash_files_dir = base_dir.join("_trash").join("files");
+        if trash_files_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(trash_files_dir) {
+                for entry in entries.flatten() {
+                    if let Ok(file_type) = entry.file_type() {
+                        if file_type.is_dir() {
+                            let bucket = FileBucket::new(&entry.file_name().to_string_lossy(), base_dir);
+                            let _ = bucket.purge_trash_ttl(ttl);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(purged_count)
     }
 
     /// Check if this is an in-memory only database.
@@ -582,6 +711,8 @@ impl Database {
         }
         drop(indexes);
 
+        self.increment_file_refs(&doc);
+
         // Update in-memory store
         let mut docs = self.docs.write();
         self.deleted.write().remove(&id);
@@ -626,6 +757,8 @@ impl Database {
         }
         drop(indexes);
 
+        self.increment_file_refs(&doc);
+
         let mut docs = self.docs.write();
         self.deleted.write().remove(&id);
         docs.insert(id.clone(), doc);
@@ -660,10 +793,12 @@ impl Database {
             .insert("_id".to_string(), Value::String(id.to_string()));
 
         // Remove old values from indexes, add new
+        let mut old_doc_clone = None;
         let mut indexes = self.indexes.write();
         {
             let docs = self.docs.read();
             if let Some(old_doc) = docs.get(id) {
+                old_doc_clone = Some(old_doc.clone());
                 for (field, index) in indexes.iter_mut() {
                     if let Some(old_val) = old_doc.get(field) {
                         index.remove(old_val, id);
@@ -677,6 +812,10 @@ impl Database {
             }
         }
         drop(indexes);
+
+        if let Some(old) = old_doc_clone {
+            self.handle_ref_delta_and_trash(&old, &new_doc);
+        }
 
         // Append to file
         if !self.is_in_memory() {
@@ -705,15 +844,20 @@ impl Database {
     pub fn array_push(&self, id: &str, field: &str, value: Value) -> Result<()> {
         let _guard = self.writer.lock();
 
+        let mut old_doc = None;
         {
             let mut docs = self.docs.write();
             if let Some(doc) = docs.get_mut(id) {
+                old_doc = Some(doc.clone());
                 if let Some(obj) = doc.as_object_mut() {
                     if let Some(arr) = obj.get_mut(field).and_then(|v| v.as_array_mut()) {
                         arr.push(value.clone());
                     } else {
                         obj.insert(field.to_string(), serde_json::json!([value.clone()]));
                     }
+                }
+                if let Some(old) = &old_doc {
+                    self.handle_ref_delta_and_trash(old, doc);
                 }
             } else {
                 return Err(Error::not_found(id));
@@ -753,10 +897,15 @@ impl Database {
     pub fn set(&self, id: &str, path: &str, value: Value) -> Result<()> {
         let _guard = self.writer.lock();
 
+        let mut old_doc = None;
         {
             let mut docs = self.docs.write();
             if let Some(doc) = docs.get_mut(id) {
+                old_doc = Some(doc.clone());
                 apply_path_set(doc, path, value.clone());
+                if let Some(old) = &old_doc {
+                    self.handle_ref_delta_and_trash(old, doc);
+                }
             } else {
                 return Err(Error::not_found(id));
             }
@@ -794,10 +943,15 @@ impl Database {
     pub fn remove(&self, id: &str, path: &str) -> Result<()> {
         let _guard = self.writer.lock();
 
+        let mut old_doc = None;
         {
             let mut docs = self.docs.write();
             if let Some(doc) = docs.get_mut(id) {
+                old_doc = Some(doc.clone());
                 apply_path_remove(doc, path);
+                if let Some(old) = &old_doc {
+                    self.handle_ref_delta_and_trash(old, doc);
+                }
             } else {
                 return Err(Error::not_found(id));
             }
@@ -827,14 +981,67 @@ impl Database {
     }
 
     /// Delete a document (soft delete / tombstone). O(1).
+    /// Helper to get the path of the persistent trash file.
+    fn trash_doc_path(&self) -> PathBuf {
+        let filename = self.path.file_name().unwrap_or(std::ffi::OsStr::new("data.jsonl"));
+        self.base_dir.join("_trash").join("docs").join(filename)
+    }
+
+    /// Delete a document by ID. O(1) duration.
+    /// In an on-disk database, writes a tombstone instead of deleting data.
     pub fn delete(&self, id: &str) -> Result<()> {
         let _guard = self.writer.lock();
 
-        {
+        let doc_to_trash = {
             let docs = self.docs.read();
-            if !docs.contains_key(id) {
+            if let Some(doc) = docs.get(id) {
+                doc.clone()
+            } else {
                 return Err(Error::not_found(id));
             }
+        };
+
+        // Extract file references safely
+        let mut extracted_file_refs = HashSet::new();
+        Self::extract_file_refs(&doc_to_trash, &mut extracted_file_refs);
+
+        let mut orphaned_files = Vec::new();
+        // Update in-memory file reference counter
+        {
+            let mut file_refs = self.file_refs.write();
+            for r in extracted_file_refs {
+                if let Some(count) = file_refs.get_mut(&r) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        file_refs.remove(&r);
+                        orphaned_files.push(r);
+                    }
+                }
+            }
+        }
+
+        // Trash the orphaned files
+        for f in &orphaned_files {
+            if let Some(file_ref) = FileRef::from_compact(f) {
+                let bucket = self.bucket(&file_ref.bucket);
+                let _ = bucket.delete(&file_ref);
+            }
+        }
+
+        // Append to persistent doc trash file
+        if !self.is_in_memory() && self.trash_mode != TrashMode::Off {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let mut trash_doc = doc_to_trash;
+            if let Some(obj) = trash_doc.as_object_mut() {
+                obj.insert("_deleted".to_string(), serde_json::json!(now));
+                if !orphaned_files.is_empty() {
+                    obj.insert("_trashed_files".to_string(), serde_json::json!(orphaned_files));
+                }
+            }
+            let _ = storage::append_doc_trash(&self.trash_doc_path(), &trash_doc);
         }
 
         // Remove from indexes
@@ -1068,7 +1275,7 @@ impl Database {
 
     // ─── Compaction & Trash ────────────────────────────────────────
 
-    /// Compact the database: rewrite active docs, archive deleted to trash.
+    /// Compact the database: rewrite active docs to a single file and discard any tombstones.
     pub fn compact(&self) -> Result<()> {
         let _guard = self.writer.lock();
 
@@ -1085,31 +1292,67 @@ impl Database {
         let docs = self.docs.read();
         let active: Vec<&Value> = docs.values().collect();
 
-        // Collect deleted docs from the file (re-read to find tombstones)
-        let raw_docs = storage::read_all(&self.path)?;
-        let mut trash_docs: Vec<&Value> = Vec::new();
-        for doc in &raw_docs {
-            if doc.get("_deleted").is_some() {
-                trash_docs.push(doc);
-            }
-        }
-
-        // Archive deleted to trash
-        if !trash_docs.is_empty() {
-            let trash_dir = self.base_dir.join("_trash").join("docs");
-            let collection_name = self
-                .path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            storage::append_trash(&trash_dir, &collection_name, &trash_docs)?;
-        }
-
-        // Rewrite active docs
+        // Rewrite active docs. Tombstones in the old data.jsonl are permanently dropped, 
+        // which is safe because `delete()` already archived the full documents into 
+        // the persistent `_trash/docs/{dbname}.jsonl` file.
         storage::rewrite_atomic(&self.path, &active)?;
 
         Ok(())
+    }
+
+    /// Purge documents from the persistent trash file and files from the file trash 
+    /// that are older than the configured TTL (or all if duration is ZERO).
+    pub fn purge_trash(&self) -> Result<usize> {
+        let ttl = match (self.trash_mode, self.trash_ttl) {
+            (TrashMode::TTL(t), _) => t,
+            (_, Some(t)) => t,
+            _ => Duration::ZERO,
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cutoff = now.saturating_sub(ttl.as_secs());
+
+        // Purge Document Trash
+        let mut purged_count = 0;
+        let trash_file = self.trash_doc_path();
+        if trash_file.exists() {
+            let all_trash = storage::read_trash(&trash_file)?;
+            let mut keep: Vec<&Value> = Vec::new();
+            for doc in &all_trash {
+                if let Some(deleted) = doc.get("_deleted").and_then(|v| v.as_u64()) {
+                    if deleted > cutoff {
+                        keep.push(doc); // Still active in trash
+                    } else {
+                        purged_count += 1; // Passed TTL
+                    }
+                } else {
+                    keep.push(doc); // Keep malformed safe
+                }
+            }
+            if purged_count > 0 {
+                storage::rewrite_atomic(&trash_file, &keep)?;
+            }
+        }
+
+        // Purge File Trash in all buckets using Folder-Led Purging
+        let trash_files_dir = self.base_dir.join("_trash").join("files");
+        if trash_files_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(trash_files_dir) {
+                for entry in entries.flatten() {
+                    if let Ok(file_type) = entry.file_type() {
+                        if file_type.is_dir() {
+                            let bucket = self.bucket(&entry.file_name().to_string_lossy());
+                            let _ = bucket.purge_trash_ttl(ttl);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(purged_count)
     }
 
     /// Export a pristine snapshot of the database to a target directory.
@@ -1176,7 +1419,6 @@ impl Database {
     }
 
     /// Restore a deleted document from trash by ID.
-    /// Re-reads the file to find the last non-deleted version.
     pub fn restore(&self, id: &str) -> Result<()> {
         let _guard = self.writer.lock();
 
@@ -1184,20 +1426,47 @@ impl Database {
             return Err(Error::invalid_arg("cannot restore in in-memory database"));
         }
 
-        // Read file to find the document before tombstone
-        let raw_docs = storage::read_all(&self.path)?;
-        let mut last_version: Option<Value> = None;
-        for doc in &raw_docs {
+        // Read TRASH file to find the most recent trash entry for this ID
+        let trash_docs = storage::read_trash(&self.trash_doc_path())?;
+        let mut last_trash_entry: Option<Value> = None;
+        for doc in trash_docs.into_iter().rev() {
             if doc.get("_id").and_then(|v| v.as_str()) == Some(id) {
-                if doc.get("_deleted").is_some() {
-                    // Tombstone — stop looking
-                    break;
-                }
-                last_version = Some(doc.clone());
+                last_trash_entry = Some(doc);
+                break;
             }
         }
 
-        let doc = last_version.ok_or_else(|| Error::not_found(id))?;
+        let mut trash_doc = last_trash_entry.ok_or_else(|| Error::not_found(id))?;
+
+        // Extract and restore any implicitly trashed files
+        if let Some(trashed_files) = trash_doc.get("_trashed_files").and_then(|v| v.as_array()) {
+            for f in trashed_files {
+                if let Some(s) = f.as_str() {
+                    if let Some(file_ref) = FileRef::from_compact(s) {
+                        let bucket = self.bucket(&file_ref.bucket);
+                        let _ = bucket.restore(&file_ref.id, &file_ref.ext);
+                    }
+                }
+            }
+        }
+
+        // Strictly strip engine metadata
+        if let Some(obj) = trash_doc.as_object_mut() {
+            obj.remove("_deleted");
+            obj.remove("_trashed_files");
+        }
+
+        let doc = trash_doc;
+
+        // Restore file reference counters
+        let mut extracted_file_refs = HashSet::new();
+        Self::extract_file_refs(&doc, &mut extracted_file_refs);
+        {
+            let mut file_refs = self.file_refs.write();
+            for r in extracted_file_refs {
+                *file_refs.entry(r).or_insert(0) += 1;
+            }
+        }
 
         // Append restored doc to file
         let line = serde_json::to_string(&doc)?;
@@ -1361,6 +1630,73 @@ impl Database {
             _ => {}
         }
     }
+
+    /// Diff file refs between old and new state, update counters, and trash orphaned.
+    fn handle_ref_delta_and_trash(&self, old_doc: &Value, new_doc: &Value) {
+        let mut old_refs = HashSet::new();
+        Self::extract_file_refs(old_doc, &mut old_refs);
+        let mut new_refs = HashSet::new();
+        Self::extract_file_refs(new_doc, &mut new_refs);
+
+        let to_decrement: HashSet<_> = old_refs.difference(&new_refs).cloned().collect();
+        let to_increment: HashSet<_> = new_refs.difference(&old_refs).cloned().collect();
+
+        let mut orphaned_files = Vec::new();
+        {
+            let mut file_refs = self.file_refs.write();
+            for r in to_decrement {
+                if let Some(count) = file_refs.get_mut(&r) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        file_refs.remove(&r);
+                        orphaned_files.push(r);
+                    }
+                }
+            }
+            for r in to_increment {
+                *file_refs.entry(r).or_insert(0) += 1;
+            }
+        }
+
+        for f in &orphaned_files {
+            if let Some(file_ref) = FileRef::from_compact(f) {
+                let bucket = self.bucket(&file_ref.bucket);
+                let _ = bucket.delete(&file_ref);
+            }
+        }
+    }
+
+    /// Increment file ref counts for all refs in a document
+    fn increment_file_refs(&self, doc: &Value) {
+        let mut extracted = HashSet::new();
+        Self::extract_file_refs(doc, &mut extracted);
+        if extracted.is_empty() { return; }
+        
+        let mut file_refs = self.file_refs.write();
+        for r in extracted {
+            *file_refs.entry(r).or_insert(0) += 1;
+        }
+    }
+
+    /// Decrement file ref counts and return any that hit zero (orphaned)
+    fn decrement_file_refs(&self, doc: &Value) -> Vec<String> {
+        let mut extracted = HashSet::new();
+        Self::extract_file_refs(doc, &mut extracted);
+        let mut orphaned = Vec::new();
+        if extracted.is_empty() { return orphaned; }
+        
+        let mut file_refs = self.file_refs.write();
+        for r in extracted {
+            if let Some(count) = file_refs.get_mut(&r) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    file_refs.remove(&r);
+                    orphaned.push(r);
+                }
+            }
+        }
+        orphaned
+    }
 }
 
 impl Error {
@@ -1369,6 +1705,23 @@ impl Error {
             field: field.into(),
             reason: reason.into(),
         }
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        // Signal the TTL background thread to stop
+        if let Some(tx) = self.ttl_tx.lock().take() {
+            let _ = tx.send(());
+        }
+        
+        // Wait for it to finish gracefully to prevent Node.js hanging
+        if let Some(handle) = self.ttl_thread.lock().take() {
+            let _ = handle.join();
+        }
+
+        // Flush any pending writes if lazy
+        let _ = self.flush();
     }
 }
 

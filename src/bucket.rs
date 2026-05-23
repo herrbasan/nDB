@@ -220,15 +220,30 @@ impl FileBucket {
     }
 
     /// Purge trashed files older than given duration.
-    pub fn purge_trash(&self, _older_than: std::time::Duration) -> Result<usize> {
+    pub fn purge_trash_ttl(&self, older_than: std::time::Duration) -> Result<usize> {
         let trash_dir = self.trash_dir();
         if !trash_dir.exists() {
             return Ok(0);
         }
 
+        let now = std::time::SystemTime::now();
+        let check_ttl = older_than > std::time::Duration::ZERO;
         let mut count = 0;
         for entry in fs::read_dir(&trash_dir).map_err(Error::io_err(&trash_dir, "read trash dir"))? {
             let entry = entry.map_err(Error::io_err(&trash_dir, "read trash entry"))?;
+            
+            if check_ttl {
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        if let Ok(age) = now.duration_since(modified) {
+                            if age <= older_than {
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            
             if let Err(e) = fs::remove_file(entry.path()) {
                 // Log but continue
                 eprintln!("purge warning: {}", e);
@@ -239,9 +254,14 @@ impl FileBucket {
         Ok(count)
     }
 
-    /// Clear all trashed files.
+    /// Complete manual purge.
+    pub fn purge_trash(&self) -> Result<usize> {
+        self.purge_trash_ttl(std::time::Duration::ZERO)
+    }
+
+    /// Clear all trashed files (alias for manual purge).
     pub fn clear_trash(&self) -> Result<usize> {
-        self.purge_trash(std::time::Duration::ZERO)
+        self.purge_trash_ttl(std::time::Duration::ZERO)
     }
 
     /// Get the bucket name.

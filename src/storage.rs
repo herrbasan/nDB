@@ -190,30 +190,27 @@ pub fn rewrite_atomic(path: &Path, docs: &[&Value]) -> Result<()> {
     Ok(())
 }
 
-/// Append documents to a trash file (dated archive).
-pub fn append_trash(trash_dir: &Path, collection_name: &str, docs: &[&Value]) -> Result<()> {
-    fs::create_dir_all(trash_dir).map_err(Error::io_err(trash_dir, "create trash directory"))?;
-
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let trash_file = trash_dir.join(format!("{}_{}.jsonl", collection_name, secs));
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&trash_file)
-        .map_err(Error::io_err(&trash_file, "create trash file"))?;
-
-    for doc in docs {
-        let line = serde_json::to_string(doc)?;
-        writeln!(file, "{}", line).map_err(Error::io_err(&trash_file, "write trash doc"))?;
+/// Append a single document to the persistent trash file.
+/// Initializes the file with a meta header if it doesn't exist.
+pub fn append_doc_trash(trash_path: &Path, doc: &Value) -> Result<()> {
+    if !trash_path.exists() {
+        init_file(trash_path)?;
     }
-
+    let mut file = open_for_append(trash_path)?;
+    let line = serde_json::to_string(doc)?;
+    writeln!(file, "{}", line).map_err(Error::io_err(trash_path, "write trash doc"))?;
     file.flush()
-        .map_err(Error::io_err(&trash_file, "flush trash file"))?;
+        .map_err(Error::io_err(trash_path, "flush trash file"))?;
     Ok(())
+}
+
+/// Read all documents from a trash file.
+/// Reuses the robust read_all logic to skip meta headers and corrupted lines.
+pub fn read_trash(trash_path: &Path) -> Result<Vec<Value>> {
+    if !trash_path.exists() {
+        return Ok(Vec::new());
+    }
+    read_all(trash_path)
 }
 
 #[cfg(test)]

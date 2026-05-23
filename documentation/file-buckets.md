@@ -104,20 +104,29 @@ Files are **not** permanently deleted immediately. They are moved to:
 _trash/files/{bucket_name}/{hash}.{ext}
 ```
 
-### `restore(file_ref: &FileRef) -> Result<()>`
+### `restore(hash: &str, ext: &str) -> Result<()>`
 
 Restore a file from trash.
 
 ```rust
-bucket.restore(&meta._file)?;
+bucket.restore(&meta._file.id, &meta._file.ext)?;
 ```
 
-### `purge_trash() -> Result<()>`
+### Automatic Garbage Collection
 
-Permanently delete all trashed files in this bucket.
+In `nDB`, file trashing is designed to happen proactively via `gc_buckets()`. Due to atomic ref-counting on active paths embedded within JSON docs, calling `db.gc_buckets()` parses all dynamically unreferenced files and sweeps them entirely out of the active buckets into the `_trash/` directories in O(n_files) time.
 
 ```rust
-bucket.purge_trash()?;
+let trashed = db.gc_buckets()?;
+println!("GC collected {} orphaned files.", trashed);
+```
+
+### `purge_trash_ttl(ttl: Duration) -> Result<()>`
+
+Delete all trashed files in this bucket that exceed the given TTL by reading their filesystem modification date.
+
+```rust
+bucket.purge_trash_ttl(Duration::from_secs(86400))?;
 ```
 
 ---

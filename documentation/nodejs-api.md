@@ -78,6 +78,8 @@ const db2 = Database.open('./data/app.jsonl', {
 |--------|------|---------|-------------|
 | `persistence` | `string` | `'lazy'` | `'lazy'`, `'immediate'`, or `'scheduled'` |
 | `interval` | `number` | `60` | Seconds between flushes (for `scheduled` mode) |
+| `trash_ttl` | `number` | `undefined` | Auto-empty trash TTL in seconds (e.g., 86400 for 1 day) |
+| `trash_purge_interval` | `number` | `3600` | Background loop interval in seconds (default 1 hour) |
 
 #### `Database.openInMemory()`
 
@@ -465,15 +467,14 @@ List all active files in a bucket.
 const files = db.listFiles('avatars');
 files.forEach(f => console.log(f));
 ```
-files.forEach(f => console.log(f.name, f.size));
-```
 
-#### `purgeTrash() → void`
+### `gcBuckets() → number`
 
-Permanently delete all trashed files.
+Perform garabage collection on all file buckets. Iterates over all files stored in `_files/` and moves any unreferenced file into `_trash/files/`. Returns the number of files successfully trashed.
 
 ```js
-avatars.purgeTrash();
+const trashedCount = db.gcBuckets();
+console.log(`Garbage collection trashed ${trashedCount} files.`);
 ```
 
 ---
