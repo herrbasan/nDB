@@ -15,6 +15,10 @@ nDB is an **in-memory document database** with JSON Lines persistence, layered q
 > 
 > This removes the need for upper-layer management wrappers (like the deprecated nGDB). nDB now natively handles **Delta patch operations** (e.g. `array_push`) for large objects, **opt-in schema enforcement**, **nURI Links** (`bucket:hash.ext`), and **bucket garbage collection**.
 
+## What's New in v1.2.0 (Non-Breaking)
+- **Background Trash TTL**: Added the ability to define a TTL (Time-To-Live) for trashed files and documents, with a non-blocking background thread that automatically cleans up expired trash.
+- **Garbage Collection API**: Added new `gcBuckets()` (Node.js) / `gc_buckets()` (Rust) APIs to scan file buckets and automatically trash unreferenced files.
+- **Opt-in Compatibility**: These additions are completely backward-compatible. Users can opt in to the background GC via `trash_ttl` and `trash_purge_interval` options in `Database.open()`.
 
 ## Features
 
