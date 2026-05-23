@@ -1,6 +1,6 @@
 {
   "name": "ndb",
-  "version": "0.1.0",
+  "version": "1.2.0",
   "description": "Human-readable document database for the AI age. Standalone embeddable database for Node.js and Electron.",
   "main": "index.js",
   "types": "index.d.ts",

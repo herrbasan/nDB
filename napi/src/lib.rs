@@ -144,6 +144,13 @@ impl Database {
                     }
                 }
             }
+            if let Some(ttl) = opts.trash_ttl {
+                let interval = opts.trash_purge_interval.unwrap_or(3600);
+                db = db.with_trash_ttl(
+                    std::time::Duration::from_secs(ttl as u64),
+                    std::time::Duration::from_secs(interval as u64)
+                );
+            }
         }
 
         Ok(Self {
@@ -531,5 +538,9 @@ pub struct DatabaseOptions {
     pub persistence: Option<String>,
     /// Interval in seconds for scheduled persistence. Default: 60.
     pub interval: Option<u32>,
+    /// Auto-empty trash TTL in seconds. Default: no auto-empty.
+    pub trash_ttl: Option<u32>,
+    /// Background interval in seconds to check for expired trash. Default: 3600 (1 hour).
+    pub trash_purge_interval: Option<u32>,
 }
 

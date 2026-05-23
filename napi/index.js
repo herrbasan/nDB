@@ -123,6 +123,8 @@ class Database {
    * @param {object} [options] - Persistence options.
    * @param {string} [options.persistence] - "lazy" | "immediate" | "scheduled"
    * @param {number} [options.interval] - Seconds between flushes (scheduled mode).
+   * @param {number} [options.trash_ttl] - Auto-empty trash TTL in seconds. Default: no auto-empty.
+   * @param {number} [options.trash_purge_interval] - Background interval in seconds to check for expired trash. Default: 3600 (1 hour).
    * @returns {Database}
    */
   static open(path, options) {
@@ -416,6 +418,15 @@ class Database {
    */
   listFiles(bucket) {
     return this._native.listFiles(bucket);
+  }
+
+  /**
+   * Run garbage collection on all file buckets.
+   * Scans all file buckets and trashes files that are no longer referenced.
+   * @returns {number} The count of files moved to trash.
+   */
+  gcBuckets() {
+    return this._native.gcBuckets();
   }
 }
 
