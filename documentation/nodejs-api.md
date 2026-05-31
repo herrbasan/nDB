@@ -35,7 +35,7 @@ console.log('Document:', doc);
 db.update(id, { name: 'Alice Smith', age: 31, email: 'alice@example.com' });
 
 // Query
-const active = db.query({ status: { $eq: 'active' } });
+const active = await db.query({ status: { $eq: 'active' } });
 console.log('Active users:', active.length);
 
 // Delete
@@ -268,19 +268,19 @@ Execute a JSON AST query. See [Query Language Reference](./query-language.md) fo
 
 ```js
 // Simple equality
-db.query({ status: 'active' });
+await db.query({ status: 'active' });
 
 // Comparison operators
-db.query({ age: { $gte: 21 } });
+await db.query({ age: { $gte: 21 } });
 
 // Combined conditions (implicit AND)
-db.query({
+await db.query({
     status: 'active',
     age: { $gte: 18 }
 });
 
 // Logical combinators
-db.query({
+await db.query({
     $or: [
         { role: 'admin' },
         { role: 'moderator' }
@@ -288,7 +288,7 @@ db.query({
 });
 
 // Nested combinators
-db.query({
+await db.query({
     $and: [
         { $or: [{ status: 'active' }, { status: 'pending' }] },
         { age: { $gte: 18 } }
@@ -301,7 +301,7 @@ db.query({
 Query with limit, offset, and sort.
 
 ```js
-const results = db.queryWith(
+const results = await db.queryWith(
     { status: 'active' },
     {
         sortBy: 'age',
