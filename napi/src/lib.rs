@@ -484,6 +484,29 @@ impl Database {
         Ok(Buffer::from(data))
     }
 
+    /// Restore a file from bucket trash back to the active bucket.
+    /// No-op-friendly: returns false if the file was not in trash.
+    ///
+    /// ```js
+    /// db.restoreFile('images', 'a3f5c2d1', 'png');
+    /// ```
+    #[napi]
+    pub fn restore_file(&self, bucket: String, hash: String, ext: String) -> Result<bool> {
+        let bkt = self.inner()?.bucket(&bucket);
+        match bkt.restore(&hash, &ext) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                // Not in trash / already active — treat as soft miss
+                let msg = format!("{}", e);
+                if msg.contains("not found") || msg.contains("NotFound") {
+                    Ok(false)
+                } else {
+                    Err(Error::from_reason(format!("Restore file failed: {}", e)))
+                }
+            }
+        }
+    }
+
     /// Delete a file from a bucket (moves to trash).
     #[napi]
     pub fn delete_file(&self, bucket: String, hash: String, ext: String) -> Result<()> {

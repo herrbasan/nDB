@@ -1533,15 +1533,23 @@ impl Database {
     /// Targets a specific file reference string (e.g. `images:a1b2c3d4.png`)
     /// and safely removes it from the bucket if no active document references it.
     /// Returns true if it was safely deleted.
+    ///
+    /// Documents may store either the compact nURI or an API URL
+    /// (`/api/buckets/images/a1b2c3d4.png`). Both count as live references.
     pub fn release_file(&self, file_ref_str: &str) -> Result<bool> {
-        let file_ref = FileRef::from_compact(file_ref_str)
+        let compact = Self::normalize_file_ref(file_ref_str)
+            .ok_or_else(|| Error::invalid_arg("Invalid file ref format, expected bucket:hash.ext or /api/buckets/..."))?;
+        let file_ref = FileRef::from_compact(&compact)
             .ok_or_else(|| Error::invalid_arg("Invalid file ref format, expected bucket:hash.ext"))?;
+        let url_form = format!("/api/buckets/{}/{}", file_ref.bucket, file_ref.filename());
 
         // Fast sweep of in-memory active documents
         {
             let docs = self.docs.read();
             for val in docs.values() {
-                if Self::value_contains_string(val, file_ref_str) {
+                if Self::value_contains_string(val, &compact)
+                    || Self::value_contains_string(val, &url_form)
+                {
                     // Another active document is using it, abort delete
                     return Ok(false);
                 }
@@ -1605,16 +1613,48 @@ impl Database {
         Ok(trashed_count)
     }
 
+    /// Normalize any string that points at a bucket file into compact
+    /// `bucket:hash.ext` form. Accepts:
+    /// - compact nURI: `images:a1b2c3d4.png`
+    /// - API path/URL: `/api/buckets/images/a1b2c3d4.png` (optional host prefix, query)
+    fn normalize_file_ref(s: &str) -> Option<String> {
+        // Compact form first
+        if let Some(fr) = FileRef::from_compact(s) {
+            if fr.id.len() >= 8 && !fr.bucket.is_empty() && !fr.ext.is_empty() {
+                // Reject URL-looking "buckets" mistaken as compact (no slashes in bucket)
+                if !fr.bucket.contains('/') && !fr.id.contains('/') {
+                    return Some(fr.to_string_compact());
+                }
+            }
+        }
+
+        // /api/buckets/{bucket}/{id}.{ext} anywhere in the string
+        const MARKER: &str = "/api/buckets/";
+        if let Some(idx) = s.find(MARKER) {
+            let rest = &s[idx + MARKER.len()..];
+            let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+            let mut parts = rest.splitn(2, '/');
+            let bucket = parts.next().unwrap_or("");
+            let file = parts.next().unwrap_or("");
+            if bucket.is_empty() || file.is_empty() {
+                return None;
+            }
+            let dot = file.rfind('.')?;
+            let id = &file[..dot];
+            let ext = &file[dot + 1..];
+            if id.len() >= 8 && !ext.is_empty() && !bucket.contains('/') {
+                return Some(format!("{}:{}.{}", bucket, id, ext));
+            }
+        }
+
+        None
+    }
+
     fn extract_file_refs(value: &Value, refs: &mut HashSet<String>) {
         match value {
             Value::String(s) => {
-                // Heuristic: looks like "bucket:hash.ext"
-                // E.g. "images:a1b2c3d4.png"
-                if s.contains(':') && s.contains('.') {
-                    let parts: Vec<&str> = s.splitn(2, ':').collect();
-                    if parts.len() == 2 && parts[1].len() >= 8 {
-                        refs.insert(s.to_string());
-                    }
+                if let Some(compact) = Self::normalize_file_ref(s) {
+                    refs.insert(compact);
                 }
             }
             Value::Array(a) => {

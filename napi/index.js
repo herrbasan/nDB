@@ -392,6 +392,17 @@ class Database {
   }
 
   /**
+   * Restore a file from bucket trash to the active bucket.
+   * @param {string} bucket
+   * @param {string} hash
+   * @param {string} ext
+   * @returns {boolean} true if restored from trash, false if not in trash
+   */
+  restoreFile(bucket, hash, ext) {
+    return this._native.restoreFile(bucket, hash, ext);
+  }
+
+  /**
    * Safe garbage collecting release of a file from a bucket.
    * If there are no active document references, the file is trashed.
    * @param {string} fileRef - File reference id (e.g. images:b1a2c3.png)
