@@ -1377,8 +1377,8 @@ impl Database {
         }
         
         // 3. Create the clean buckets folder & stream the active files
-        let buckets_src = self.base_dir.join("buckets");
-        let buckets_dst = target.join("buckets");
+        let buckets_src = self.base_dir.join("_files");
+        let buckets_dst = target.join("_files");
         if buckets_src.exists() {
             // Find only buckets natively active in this DB
             for entry in fs::read_dir(&buckets_src).map_err(Error::io_err(&buckets_src, "read buckets dir"))? {

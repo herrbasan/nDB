@@ -249,9 +249,7 @@ my-app/
             └── a1b2c3d4.png
 ```
 
-**CLI divergence (known inconsistency):** the CLI commands (`ndb init`, `info`, `verify`, `export`, …) use different names for the same pieces — `meta.json`, `db.jsonl` (doc store), `trash.jsonl`, and `buckets/`. The library and consumers use `data.jsonl`, `_files/`, and `_trash/`. Until the CLI is aligned, run CLI maintenance commands on a folder created by `ndb init`, and treat CLI-produced `buckets/`/`trash.jsonl` as separate from the library's `_files/`/`_trash/`.
-
-> Note: some tools (e.g. `export_snapshot`) still reference `buckets/` and `meta.json` in their snapshot output, matching the CLI convention rather than the library's `_files/`. This is a known seam to reconcile.
+**CLI alignment:** the CLI (`ndb init`, `info`, `verify`, `export`, …) uses the same layout as the library and the primary consumer — `data.jsonl` (doc store), `_files/` (buckets), `_trash/` (trash), plus `meta.json`. A folder created by `ndb init` can be opened directly with `Database::open("mydb/data.jsonl")`.
 
 ## v3 Breaking Changes
 - **Atomic Deltas:** Three patch operations (`array_push`, `set`, `remove`) enable O(1) file writes for field-level edits without rewriting entire documents.

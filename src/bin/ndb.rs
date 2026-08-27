@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::process;
 
@@ -97,48 +98,37 @@ fn handle_init(args: &[String]) {
         process::exit(EXIT_GENERAL_ERROR);
     }
 
-    // Create buckets directory
-    let buckets_dir = path.join("buckets");
-    if let Err(e) = fs::create_dir_all(&buckets_dir) {
-        eprintln!("Failed to create buckets directory: {}", e);
+    // Create library-compatible bucket home (_files) and per-bucket subdirs
+    let files_dir = path.join("_files");
+    if let Err(e) = fs::create_dir_all(&files_dir) {
+        eprintln!("Failed to create _files directory: {}", e);
         process::exit(EXIT_GENERAL_ERROR);
     }
-
     for bucket in &buckets {
-        if let Err(e) = fs::create_dir(buckets_dir.join(bucket)) {
+        if let Err(e) = fs::create_dir(files_dir.join(bucket)) {
             eprintln!("Failed to create bucket dir '{}': {}", bucket, e);
             process::exit(EXIT_GENERAL_ERROR);
         }
     }
 
-    // Write empty _meta header for db.jsonl
-    let db_jsonl = format!("{{\"_meta\":{{\"version\":1,\"created\":\"{}\"}}}}\n", 
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
-    
-    if let Err(e) = fs::write(path.join("db.jsonl"), db_jsonl.clone()) {
-        eprintln!("Failed to write db.jsonl: {}", e);
+    // Create the trash root (the library manages _trash/docs/ on demand)
+    if let Err(e) = fs::create_dir_all(path.join("_trash")) {
+        eprintln!("Failed to create _trash directory: {}", e);
         process::exit(EXIT_GENERAL_ERROR);
     }
 
-    // Write empty _meta header for trash.jsonl
-    if let Err(e) = fs::write(path.join("trash.jsonl"), db_jsonl) {
-        eprintln!("Failed to write trash.jsonl: {}", e);
-        process::exit(EXIT_GENERAL_ERROR);
-    }
-    if !path.join("meta.json").exists() {
-        eprintln!("Error: Target is not a valid nDB folder.");
+    // Write empty _meta header for data.jsonl (library-compatible doc store name)
+    let data_jsonl = format!("{{\"_meta\":{{\"version\":1,\"created\":\"{}\"}}}}\n",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+
+    if let Err(e) = fs::write(path.join("data.jsonl"), data_jsonl) {
+        eprintln!("Failed to write data.jsonl: {}", e);
         process::exit(EXIT_GENERAL_ERROR);
     }
 
-    if let Err(e) = fs::remove_dir_all(path) {
-        eprintln!("Failed to destroy database: {}", e);
-        process::exit(EXIT_GENERAL_ERROR);
-    }
-
-    println!("Destroyed database at {}", path.display());
+    println!("Initialized database at {}", path.display());
     process::exit(EXIT_SUCCESS);
 }
-use std::io::Write;
 
 fn handle_destroy(args: &[String]) {
     if args.is_empty() {
@@ -194,12 +184,12 @@ fn handle_info(args: &[String]) {
     let meta_content = fs::read_to_string(&meta_path).unwrap_or_default();
     let meta: serde_json::Value = serde_json::from_str(&meta_content).unwrap_or_else(|_| serde_json::Value::Null);
 
-    let active_size = fs::metadata(path.join("db.jsonl")).map(|m| m.len()).unwrap_or(0);
-    let trash_size = fs::metadata(path.join("trash.jsonl")).map(|m| m.len()).unwrap_or(0);
+    let active_size = fs::metadata(path.join("data.jsonl")).map(|m| m.len()).unwrap_or(0);
+    let trash_size = fs::metadata(path.join("_trash").join("docs").join("data.jsonl")).map(|m| m.len()).unwrap_or(0);
     let total_size = active_size + trash_size;
 
     let mut doc_count = 0;
-    if let Ok(file) = fs::File::open(path.join("db.jsonl")) {
+    if let Ok(file) = fs::File::open(path.join("data.jsonl")) {
         use std::io::{BufRead, BufReader};
         let reader = BufReader::new(file);
         // Exclude the _meta header line
@@ -215,8 +205,8 @@ fn handle_info(args: &[String]) {
     println!("Schema Version: {}", meta.get("version").and_then(|v| v.as_i64()).unwrap_or(0));
     println!("Active Documents: {}", doc_count);
     println!("Disk Usage:");
-    println!("  - Active (db.jsonl): {} bytes", active_size);
-    println!("  - Trash (trash.jsonl): {} bytes", trash_size);
+    println!("  - Active (data.jsonl): {} bytes", active_size);
+    println!("  - Trash (_trash/docs/data.jsonl): {} bytes", trash_size);
 
     if total_size > 0 {
         let frag = (trash_size as f64 / total_size as f64) * 100.0;
@@ -230,7 +220,7 @@ fn handle_info(args: &[String]) {
     } else {
         println!("Buckets:");
         for bucket in buckets {
-            let bucket_dir = path.join("buckets").join(bucket);
+            let bucket_dir = path.join("_files").join(bucket);
             let mut bucket_size = 0;
             let mut file_count = 0;
             if let Ok(entries) = fs::read_dir(&bucket_dir) {
@@ -257,7 +247,7 @@ fn handle_compact(args: &[String]) {
     }
     let path = Path::new(&args[0]);
     let meta_path = path.join("meta.json");
-    let db_path = path.join("db.jsonl");
+    let db_path = path.join("data.jsonl");
 
     if path.join(".lock").exists() && !path.join(".readonly").exists() {
         eprintln!("Error: Database is actively locked. Cannot compact without a .readonly lock.");
@@ -298,7 +288,7 @@ fn handle_export(args: &[String]) {
     
     let src_path = Path::new(&args[0]);
     let dest_path = Path::new(&args[1]);
-    let db_path = src_path.join("db.jsonl");
+    let db_path = src_path.join("data.jsonl");
 
     let consistent = args.iter().any(|a| a == "--consistent");
     if consistent {
@@ -438,20 +428,20 @@ fn handle_import(args: &[String]) {
         }
     }
 
-    // Copy db.jsonl
-    let db_src = src_path.join("db.jsonl");
+    // Copy data.jsonl
+    let db_src = src_path.join("data.jsonl");
     if db_src.exists() {
-        if let Err(e) = fs::copy(&db_src, dest_path.join("db.jsonl")) {
-            eprintln!("Error copying db.jsonl: {}", e);
+        if let Err(e) = fs::copy(&db_src, dest_path.join("data.jsonl")) {
+            eprintln!("Error copying data.jsonl: {}", e);
             process::exit(EXIT_GENERAL_ERROR);
         }
     }
 
-    // Copy buckets directory
-    let buckets_src = src_path.join("buckets");
-    if buckets_src.exists() {
-        if let Err(e) = copy_dir_recursive(&buckets_src, &dest_path.join("buckets")) {
-            eprintln!("Error copying buckets: {}", e);
+    // Copy _files directory
+    let files_src = src_path.join("_files");
+    if files_src.exists() {
+        if let Err(e) = copy_dir_recursive(&files_src, &dest_path.join("_files")) {
+            eprintln!("Error copying files: {}", e);
             process::exit(EXIT_GENERAL_ERROR);
         }
     }
@@ -476,7 +466,7 @@ fn handle_merge(args: &[String]) {
     }
 
     eprintln!("[1/4] Connecting to source databases...");
-    let base_db = match ndb::Database::open(base_path.join("db.jsonl")) {
+    let base_db = match ndb::Database::open(base_path.join("data.jsonl")) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("Failed to open base database: {}", e);
@@ -484,7 +474,7 @@ fn handle_merge(args: &[String]) {
         }
     };
     
-    let merge_db = match ndb::Database::open(merge_path.join("db.jsonl")) {
+    let merge_db = match ndb::Database::open(merge_path.join("data.jsonl")) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("Failed to open merge-in database: {}", e);
@@ -522,16 +512,16 @@ fn handle_merge(args: &[String]) {
         process::exit(EXIT_GENERAL_ERROR);
     }
 
-    // Write db.jsonl
-    let target_db = dest_path.join("db.jsonl");
+    // Write data.jsonl
+    let target_db = dest_path.join("data.jsonl");
     let active: Vec<&serde_json::Value> = resolved_docs.values().collect();
     if let Err(e) = ndb::storage::rewrite_atomic(&target_db, &active) {
-        eprintln!("Failed to write merged db.jsonl: {}", e);
+        eprintln!("Failed to write merged data.jsonl: {}", e);
         process::exit(EXIT_GENERAL_ERROR);
     }
     
-    // Create empty trash matching ndb specs
-    let _ = fs::write(dest_path.join("trash.jsonl"), "{\"_meta\":{\"version\":1,\"created\":\"0\"}}\n");
+    // Create the trash root (the library manages _trash/docs/ on demand)
+    let _ = fs::create_dir_all(dest_path.join("_trash"));
 
     // Copy and merge meta.json
     // Read meta from both, union their buckets array.
@@ -576,8 +566,8 @@ fn handle_merge(args: &[String]) {
 
     eprintln!("[4/4] Deduplicating and copying file buckets...");
     // Copy base buckets
-    let base_buckets = base_path.join("buckets");
-    let dest_buckets = dest_path.join("buckets");
+    let base_buckets = base_path.join("_files");
+    let dest_buckets = dest_path.join("_files");
     if base_buckets.exists() {
         if let Err(e) = copy_dir_recursive(&base_buckets, &dest_buckets) {
             eprintln!("Failed to copy base buckets: {}", e);
@@ -585,7 +575,7 @@ fn handle_merge(args: &[String]) {
         }
     }
     // Copy merge-in buckets (overwrites handle native deduplication naturally)
-    let merge_buckets = merge_path.join("buckets");
+    let merge_buckets = merge_path.join("_files");
     if merge_buckets.exists() {
         if let Err(e) = copy_dir_recursive(&merge_buckets, &dest_buckets) {
             eprintln!("Failed to copy merge-in buckets: {}", e);
@@ -608,7 +598,7 @@ fn check_file_refs(val: &serde_json::Value, base_path: &Path) -> Result<(), Stri
                         let ext = file_ref.get("ext").and_then(|x| x.as_str()).unwrap_or("");
                         
                         if !bucket.is_empty() && !id.is_empty() {
-                            let path = base_path.join("buckets").join(bucket).join(format!("{}.{}", id, ext));
+                            let path = base_path.join("_files").join(bucket).join(format!("{}.{}", id, ext));
                             if !path.exists() {
                                 return Err(format!("{}:{}.{}", bucket, id, ext));
                             }
@@ -636,15 +626,15 @@ fn handle_verify(args: &[String]) {
     }
     
     let path = Path::new(&args[0]);
-    let db_path = path.join("db.jsonl");
-    let trash_path = path.join("trash.jsonl");
+    let db_path = path.join("data.jsonl");
+    let trash_path = path.join("_trash").join("docs").join("data.jsonl");
     
     if !path.join("meta.json").exists() {
         eprintln!("Error: Target is not a valid nDB folder.");
         process::exit(EXIT_GENERAL_ERROR);
     }
 
-    eprintln!("[1/2] Verifying db.jsonl syntax and references...");
+    eprintln!("[1/2] Verifying data.jsonl syntax and references...");
     let mut corruptions = 0;
     
     if db_path.exists() {
@@ -674,7 +664,7 @@ fn handle_verify(args: &[String]) {
         }
     }
     
-    eprintln!("[2/2] Verifying trash.jsonl syntax and references...");
+    eprintln!("[2/2] Verifying _trash/docs/data.jsonl syntax and references...");
     if trash_path.exists() {
         if let Ok(file) = fs::File::open(&trash_path) {
             use std::io::{BufRead, BufReader};
@@ -734,17 +724,17 @@ fn handle_recover(args: &[String]) {
     }
     
     // Attempt bucket recovery
-    let buckets_src = src_path.join("buckets");
+    let buckets_src = src_path.join("_files");
     if buckets_src.exists() {
-        let _ = copy_dir_recursive(&buckets_src, &dest_path.join("buckets"));
+        let _ = copy_dir_recursive(&buckets_src, &dest_path.join("_files"));
     }
     
-    eprintln!("[2/2] Scanning db.jsonl for surviving rows...");
-    let db_src = src_path.join("db.jsonl");
-    let target_db = dest_path.join("db.jsonl");
+    eprintln!("[2/2] Scanning data.jsonl for surviving rows...");
+    let db_src = src_path.join("data.jsonl");
+    let target_db = dest_path.join("data.jsonl");
     
-    // Write an empty trash file
-    let _ = fs::write(dest_path.join("trash.jsonl"), "{\"_meta\":{\"version\":1,\"created\":\"0\"}}\n");
+    // Create the trash root (the library manages _trash/docs/ on demand)
+    let _ = fs::create_dir_all(dest_path.join("_trash"));
 
     if db_src.exists() {
         use std::io::{BufRead, BufReader, Write};
@@ -786,7 +776,7 @@ fn handle_dump(args: &[String]) {
         process::exit(EXIT_GENERAL_ERROR);
     }
     let path = Path::new(&args[0]);
-    let db_path = path.join("db.jsonl");
+    let db_path = path.join("data.jsonl");
 
     let db = match ndb::Database::open(&db_path) {
         Ok(db) => db,
@@ -920,7 +910,7 @@ fn handle_query(args: &[String]) {
         }
     };
 
-    let db_path = path.join("db.jsonl");
+    let db_path = path.join("data.jsonl");
     let db = match ndb::Database::open(&db_path) {
         Ok(db) => db,
         Err(e) => {

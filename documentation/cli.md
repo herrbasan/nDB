@@ -4,17 +4,15 @@
 
 ## Folder model
 
-The CLI uses its own **database-as-a-folder** convention, created by `ndb init`:
+The CLI uses the same **database-as-a-folder** layout as the library and the primary consumer (LLM-Gateway-Chat). `ndb init` creates:
 
 ```
 mydb/
-├── meta.json      # Engine metadata (version, created, buckets)
-├── db.jsonl       # Document store
-├── trash.jsonl    # Trash journal
-└── buckets/       # File buckets (note: the CLI uses `buckets/`, the library uses `_files/`)
+├── meta.json      # Engine metadata (version, created, buckets) — CLI/migration only, core ignores it
+├── data.jsonl     # Document store
+├── _files/        # File buckets
+└── _trash/        # Trash (the library manages _trash/docs/ on demand)
 ```
-
-> ⚠️ **Known inconsistency:** the CLI's file names differ from the library and from the main consumer. The library creates `_files/` (buckets) and `_trash/docs/` (trash) as siblings of `data.jsonl`; the CLI expects `buckets/` and `trash.jsonl`. Run CLI maintenance against a folder created by `ndb init` — don't point CLI commands at a library-managed folder and expect them to see the same buckets/trash.
 
 ## Usage
 
@@ -48,11 +46,10 @@ Commands:
 | `2` | Corruption detected (from `verify`) |
 | `3` | Database locked / `.readonly` missing |
 
-## Notes & known bugs
+## Notes
 
-- **`init` deletes the database it just created** (copy-paste from `destroy`): `ndb init` creates the folder, then removes it and prints "Destroyed database". This is a real bug — do not rely on `init` producing a usable database until it is fixed.
 - **`destroy` checks for a `.lock` marker** and refuses if present (`EXIT_LOCKED`). The library does not create `.lock`/`.readonly` markers, so these checks are effectively advisory for CLI-created databases.
 - **`config`** operates on `meta.json` in the *current directory* — run it inside the database folder.
 - **`merge`** resolves ID collisions by comparing a `_modified` field on each document; documents without it default to `0`.
-- **`verify`** checks for `_file` object references inside documents (the `{bucket, id, ext}` form) against the `buckets/` tree, and validates JSON on every journal line.
+- **`verify`** checks for `_file` object references inside documents (the `{bucket, id, ext}` form) against the `_files/` tree, and validates JSON on every journal line.
 - The `--consistent` export flag requires a `.readonly` marker file; without it the export is treated as "crash-consistent".
