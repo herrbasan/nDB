@@ -28,11 +28,13 @@
 pub mod bucket;
 pub mod error;
 pub mod id;
+pub mod search;
 pub mod server;
 pub mod storage;
 
 pub use bucket::{FileBucket, FileMeta, FileRef};
 pub use error::{Error, Result};
+pub use search::{TextMode, TextQuery, TextSearch};
 
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
@@ -533,6 +535,8 @@ pub struct Database {
     file_refs: RwLock<HashMap<String, usize>>,
     /// Secondary indexes (opt-in).
     indexes: RwLock<HashMap<String, Box<dyn Index>>>,
+    /// Full-text indexes (opt-in): field → inverted index.
+    text_indexes: RwLock<HashMap<String, search::TextIndex>>,
     /// Single-writer mutex.
     writer: Mutex<()>,
     /// Persistence mode.
@@ -636,6 +640,7 @@ impl Database {
             deleted: RwLock::new(deleted),
             file_refs: RwLock::new(file_refs),
             indexes: RwLock::new(HashMap::new()),
+            text_indexes: RwLock::new(HashMap::new()),
             writer: Mutex::new(()),
             persistence: Persistence::Lazy,
             trash_mode: TrashMode::Manual,
@@ -656,6 +661,7 @@ impl Database {
             deleted: RwLock::new(HashSet::new()),
             file_refs: RwLock::new(HashMap::new()),
             indexes: RwLock::new(HashMap::new()),
+            text_indexes: RwLock::new(HashMap::new()),
             writer: Mutex::new(()),
             persistence: Persistence::Lazy,
             trash_mode: TrashMode::Manual,
@@ -841,6 +847,10 @@ impl Database {
         let mut docs = self.docs.write();
         self.deleted.write().remove(&id);
         docs.insert(id.clone(), doc);
+        drop(docs);
+
+        // Full-text indexes (after the doc is in the store)
+        self.retext_doc(&id, &Value::Null);
 
         Ok(id)
     }
@@ -886,6 +896,10 @@ impl Database {
         let mut docs = self.docs.write();
         self.deleted.write().remove(&id);
         docs.insert(id.clone(), doc);
+        drop(docs);
+
+        // Full-text indexes (after the doc is in the store)
+        self.retext_doc(&id, &Value::Null);
 
         Ok(id)
     }
@@ -918,6 +932,70 @@ impl Database {
             }
         }
         drop(indexes);
+
+        // Full-text indexes: re-tokenize the field text.
+        self.retext_doc(id, old_doc);
+    }
+
+    /// Sync full-text indexes after an in-place mutation. Caller holds the
+    /// writer lock; `old_doc` is the pre-mutation snapshot.
+    fn retext_doc(&self, id: &str, old_doc: &Value) {
+        let mut text_indexes = self.text_indexes.write();
+        if text_indexes.is_empty() {
+            return;
+        }
+        let new_doc = self.docs.read().get(id).cloned();
+        for (field, tindex) in text_indexes.iter_mut() {
+            if old_doc.get(field).is_some()
+                || new_doc.as_ref().map(|d| d.get(field).is_some()).unwrap_or(false)
+            {
+                match &new_doc {
+                    Some(doc) => {
+                        tindex.index_doc(id, doc);
+                    }
+                    None => tindex.remove_doc(id),
+                }
+            }
+        }
+    }
+
+    /// Create a full-text index on a text field (opt-in, like hash/btree
+    /// indexes). Existing documents are tokenized once. AND/OR/phrase/prefix
+    /// queries then run against the inverted index via `text_search`.
+    pub fn create_text_index(&self, field: &str) -> Result<()> {
+        let _guard = self.writer.lock();
+
+        let mut tindex = search::TextIndex::new(field);
+        {
+            let docs = self.docs.read();
+            for (id, doc) in docs.iter() {
+                tindex.index_doc(id, doc);
+            }
+        }
+        self.text_indexes.write().insert(field.to_string(), tindex);
+        Ok(())
+    }
+
+    /// Drop a full-text index.
+    pub fn drop_text_index(&self, field: &str) -> Result<()> {
+        let _guard = self.writer.lock();
+        self.text_indexes.write().remove(field);
+        Ok(())
+    }
+
+    /// Run a full-text search over an indexed field. Returns matching _ids
+    /// (unordered). The field must have a text index (fail loud otherwise).
+    pub fn text_search(&self, field: &str, search: &TextSearch) -> Result<Vec<String>> {
+        search.validate()?;
+        let text_indexes = self.text_indexes.read();
+        let tindex = text_indexes
+            .get(field)
+            .ok_or_else(|| Error::invalid_arg(format!("no text index on '{}'", field)))?;
+        let docs = self.docs.read();
+        let ids = tindex.search(search, |id| {
+            docs.get(id).and_then(|d| search::extract_text(d, field))
+        });
+        Ok(ids)
     }
 
     /// Update a document. Appends new version to file, old version superseded.
@@ -959,7 +1037,7 @@ impl Database {
         }
         drop(indexes);
 
-        if let Some(old) = old_doc_clone {
+        if let Some(old) = old_doc_clone.clone() {
             self.handle_ref_delta_and_trash(&old, &new_doc);
         }
 
@@ -981,7 +1059,13 @@ impl Database {
 
         // Update in-memory store
         let mut docs = self.docs.write();
-        docs.insert(id.to_string(), new_doc);
+        docs.insert(id.to_string(), new_doc.clone());
+        drop(docs);
+
+        // Full-text indexes (old_doc_clone is the pre-update snapshot)
+        if let Some(old) = &old_doc_clone {
+            self.retext_doc(id, old);
+        }
 
         Ok(())
     }
@@ -1186,7 +1270,7 @@ impl Database {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let mut trash_doc = doc_to_trash;
+            let mut trash_doc = doc_to_trash.clone();
             if let Some(obj) = trash_doc.as_object_mut() {
                 obj.insert("_deleted".to_string(), serde_json::json!(now));
                 if !orphaned_files.is_empty() {
@@ -1209,6 +1293,15 @@ impl Database {
             }
         }
         drop(indexes);
+
+        // Remove from full-text indexes (doc is about to leave the store;
+        // retext_doc would re-see it, so purge directly)
+        {
+            let mut text_indexes = self.text_indexes.write();
+            for (_, tindex) in text_indexes.iter_mut() {
+                tindex.remove_doc(id);
+            }
+        }
 
         // Write tombstone to file
         if !self.is_in_memory() {

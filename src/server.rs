@@ -5,7 +5,7 @@
 //! with a cap, keep-alive, read timeout, body cap, static bearer token.
 //! The daemon owns the database in memory; clients receive only results.
 
-use crate::{Database, Error, QueryOptions, SortDir};
+use crate::{Database, Error, QueryOptions, SortDir, TextMode, TextQuery, TextSearch};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -289,6 +289,7 @@ fn route(db: &Arc<Database>, config: &ServerConfig, req: &Request) -> Response {
 
         ("POST", ["query"]) => handle_query(db, config, req),
         ("POST", ["find"]) => handle_find(db, req),
+        ("POST", ["search"]) => handle_search(db, config, req),
 
         ("GET", ["doc", id]) => handle_get_doc(db, req, id),
         ("PUT", ["doc"]) => handle_insert(db, req),
@@ -393,6 +394,125 @@ fn parse_query_options(body: &Value, config: &ServerConfig) -> Result<QueryOptio
     }
 
     Ok(opts)
+}
+
+/// POST /search — full-text search over a text-indexed field.
+/// Body: {field, mode: "and"|"or", case_sensitive?, queries: [{type, value, exclude?}],
+
+/// POST /search — full-text search over a text-indexed field.
+/// Body: {field, mode: "and"|"or", case_sensitive?, queries: [{type, value, exclude?}],
+///         fields?, limit?, offset?}
+fn handle_search(db: &Database, config: &ServerConfig, req: &Request) -> (u16, Value) {
+    let body = match parse_body(req) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+
+    let field = match body.get("field").and_then(|v| v.as_str()) {
+        Some(f) => f.to_string(),
+        None => return (400, json!({"error": "field required"})),
+    };
+
+    let mode = match body.get("mode").and_then(|v| v.as_str()).unwrap_or("and") {
+        "and" => TextMode::And,
+        "or" => TextMode::Or,
+        other => {
+            return (
+                400,
+                json!({"error": format!("mode must be 'and' or 'or', got '{}'", other)}),
+            )
+        }
+    };
+
+    let case_sensitive = body.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let raw_queries = match body.get("queries").and_then(|q| q.as_array()) {
+        Some(q) if !q.is_empty() => q,
+        _ => return (400, json!({"error": "queries: non-empty array required"})),
+    };
+
+    let mut queries = Vec::with_capacity(raw_queries.len());
+    for q in raw_queries {
+        let qtype = q.get("type").and_then(|v| v.as_str()).unwrap_or("term");
+        let value = match q.get("value").and_then(|v| v.as_str()) {
+            Some(v) if !v.trim().is_empty() => v.to_string(),
+            _ => return (400, json!({"error": "each query needs a non-empty value"})),
+        };
+        let inner = match qtype {
+            "term" => TextQuery::Term(value),
+            "phrase" => TextQuery::Phrase(value),
+            "prefix" => TextQuery::Prefix(value),
+            other => {
+                return (
+                    400,
+                    json!({"error": format!("query type must be term|phrase|prefix, got '{}'", other)}),
+                )
+            }
+        };
+        if q.get("exclude").and_then(|v| v.as_bool()).unwrap_or(false) {
+            queries.push(TextQuery::Exclude(Box::new(inner)));
+        } else {
+            queries.push(inner);
+        }
+    }
+
+    let search = TextSearch { mode, case_sensitive, queries };
+    if let Err(e) = search.validate() {
+        return (400, json!({"error": e.to_string()}));
+    }
+
+    let ids = match db.text_search(&field, &search) {
+        Ok(ids) => ids,
+        Err(e) => {
+            let (status, body) = db_error(e);
+            return (status, body);
+        }
+    };
+    let total = ids.len();
+
+    // Hydrate results with optional projection, honoring limit/offset.
+    let limit = body
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(config.default_limit)
+        .min(config.default_limit);
+    let offset = body.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+    let fields: Option<Vec<String>> = body
+        .get("fields")
+        .and_then(|f| f.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+
+    let page: Vec<Value> = ids
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .filter_map(|id| db.get(&id).ok())
+        .map(|doc| match &fields {
+            Some(fs) => {
+                let mut out = serde_json::Map::new();
+                for f in fs {
+                    if let Some(v) = crate::field_get(&doc, f) {
+                        out.insert(f.clone(), v.clone());
+                    }
+                }
+                out.insert("_id".to_string(), json!(doc["_id"]));
+                Value::Object(out)
+            }
+            None => doc,
+        })
+        .collect();
+
+    (
+        200,
+        json!({
+            "ok": true,
+            "count": page.len(),
+            "total": total,
+            "results": page,
+        }),
+    )
 }
 
 fn handle_find(db: &Database, req: &Request) -> (u16, Value) {
