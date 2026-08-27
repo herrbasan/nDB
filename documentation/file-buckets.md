@@ -10,8 +10,8 @@ File Buckets provide named storage for binary data alongside your documents. Fil
 
 ```
 mydb/
-├── mydb.jsonl                    # Document store
-└── _files/                       # All file buckets
+├── data.jsonl                   # Document store (passed to Database::open)
+└── _files/                       # All file buckets (created implicitly, sibling of data.jsonl)
     ├── avatars/                  # Bucket "avatars"
     │   ├── a1b2c3d4e5f6.png      # Stored by hash prefix
     │   └── g7h8i9j0k1l2.jpg
@@ -133,9 +133,9 @@ bucket.purge_trash_ttl(Duration::from_secs(86400))?;
 
 ## Listing Files
 
-### `list() -> Result<Vec<FileMeta>>`
+### `list() -> Result<Vec<String>>`
 
-List all active files in the bucket. Reads metadata from each file's companion `.meta` JSON file.
+List all active files in the bucket. Returns the stored filenames (e.g. `a1b2c3d4e5f6.png`). It reads the directory directly — there are no companion `.meta` files.
 
 ```rust
 let files = bucket.list()?;

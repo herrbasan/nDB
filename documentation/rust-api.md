@@ -22,8 +22,9 @@ serde_json = "1"
 use ndb::{Database, Persistence};
 use serde_json::json;
 
-// Open a database
-let db = Database::open("mydata.jsonl")?;
+// Open a database. nDB is database-as-a-folder: the path is the
+// data.jsonl file *inside* the database folder.
+let db = Database::open("mydata/data.jsonl")?;
 
 // Insert a document
 let id = db.insert(json!({

@@ -20,8 +20,9 @@ The package includes prebuilt native binaries for:
 ```js
 const { Database } = require('ndb');
 
-// Open a database
-const db = new Database('./mydata.jsonl');
+// Open a database. nDB is database-as-a-folder: the path is the
+// data.jsonl file *inside* the database folder.
+const db = new Database('./mydata/data.jsonl');
 
 // Insert
 const id = db.insert({ name: 'Alice', age: 30, email: 'alice@example.com' });
@@ -50,10 +51,10 @@ db.delete(id);
 
 #### `new Database(path)`
 
-Open or create a database at the given file path.
+Open or create a database. `path` is the `data.jsonl` file *inside* a database folder — the folder's `_files/` and `_trash/` are created implicitly.
 
 ```js
-const db = new Database('./data/app.jsonl');
+const db = new Database('./data/app/data.jsonl');
 ```
 
 #### `Database.open(path, options?)`
@@ -61,12 +62,12 @@ const db = new Database('./data/app.jsonl');
 Open with configuration options.
 
 ```js
-const db = Database.open('./data/app.jsonl', {
+const db = Database.open('./data/app/data.jsonl', {
     persistence: 'immediate'
 });
 
 // Scheduled flush every 60 seconds
-const db2 = Database.open('./data/app.jsonl', {
+const db2 = Database.open('./data/app/data.jsonl', {
     persistence: 'scheduled',
     interval: 60
 });
@@ -115,16 +116,24 @@ const id = db.insertWithPrefix('user', { name: 'Bob' });
 // id = "user_k8Tm2pQw4xNvRj7L"
 ```
 
-### `get(id) → object | null`
+### `get(id) → object`
 
-Get a document by ID. Returns `null` if not found.
+Get a document by ID. **Throws** if the ID does not exist or the document has been soft-deleted — it does **not** return `null`.
 
 ```js
 const doc = db.get(id);
-if (doc) {
-    console.log(doc.name);
+console.log(doc.name);
+```
+
+To read a key that may or may not exist, use `contains()` or catch:
+
+```js
+function readOptional(id) {
+  try { return db.get(id); } catch { return null; }
 }
 ```
+
+See [Common Patterns](./common-patterns.md) for the singleton/config-record idiom that builds on this.
 
 ### `update(id, newDoc) → void`
 
@@ -233,15 +242,6 @@ const alices = db.find('name', 'Alice');
 const activeUsers = db.find('status', 'active');
 ```
 
-### `findWhere(field, predicate) → object[]`
-
-Find documents where field value matches a predicate function.
-
-```js
-const seniors = db.findWhere('age', v => v >= 65);
-const longNames = db.findWhere('name', v => v.length > 20);
-```
-
 ### `findRange(field, min, max) → object[]`
 
 Find documents with field value in range [min, max]. Works best with a BTree index.
@@ -252,11 +252,13 @@ const midRange = db.findRange('score', 50, 100);
 
 ### `iter() → object[]`
 
-Get all active documents.
+Get all active (non-deleted) documents.
 
 ```js
 const allDocs = db.iter();
 ```
+
+> ⚠️ **Size limit:** `iter()` marshals the entire database as one JSON string across the napi boundary. Very large databases can exceed napi's string size limit (~2 GB) and throw. For bulk reads on large corpora, page with `queryWith({ limit, offset })` instead (each page crosses the boundary separately).
 
 ---
 
@@ -404,14 +406,6 @@ Explicitly flush pending writes to disk (fsync).
 db.flush();
 ```
 
-### `path() → string`
-
-Get the database file path.
-
-```js
-console.log('DB path:', db.path());
-```
-
 ---
 
 ## File Buckets
@@ -439,6 +433,14 @@ Retrieve file content by hash and extension.
 ```js
 const buffer = db.getFile('avatars', 'a1b2c3d4', 'png');
 fs.writeFileSync('./retrieved.png', buffer);
+```
+
+### `restoreFile(bucket, hash, ext) → boolean`
+
+Restore a file from bucket trash back to the active bucket. Returns `true` if the file was in trash and restored, `false` if it was not in trash (no-op).
+
+```js
+const restored = db.restoreFile('avatars', 'a1b2c3d4', 'png');
 ```
 
 ### `releaseFile(fileRefStr) → boolean`

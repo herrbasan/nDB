@@ -6,9 +6,19 @@
 
 ## Overview
 
-**v3 Architecture Note:** nDB utilizes a **Database-as-a-Folder** architecture. Opening a database creates an encapsulated directory (`meta.json`, `data.jsonl`, `_trash/`, `_files/`).
+**Database-as-a-Folder.** nDB's intended and production structure is one **directory per database**. The convention used by the primary consumer (LLM-Gateway-Chat) and produced by the CLI is:
 
-nDB operates as an in-memory document database backed by these structured directories. Every document lives in a `HashMap<String, Value>` at runtime, providing O(1) lookups by `_id`. Persistence is achieved through an append-only JSON Lines file.
+```
+my-app/
+├── data.jsonl     # The append-only document store (this file is passed to Database::open)
+├── _files/        # Managed binary buckets (SHA-256 deduplication)
+├── _trash/        # Soft-deleted documents and files
+└── meta.json      # Schema/bucket metadata — written by the CLI/migration, NOT yet read by the core
+```
+
+**Important nuance:** the Rust core's `Database::open(path)` takes the **`data.jsonl` file itself**, not the folder. The library derives the folder as the file's parent and creates `_files/` and `_trash/` as siblings of the `.jsonl`. So a "folder database" is a *container convention* imposed by the caller (or the CLI), not something `open()` sets up for you. `meta.json` is present in real folders but the core neither reads nor writes it — schema validation is not implemented.
+
+Every document lives in a `HashMap<String, Value>` at runtime, providing O(1) lookups by `_id`. Persistence is achieved through an append-only JSON Lines file.
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -25,6 +35,7 @@ nDB operates as an in-memory document database backed by these structured direct
 │         Append-Only + Compaction                 │
 └─────────────────────────────────────────────────┘
 ```
+`Database::open("my-app/data.jsonl")` → in-memory store backed by `my-app/data.jsonl`, with buckets in `my-app/_files/` and trash in `my-app/_trash/`.
 
 ---
 
@@ -218,10 +229,13 @@ db.drop_index("email")?;  // Free memory
 
 ## File Layout
 
+The canonical folder-per-database layout (as used by LLM-Gateway-Chat and created by `ndb init`):
+
 ```
-mydb/
-├── mydb.jsonl              # Document store (JSON Lines)
-├── _files/                 # File buckets root
+my-app/
+├── data.jsonl              # Document store (JSON Lines) — passed to Database::open
+├── meta.json               # Engine metadata (version, buckets, schemas). Written by CLI/migration; not yet enforced by core.
+├── _files/                 # File buckets root (created implicitly by bucket operations)
 │   ├── avatars/            # Named bucket "avatars"
 │   │   ├── a1b2c3d4.png    # Stored by SHA-256 hash prefix
 │   │   └── e5f6g7h8.jpg
@@ -229,12 +243,15 @@ mydb/
 │       └── i9j0k1l2.pdf
 └── _trash/                 # Trash root
     ├── docs/
-    │   └── mydb.jsonl      # Archived deleted documents
+    │   └── data.jsonl      # Archived deleted documents
     └── files/
         └── avatars/        # Archived deleted files
             └── a1b2c3d4.png
 ```
 
+**CLI divergence (known inconsistency):** the CLI commands (`ndb init`, `info`, `verify`, `export`, …) use different names for the same pieces — `meta.json`, `db.jsonl` (doc store), `trash.jsonl`, and `buckets/`. The library and consumers use `data.jsonl`, `_files/`, and `_trash/`. Until the CLI is aligned, run CLI maintenance commands on a folder created by `ndb init`, and treat CLI-produced `buckets/`/`trash.jsonl` as separate from the library's `_files/`/`_trash/`.
+
+> Note: some tools (e.g. `export_snapshot`) still reference `buckets/` and `meta.json` in their snapshot output, matching the CLI convention rather than the library's `_files/`. This is a known seam to reconcile.
 
 ## v3 Breaking Changes
 - **Atomic Deltas:** Three patch operations (`array_push`, `set`, `remove`) enable O(1) file writes for field-level edits without rewriting entire documents.

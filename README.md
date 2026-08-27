@@ -6,14 +6,13 @@ nDB is an **in-memory document database** with JSON Lines persistence, layered q
 
 
 > **⚠️ BREAKING CHANGE (v3 Architecture)**
-> nDB has transitioned to a **Database-as-a-Folder** architecture. It is no longer just a flat `.jsonl` file.
-> Opening a database now treats the path as a directory containing:
-> - `meta.json` (Schema and bucket definitions)
-> - `data.jsonl` (The append-only document store)
-> - `_trash/` (Soft-deleted documents and files)
-> - `_files/` (Managed binary buckets with SHA-256 deduplication)
+> nDB uses a **Database-as-a-Folder** layout: one directory per database containing
+> - `data.jsonl` (the append-only document store — this is the file you pass to `Database::open`)
+> - `_files/` (managed binary buckets with SHA-256 deduplication, created implicitly)
+> - `_trash/` (soft-deleted documents and files)
+> - `meta.json` (schema/bucket metadata — written by the CLI/migration, **not yet enforced** by the core)
 > 
-> This removes the need for upper-layer management wrappers (like the deprecated nGDB). nDB now natively handles **Delta patch operations** (e.g. `array_push`) for large objects, **opt-in schema enforcement**, **nURI Links** (`bucket:hash.ext`), and **bucket garbage collection**.
+> This removes the need for upper-layer management wrappers (like the deprecated nGDB). nDB natively handles **Delta patch operations** (e.g. `array_push`) for large objects and **bucket garbage collection**. Schema enforcement and nURI link-type validation remain unimplemented — the core does not read `meta.json` yet.
 
 ## What's New in v1.2.0 (Non-Breaking)
 - **Background Trash TTL**: Added the ability to define a TTL (Time-To-Live) for trashed files and documents, with a non-blocking background thread that automatically cleans up expired trash.
@@ -40,7 +39,7 @@ nDB is an **in-memory document database** with JSON Lines persistence, layered q
 use ndb::{Database, Persistence};
 use serde_json::json;
 
-let db = Database::open("mydata.jsonl")?
+let db = Database::open("mydata/data.jsonl")?
     .with_persistence(Persistence::Immediate);
 
 // Insert
@@ -61,7 +60,7 @@ db.restore(&id)?;
 ```js
 const { Database } = require('ndb');
 
-const db = new Database('./mydata.jsonl');
+const db = new Database('./mydata/data.jsonl');
 
 const id = db.insert({ name: 'Alice', age: 30 });
 const doc = db.get(id);

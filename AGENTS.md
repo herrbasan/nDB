@@ -25,7 +25,7 @@ nDB is an **embeddable in-memory document database** built in Rust with native N
 
 - **Single-writer, multi-reader** concurrency. One thread writes at a time; many threads can read simultaneously.
 - **Append-only JSON Lines** persistence. Every write appends a line. On load, the file is replayed: last write wins, tombstones mark deletions, delta patches are applied in order.
-- **Database-as-a-Folder.** Opening a path creates `meta.json` (schema/config), `data.jsonl` (documents), `_trash/` (soft-deleted items), and `_files/` (binary storage).
+- **Database-as-a-Folder.** One directory per database: `data.jsonl` (documents — the file passed to `open()`), `_files/` (binary storage, created implicitly), `_trash/` (soft-deleted items), and `meta.json` (schema/config — written by the CLI/migration, not yet read by the core).
 - **Zero dependencies beyond the Rust standard library plus `serde`, `serde_json`, `parking_lot`, `fastrand`, and `thiserror`.** No external crypto, no external DB engines. SHA-256 for file deduplication is hand-rolled.
 
 ## Query Layers
@@ -62,12 +62,12 @@ Powered by **napi-rs**. The `napi/` crate wraps the Rust `Database` type and exp
 | Database-as-a-Folder | Complete |
 | File buckets with SHA-256 dedup | Complete |
 | `array_push` delta (Rust core) | Complete |
+| Delta updates in Node.js backend | Complete (`arrayPush`, `set`, `remove` wired and used by consumers) |
 | `release_file` + `gc_buckets` (Rust + NAPI) | Complete |
-| Delta updates in Node.js backend | Not yet wired |
-| Schema validation from `meta.json` | Not implemented |
-| nURI `link` type enforcement | Not implemented |
-| TTL-based trash purging | Not implemented |
-| Bucket migration script for legacy data | Not implemented |
+| TTL-based trash purging | Complete (`with_trash_ttl` + background thread; napi via `trash_ttl` option) |
+| Schema validation from `meta.json` | Not implemented (`meta.json` written but unenforced) |
+| nURI `link` type enforcement | Not implemented (file refs detected heuristically by string match, not by schema) |
+| Bucket migration script for legacy data | Not bundled here (the consumer's `migrate-ndb-to-folder.js` was used in production) |
 
 ## What nDB Is Not
 
