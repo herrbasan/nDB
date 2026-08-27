@@ -18,6 +18,15 @@ my-app/
 
 **Important nuance:** the Rust core's `Database::open(path)` takes the **`data.jsonl` file itself**, not the folder. The library derives the folder as the file's parent and creates `_files/` and `_trash/` as siblings of the `.jsonl`. So a "folder database" is a *container convention* imposed by the caller (or the CLI), not something `open()` sets up for you. `meta.json` is present in real folders but the core neither reads nor writes it — schema validation is not implemented.
 
+### Two accepted layouts (no "mode" switch)
+
+Because `open()` always takes a flat `.jsonl` file, **where you place that file** is the only difference between the two layouts — the code runs identically for both:
+
+1. **Folder mode (canonical).** The `.jsonl` lives inside its own directory, with `_files/` and `_trash/` inside that same directory. Self-contained and portable. Used by the primary consumer (LLM-Gateway-Chat, one folder per user) and produced by `ndb init`.
+2. **Flat / co-located mode.** The `.jsonl` sits directly in a shared directory, and `_files/`/`_trash/` are created *alongside* it in that shared directory. Simpler when there are no buckets; used by mcp_server (`data/memories.jsonl`).
+
+A bare `.jsonl` on disk will **always** have a sibling `_trash/` (and `_files/` if buckets are used), because the library creates them next to the file — in flat mode they appear directly in the shared directory rather than inside a dedicated per-database folder. The two layouts are interchangeable; neither is "wrong." Folder mode is the preferred convention for new databases because it keeps a database's documents, buckets, trash, and future `meta.json` encapsulated in one directory.
+
 Every document lives in a `HashMap<String, Value>` at runtime, providing O(1) lookups by `_id`. Persistence is achieved through an append-only JSON Lines file.
 
 ```
