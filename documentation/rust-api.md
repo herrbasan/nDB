@@ -288,6 +288,63 @@ let mid_range = db.find_range("score", &json!(50), &json!(100));
 
 ---
 
+## Layer 4: Full-Text Search
+
+Fast multi-term/phrase search over story-sized text fields (built for 300KB
+docs, 10GB corpora). Opt-in per field, like hash/btree indexes: an inverted
+index (token → sorted doc-id list) is built once and maintained on every
+write path. Index memory: ~3-8% of indexed text size.
+
+### `create_text_index(field: &str) -> Result<()>`
+
+Build the inverted index over a text field; tokenizes existing documents
+once. String fields and arrays-of-strings are searchable. `drop_text_index(field)` removes it.
+
+### `text_search(field: &str, search: &TextSearch) -> Result<Vec<String>>`
+
+Returns matching `_id`s. Fails loud (`Err`) if the field has no text index.
+
+```rust
+use ndb::{TextSearch, TextQuery};
+
+let ids = db.text_search("content", &TextSearch::and(vec![
+    TextQuery::Phrase("The hare was tired".into()),
+    TextQuery::Phrase("at the end of the race".into()),
+    TextQuery::Term("paul".into()),
+    TextQuery::Term("yesterday".into()),
+])).unwrap();
+// → stories containing ALL of these (phrases contiguous, case-insensitive)
+```
+
+### Query types
+
+| Type | Matches | Notes |
+|------|---------|-------|
+| `Term(s)` | Whole token `s` | `"race"` never matches `"racetrack"` |
+| `Phrase(s)` | The words of `s` contiguous, in order | The headline use case |
+| `Prefix(s)` | Any token starting with `s` | `"yester"` matches `"yesterday"` |
+| `Exclude(q)` | NOT the inner query | Only meaningful alongside a positive query |
+
+### Modes & flags
+
+- `TextMode::And` — doc must match every positive query (set intersection,
+  rarest-first). `TextMode::Or` — any (union).
+- `case_sensitive: bool` — default false. Case-insensitive: index-only.
+  Case-sensitive: verified against raw text of the shortlisted candidates.
+- Validation (`validate()`): rejects all-exclude query sets, empty strings,
+  nested excludes — fail loud at the boundary, not mid-query.
+
+### Semantics notes
+
+- Tokenization: Unicode alphanumeric runs, lowercased. German umlauts and
+  numbers tokenize sanely.
+- AND queries are evaluated rarest-token-first; query cost scales with
+  result-set size, not corpus size.
+- Measured (release, 55MB / 1000 stories): 4-part AND phrase query 7.4ms,
+  single term 25µs, index build 778ms single-threaded.
+
+---
+
 ## Layer 3: JSON AST Queries
 
 ### `query(ast: Value) -> Vec<Value>`

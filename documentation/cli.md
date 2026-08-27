@@ -55,6 +55,7 @@ Routes (all JSON unless noted):
 | Route | Description |
 |-------|-------------|
 | `POST /query` | `{filter, fields, sort: {field, dir}, limit, offset}` — Layer-3 AST, server-side projection, default limit 1000 |
+| `POST /search` | Full-text search — see below |
 | `POST /find` | `{field, value}` or `{field, min, max}` |
 | `GET /doc/:id[?fields=a,b]` | Fetch one doc, optional projection |
 | `PUT /doc` | Insert |
@@ -68,6 +69,44 @@ Routes (all JSON unless noted):
 | `GET /file/:bucket/:hash.ext` | Fetch file — raw bytes with real Content-Type |
 
 Limits: 64 concurrent connections (503 over), 64 MB request bodies (413), 30 s read timeout, query limit capped at 1000. Unknown query operators are 400, never silently-match.
+
+### `POST /search`
+
+Full-text search over a text-indexed field. Create the index first:
+
+```
+curl -X POST .../index -d '{"field": "content", "type": "text"}'
+```
+
+Then query:
+
+```json
+{
+  "field": "content",
+  "mode": "and",
+  "case_sensitive": false,
+  "queries": [
+    {"type": "phrase", "value": "The hare was tired"},
+    {"type": "phrase", "value": "at the end of the race"},
+    {"type": "term",   "value": "paul"},
+    {"type": "term",   "value": "yesterday"},
+    {"type": "term",   "value": "rabbit", "exclude": true}
+  ],
+  "fields": ["title"],
+  "limit": 50,
+  "offset": 0
+}
+```
+
+- `mode`: `"and"` (default) — every positive query must match; `"or"` — any.
+- `queries[].type`: `term` (whole token) \| `phrase` (contiguous words) \|
+  `prefix` (`"yester"` → `"yesterday"`). `exclude: true` negates a query.
+- `case_sensitive`: default false.
+- `fields` / `limit` / `offset`: response projection and paging
+  (`total` in the response is the full match count).
+- Response: `{ok, count, total, results: [...]}`.
+- Requires a text index on the field (`POST /index` with `type: "text"`);
+  otherwise the request fails loud with `no text index on '<field>'`.
 
 ## Exit codes
 

@@ -659,7 +659,8 @@ fn handle_create_index(db: &Database, req: &Request) -> (u16, Value) {
     let result = match kind {
         "hash" => db.create_index(field),
         "btree" => db.create_btree_index(field),
-        other => return (400, json!({"error": format!("type must be hash or btree, got '{}'", other)})),
+        "text" => db.create_text_index(field),
+        other => return (400, json!({"error": format!("type must be hash, btree or text, got '{}'", other)})),
     };
     match result {
         Ok(()) => (201, json!({"ok": true, "index": field, "type": kind})),

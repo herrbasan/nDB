@@ -237,6 +237,59 @@ fn index_and_compact_accepted() {
     assert_eq!(status, 202, "compact must be accepted-async: {}", body);
 }
 
+/// Full-text search over HTTP: text index creation + /search AND query.
+#[test]
+fn full_text_search_route() {
+    let (port, _db, _dir) = start_server(None);
+    request(port, "PUT", "/doc", Some(&json!({"title": "tortoise", "content": "The hare was tired. At the end of the race, Paul laughed."})), None);
+    request(port, "PUT", "/doc", Some(&json!({"title": "other", "content": "Nothing relevant here."})), None);
+
+    let (status, body) = request(port, "POST", "/index", Some(&json!({"field": "content", "type": "text"})), None);
+    assert_eq!(status, 201, "text index: {}", body);
+
+    let (status, body) = request(
+        port,
+        "POST",
+        "/search",
+        Some(&json!({
+            "field": "content",
+            "mode": "and",
+            "queries": [
+                {"type": "phrase", "value": "The hare was tired"},
+                {"type": "phrase", "value": "at the end of the race"},
+                {"type": "term", "value": "paul"}
+            ],
+            "fields": ["title"]
+        })),
+        None,
+    );
+    assert_eq!(status, 200, "search: {}", body);
+    assert_eq!(body["total"], 1);
+    assert_eq!(body["results"][0]["title"], "tortoise");
+    assert!(body["results"][0].get("content").is_none(), "projection applies to search results");
+
+    // Search without text index fails loud
+    let (status, _) = request(
+        port,
+        "POST",
+        "/search",
+        Some(&json!({"field": "title", "queries": [{"type": "term", "value": "x"}]})),
+        None,
+    );
+    assert_eq!(status, 500, "no text index on field → error, not silent");
+
+    // Bad query type: 400
+    let (status, _) = request(
+        port,
+        "POST",
+        "/search",
+        Some(&json!({"field": "content", "queries": [{"type": "regex", "value": "x"}]})),
+        None,
+    );
+    assert_eq!(status, 400);
+}
+
+
 #[test]
 fn unknown_route_404() {
     let (port, _db, _dir) = start_server(None);
