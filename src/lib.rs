@@ -28,6 +28,7 @@
 pub mod bucket;
 pub mod error;
 pub mod id;
+pub mod server;
 pub mod storage;
 
 pub use bucket::{FileBucket, FileMeta, FileRef};

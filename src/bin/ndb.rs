@@ -32,6 +32,7 @@ fn main() {
         "dump" => handle_dump(&args[2..]),
         "config" => handle_config(&args[2..]),
         "query" => handle_query(&args[2..]),
+        "serve" => handle_serve(&args[2..]),
         _ => {
             eprintln!("Unknown command: {}", command);
             print_usage();
@@ -57,6 +58,65 @@ fn print_usage() {
     eprintln!("  dump <path>                   Export JSON Lines to stdout");
     eprintln!("  config <get|set> ...          Manage metadata/config");
     eprintln!("  query <path> <query_ast>      Run a raw JSON AST query");
+    eprintln!("  serve <path> [options]         Run as resident HTTP daemon");
+    eprintln!("");
+    eprintln!("Serve options:");
+    eprintln!("  --bind <addr>    Bind address (default 127.0.0.1; 0.0.0.0 for LAN)");
+    eprintln!("  --port <n>       Port (default 8323)");
+    eprintln!("  --token <secret> Require 'Authorization: Bearer <secret>' (recommended for LAN)");
+}
+
+fn handle_serve(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Usage: ndb serve <path/to/data.jsonl> [--bind addr] [--port n] [--token secret]");
+        process::exit(EXIT_GENERAL_ERROR);
+    }
+    let path = Path::new(&args[0]);
+    if !path.exists() {
+        eprintln!("Error: database file does not exist: {}", path.display());
+        process::exit(EXIT_GENERAL_ERROR);
+    }
+
+    let mut config = ndb::server::ServerConfig::default();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bind" if i + 1 < args.len() => {
+                config.bind = args[i + 1].clone();
+                i += 2;
+            }
+            "--port" if i + 1 < args.len() => {
+                config.port = match args[i + 1].parse::<u16>() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        eprintln!("Error: invalid port: {}", args[i + 1]);
+                        process::exit(EXIT_GENERAL_ERROR);
+                    }
+                };
+                i += 2;
+            }
+            "--token" if i + 1 < args.len() => {
+                config.token = Some(args[i + 1].clone());
+                i += 2;
+            }
+            other => {
+                eprintln!("Error: unknown serve option: {}", other);
+                process::exit(EXIT_GENERAL_ERROR);
+            }
+        }
+    }
+
+    let db = match ndb::Database::open(path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("Error opening database: {}", e);
+            process::exit(EXIT_CORRUPTION);
+        }
+    };
+    if let Err(e) = ndb::server::serve(db, config) {
+        eprintln!("Server error: {}", e);
+        process::exit(EXIT_GENERAL_ERROR);
+    }
 }
 
 fn handle_init(args: &[String]) {
