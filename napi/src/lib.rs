@@ -9,7 +9,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::sync::{Arc, RwLock};
 
-use ndb::{Database as RustDatabase, Persistence, SortDir, QueryOptions};
+use ndb::{Database as RustDatabase, Persistence, SortDir, QueryOptions, TextMode, TextQuery, TextSearch};
 
 // ─── Async Tasks ───────────────────────────────────────────────
 
@@ -98,6 +98,52 @@ impl Database {
     fn inner(&self) -> Result<Arc<RustDatabase>> {
         self.inner.read().unwrap().clone().ok_or_else(|| Error::from_reason("Database closed"))
     }
+}
+
+/// Parse a full-text search request from the `ndb serve` wire format
+/// (same JSON shape as server.rs POST /search). Fail loud on anything
+/// malformed — an unknown query type is a client bug, never a silent match.
+fn parse_text_search(json: &str) -> Result<TextSearch> {
+    let v: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| Error::from_reason(format!("Invalid text search JSON: {}", e)))?;
+
+    let mode = match v.get("mode").and_then(|m| m.as_str()).unwrap_or("and") {
+        "and" => TextMode::And,
+        "or" => TextMode::Or,
+        other => return Err(Error::from_reason(format!("Unknown text search mode: {}", other))),
+    };
+    let case_sensitive = v.get("case_sensitive").and_then(|c| c.as_bool()).unwrap_or(false);
+
+    let raw_queries = v.get("queries")
+        .and_then(|q| q.as_array())
+        .ok_or_else(|| Error::from_reason("text search requires a queries array"))?;
+    if raw_queries.is_empty() {
+        return Err(Error::from_reason("text search requires at least one query"));
+    }
+
+    let mut queries = Vec::with_capacity(raw_queries.len());
+    for q in raw_queries {
+        let qtype = q.get("type").and_then(|t| t.as_str())
+            .ok_or_else(|| Error::from_reason("text query missing type (term|phrase|prefix)"))?;
+        let value = q.get("value").and_then(|x| x.as_str())
+            .ok_or_else(|| Error::from_reason("text query missing value string"))?;
+        let inner = match qtype {
+            "term" => TextQuery::Term(value.to_string()),
+            "phrase" => TextQuery::Phrase(value.to_string()),
+            "prefix" => TextQuery::Prefix(value.to_string()),
+            other => return Err(Error::from_reason(format!("Unknown text query type: {}", other))),
+        };
+        if q.get("exclude").and_then(|x| x.as_bool()).unwrap_or(false) {
+            queries.push(TextQuery::Exclude(Box::new(inner)));
+        } else {
+            queries.push(inner);
+        }
+    }
+
+    let search = TextSearch { mode, case_sensitive, queries };
+    search.validate()
+        .map_err(|e| Error::from_reason(format!("Invalid text search: {}", e)))?;
+    Ok(search)
 }
 
 #[napi]
@@ -420,6 +466,37 @@ impl Database {
     /// Check if an index exists for a field.
     #[napi]
     pub fn has_index(&self, field: String) -> Result<bool> { Ok(self.inner()?.has_index(&field)) }
+
+    /// Create a full-text index on a field (opt-in, like hash/btree).
+    /// Tokenizes existing documents once; maintained on every write path.
+    /// Idempotent: recreating over an existing index is a no-op rebuild.
+    #[napi]
+    pub fn create_text_index(&self, field: String) -> Result<()> {
+        self.inner()?.create_text_index(&field)
+            .map_err(|e| Error::from_reason(format!("Create text index failed: {}", e)))
+    }
+
+    /// Drop a full-text index (and its disk cache, if any).
+    #[napi]
+    pub fn drop_text_index(&self, field: String) -> Result<()> {
+        self.inner()?.drop_text_index(&field)
+            .map_err(|e| Error::from_reason(format!("Drop text index failed: {}", e)))
+    }
+
+    /// Full-text search over an indexed field. `search` is a JSON string,
+    /// same wire shape as `ndb serve` POST /search:
+    /// {"mode":"and"|"or","case_sensitive":false,"queries":[
+    ///   {"type":"term"|"phrase"|"prefix","value":"...","exclude":true?}]}]
+    /// Returns a JSON array of matching `_id`s (unordered). Fails loud when
+    /// the field has no text index.
+    #[napi]
+    pub fn text_search(&self, field: String, search: String) -> Result<String> {
+        let ts = parse_text_search(&search)?;
+        let ids = self.inner()?.text_search(&field, &ts)
+            .map_err(|e| Error::from_reason(format!("Text search failed: {}", e)))?;
+        serde_json::to_string(&ids)
+            .map_err(|e| Error::from_reason(format!("Serialize search results failed: {}", e)))
+    }
 
     // ─── Compaction & Trash ────────────────────────────────────────
 

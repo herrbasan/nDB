@@ -339,6 +339,35 @@ class Database {
   }
 
   /**
+   * Create a full-text index on a field (opt-in, like hash/btree).
+   * Tokenizes existing documents once; maintained on every write path.
+   * Idempotent — safe to call on every open.
+   * @param {string} field - Field name (string or array-of-strings values).
+   */
+  createTextIndex(field) {
+    this._native.createTextIndex(field);
+  }
+
+  /**
+   * Drop a full-text index (and its disk cache, if any).
+   * @param {string} field - Field name.
+   */
+  dropTextIndex(field) {
+    this._native.dropTextIndex(field);
+  }
+
+  /**
+   * Full-text search over an indexed field. Fails loud when the field has
+   * no text index.
+   * @param {string} field - Indexed field name.
+   * @param {object} search - {mode: 'and'|'or', case_sensitive: false, queries: [{type: 'term'|'phrase'|'prefix', value, exclude?}]}
+   * @returns {string[]} Matching _ids (unordered).
+   */
+  textSearch(field, search) {
+    return JSON.parse(this._native.textSearch(field, JSON.stringify(search)));
+  }
+
+  /**
    * Compact the database.
    */
   async compact() {
