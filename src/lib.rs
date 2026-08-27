@@ -207,6 +207,72 @@ impl Index for BTreeIndex {
 
 // ─── Query Evaluator ────────────────────────────────────────────────
 
+const KNOWN_OPERATORS: [&str; 9] = [
+    "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists",
+];
+
+/// Validate a query AST. Unknown operators, malformed combinators, or a
+/// non-object/non-array root return Err instead of silently matching
+/// everything. The HTTP server calls this on every inbound query — a client
+/// typo ($eqq) must fail loud (400), never degrade to a full-DB scan.
+pub fn validate_query_ast(ast: &Value) -> Result<()> {
+    match ast {
+        Value::Object(map) => {
+            for (key, val) in map {
+                match key.as_str() {
+                    "$and" | "$or" => {
+                        let arr = val
+                            .as_array()
+                            .ok_or_else(|| Error::invalid_arg(format!("{} requires an array", key)))?;
+                        if arr.is_empty() {
+                            return Err(Error::invalid_arg(format!("{} requires a non-empty array", key)));
+                        }
+                        for cond in arr {
+                            validate_query_ast(cond)?;
+                        }
+                    }
+                    "$not" => validate_query_ast(val)?,
+                    op if op.starts_with('$') => {
+                        return Err(Error::invalid_arg(format!("unknown operator {}", op)));
+                    }
+                    _ => {
+                        // Field condition: value is either an operator object or an implicit $eq
+                        if let Value::Object(op_map) = val {
+                            for op in op_map.keys() {
+                                if op.starts_with('$') && !KNOWN_OPERATORS.contains(&op.as_str()) {
+                                    return Err(Error::invalid_arg(format!("unknown operator {}", op)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        Value::Array(conditions) => {
+            for cond in conditions {
+                validate_query_ast(cond)?;
+            }
+            Ok(())
+        }
+        _ => Err(Error::invalid_arg("query AST must be an object or array")),
+    }
+}
+
+/// Build a projection of a document: only the requested dot-paths plus _id.
+fn project_doc(doc: &Value, fields: &[String]) -> Value {
+    let mut out = serde_json::Map::new();
+    for f in fields {
+        if let Some(v) = field_get(doc, f) {
+            out.insert(f.clone(), v.clone());
+        }
+    }
+    if let Some(id) = doc.get("_id") {
+        out.insert("_id".to_string(), id.clone());
+    }
+    Value::Object(out)
+}
+
 /// Evaluate a JSON AST query against a document.
 fn query_matches(doc: &Value, ast: &Value) -> bool {
     match ast {
@@ -258,7 +324,15 @@ fn field_get<'a>(doc: &'a Value, field: &str) -> Option<&'a Value> {
     let parts: Vec<&str> = field.split('.').collect();
     let mut current = doc;
     for part in parts {
-        current = current.get(part)?;
+        // Array-aware path resolution: numeric segments index into arrays
+        // (same capability as the mutation walker in walk_and_set), so
+        // "messages.0.role" resolves for reads too.
+        if let Value::Array(arr) = current {
+            let idx = part.parse::<usize>().ok()?;
+            current = arr.get(idx)?;
+        } else {
+            current = current.get(part)?;
+        }
     }
     Some(current)
 }
@@ -362,6 +436,55 @@ fn apply_path_remove(doc: &mut Value, path: &str) {
     walk_and_remove(doc, &segments, 0);
 }
 
+/// Push a value onto the array at a dot-separated path. Array-aware:
+/// "threads.2.messages" addresses nested arrays. If the final key doesn't
+/// exist (or isn't an array), an array containing the value is created there —
+/// mirroring the top-level behavior.
+fn apply_path_push(doc: &mut Value, path: &str, value: Value) {
+    let segments: Vec<&str> = path.split('.').collect();
+    if segments.is_empty() {
+        return;
+    }
+    walk_and_push(doc, &segments, 0, value);
+}
+
+fn walk_and_push(current: &mut Value, segments: &[&str], depth: usize, value: Value) {
+    if depth >= segments.len() {
+        return;
+    }
+    let key = segments[depth];
+    let is_last = depth + 1 == segments.len();
+
+    if let Ok(idx) = key.parse::<usize>() {
+        if let Some(arr) = current.as_array_mut() {
+            if idx < arr.len() {
+                if is_last {
+                    if let Some(inner) = arr[idx].as_array_mut() {
+                        inner.push(value);
+                    }
+                } else {
+                    walk_and_push(&mut arr[idx], segments, depth + 1, value);
+                }
+            }
+        }
+    } else if let Some(obj) = current.as_object_mut() {
+        if is_last {
+            match obj.get_mut(key) {
+                Some(slot) => {
+                    if let Some(inner) = slot.as_array_mut() {
+                        inner.push(value);
+                    }
+                }
+                None => {
+                    obj.insert(key.to_string(), serde_json::json!([value]));
+                }
+            }
+        } else if obj.contains_key(key) {
+            walk_and_push(obj.get_mut(key).unwrap(), segments, depth + 1, value);
+        }
+    }
+}
+
 fn walk_and_remove(current: &mut Value, segments: &[&str], depth: usize) {
     if depth >= segments.len() {
         return;
@@ -457,16 +580,15 @@ impl Database {
                 } else if let Some(op) = doc.get("_op").and_then(|v| v.as_str()) {
                     match op {
                         "array_push" => {
-                            if let Some(field) = doc.get("field").and_then(|v| v.as_str()) {
+                            // Accept "path" (new, dot-notation) or "field" (legacy, top-level)
+                            let target = doc
+                                .get("path")
+                                .or_else(|| doc.get("field"))
+                                .and_then(|v| v.as_str());
+                            if let Some(path) = target {
                                 if let Some(value) = doc.get("value") {
                                     if let Some(existing) = docs.get_mut(id) {
-                                        if let Some(obj) = existing.as_object_mut() {
-                                            if let Some(arr) = obj.get_mut(field).and_then(|v| v.as_array_mut()) {
-                                                arr.push(value.clone());
-                                            } else {
-                                                obj.insert(field.to_string(), serde_json::json!([value.clone()]));
-                                            }
-                                        }
+                                        apply_path_push(existing, path, value.clone());
                                     }
                                 }
                             }
@@ -864,21 +986,18 @@ impl Database {
     }
 
     /// Append an element to an array field. O(1) file write.
+    ///
+    /// Dot-separated paths address nested arrays ("threads.2.messages");
+    /// numeric segments index into arrays. A missing final key creates the array.
     pub fn array_push(&self, id: &str, field: &str, value: Value) -> Result<()> {
         let _guard = self.writer.lock();
 
-        let mut old_doc;
+        let old_doc;
         {
             let mut docs = self.docs.write();
             if let Some(doc) = docs.get_mut(id) {
                 old_doc = Some(doc.clone());
-                if let Some(obj) = doc.as_object_mut() {
-                    if let Some(arr) = obj.get_mut(field).and_then(|v| v.as_array_mut()) {
-                        arr.push(value.clone());
-                    } else {
-                        obj.insert(field.to_string(), serde_json::json!([value.clone()]));
-                    }
-                }
+                apply_path_push(doc, field, value.clone());
                 if let Some(old) = &old_doc {
                     self.handle_ref_delta_and_trash(old, doc);
                 }
@@ -895,7 +1014,7 @@ impl Database {
             let patch = serde_json::json!({
                 "_id": id,
                 "_op": "array_push",
-                "field": field,
+                "path": field,
                 "value": value
             });
             let line = serde_json::to_string(&patch)?;
@@ -923,7 +1042,7 @@ impl Database {
     pub fn set(&self, id: &str, path: &str, value: Value) -> Result<()> {
         let _guard = self.writer.lock();
 
-        let mut old_doc;
+        let old_doc;
         {
             let mut docs = self.docs.write();
             if let Some(doc) = docs.get_mut(id) {
@@ -972,7 +1091,7 @@ impl Database {
     pub fn remove(&self, id: &str, path: &str) -> Result<()> {
         let _guard = self.writer.lock();
 
-        let mut old_doc;
+        let old_doc;
         {
             let mut docs = self.docs.write();
             if let Some(doc) = docs.get_mut(id) {
@@ -1226,11 +1345,11 @@ impl Database {
     pub fn query_with(&self, ast: Value, opts: QueryOptions) -> Vec<Value> {
         let mut results = self.query(ast);
 
-        // Sort
+        // Sort (dot-notation aware — "meta.views" resolves, not just top-level)
         if let Some((ref field, dir)) = opts.sort_by {
             results.sort_by(|a, b| {
-                let av = a.get(field).unwrap_or(&Value::Null);
-                let bv = b.get(field).unwrap_or(&Value::Null);
+                let av = field_get(a, field).unwrap_or(&Value::Null);
+                let bv = field_get(b, field).unwrap_or(&Value::Null);
                 let cmp = value_cmp(av, bv);
                 match dir {
                     SortDir::Asc => cmp,
@@ -1251,6 +1370,56 @@ impl Database {
         }
 
         results
+    }
+
+    /// Execute a query returning only the projected fields, cloning the
+    /// minimum while holding the read lock: for each matching doc, only the
+    /// sort key and the projected fields are cloned. Sort/offset/limit run
+    /// after the lock is released, so writers are never blocked by
+    /// materialization of the result page. `_id` is always included.
+    ///
+    /// `fields: None` returns full documents (same as query_with).
+    pub fn query_projected(
+        &self,
+        ast: Value,
+        opts: QueryOptions,
+        fields: Option<&[String]>,
+    ) -> Vec<Value> {
+        let sort_field = opts.sort_by.as_ref().map(|(f, _)| f.clone());
+        let mut rows: Vec<(Value, Value)> = {
+            let docs = self.docs.read();
+            docs.values()
+                .filter(|doc| query_matches(doc, &ast))
+                .map(|doc| {
+                    let key = match &sort_field {
+                        Some(f) => field_get(doc, f).cloned().unwrap_or(Value::Null),
+                        None => Value::Null,
+                    };
+                    let proj = match fields {
+                        Some(fs) => project_doc(doc, fs),
+                        None => doc.clone(),
+                    };
+                    (key, proj)
+                })
+                .collect()
+        };
+
+        if let Some((_, dir)) = &opts.sort_by {
+            rows.sort_by(|a, b| match dir {
+                SortDir::Asc => value_cmp(&a.0, &b.0),
+                SortDir::Desc => value_cmp(&a.0, &b.0).reverse(),
+            });
+        }
+
+        let offset = opts.offset.unwrap_or(0);
+        if offset > 0 {
+            rows.drain(..offset.min(rows.len()));
+        }
+        if let Some(limit) = opts.limit {
+            rows.truncate(limit);
+        }
+
+        rows.into_iter().map(|(_, proj)| proj).collect()
     }
 
     // ─── Index Management ──────────────────────────────────────────

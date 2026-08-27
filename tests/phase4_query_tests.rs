@@ -160,6 +160,93 @@ fn drop_index() {
 
 // ─── Layer 3: JSON AST Queries ──────────────────────────────────────
 
+/// Prereq #2: field resolution traverses arrays via numeric segments.
+#[test]
+fn query_nested_array_field() {
+    let (db, _dir) = setup();
+    db.insert(json!({"messages": [{"role": "user"}, {"role": "assistant"}]})).unwrap();
+    db.insert(json!({"messages": [{"role": "system"}, {"role": "user"}]})).unwrap();
+
+    let results = db.query(json!({"messages.0.role": {"$eq": "user"}}));
+    assert_eq!(results.len(), 1, "messages.0.role must resolve through the array");
+
+    let results = db.query(json!({"messages.1.role": {"$eq": "user"}}));
+    assert_eq!(results.len(), 1, "messages.1.role must resolve through the array");
+}
+
+/// Prereq #1: sort keys accept dot-notation (previously top-level only, silently no-op).
+#[test]
+fn query_sort_nested_field() {
+    let (db, _dir) = setup();
+    db.insert(json!({"name": "a", "meta": {"views": 3}})).unwrap();
+    db.insert(json!({"name": "b", "meta": {"views": 10}})).unwrap();
+    db.insert(json!({"name": "c", "meta": {"views": 1}})).unwrap();
+
+    let results = db.query_with(
+        json!({}),
+        QueryOptions { sort_by: Some(("meta.views".to_string(), SortDir::Desc)), ..Default::default() },
+    );
+    assert_eq!(results[0]["name"], "b", "sort by meta.views desc must order by nested value");
+    assert_eq!(results[2]["name"], "c");
+}
+
+/// Prereq #4: unknown operators are rejected by validate_query_ast.
+#[test]
+fn validate_query_ast_rejects_unknown_operators() {
+    assert!(ndb::validate_query_ast(&json!({"status": {"$eq": "ok"}})).is_ok());
+    assert!(ndb::validate_query_ast(&json!({"$and": [{"a": 1}, {"b": 2}]})).is_ok());
+    assert!(ndb::validate_query_ast(&json!({"$or": [{"a": {"$gt": 1}}]})).is_ok());
+
+    assert!(ndb::validate_query_ast(&json!({"status": {"$eqq": "typo"}})).is_err(), "unknown $op in condition");
+    assert!(ndb::validate_query_ast(&json!({"$where": "something"})).is_err(), "unknown top-level combinator");
+    assert!(ndb::validate_query_ast(&json!({"$and": [{"a": {"$gtee": 1}}]})).is_err(), "unknown $op nested in $and");
+    assert!(ndb::validate_query_ast(&json!("not an object")).is_err(), "non-object root");
+    assert!(ndb::validate_query_ast(&json!({"$and": []})).is_err(), "empty $and");
+}
+
+/// Prereq #5: query_projected returns only requested fields (+_id), honoring
+/// sort/offset/limit, without cloning full documents.
+#[test]
+fn query_projected_returns_only_requested_fields() {
+    let (db, _dir) = setup();
+    populate_db(&db);
+
+    let fields = vec!["name".to_string(), "score".to_string()];
+    let results = db.query_projected(
+        json!({"status": "active"}),
+        QueryOptions { sort_by: Some(("score".to_string(), SortDir::Desc)), ..Default::default() },
+        Some(&fields),
+    );
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["name"], "alice", "sorted by score desc: alice 150, diana 95, bob 80");
+    for doc in &results {
+        assert!(doc.get("age").is_none(), "age must not be projected");
+        assert!(doc.get("status").is_none(), "status must not be projected");
+        assert!(doc.get("_id").is_some(), "_id always included");
+    }
+
+    // offset + limit
+    let results = db.query_projected(
+        json!({"status": "active"}),
+        QueryOptions { sort_by: Some(("score".to_string(), SortDir::Desc)), offset: Some(1), limit: Some(1), ..Default::default() },
+        Some(&fields),
+    );
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["name"], "diana");
+}
+
+/// Prereq #6: array_push accepts dot-paths into nested arrays.
+#[test]
+fn array_push_nested_path() {
+    let (db, _dir) = setup();
+    let id = db.insert(json!({"threads": [{"messages": ["a"]}]})).unwrap();
+
+    db.array_push(&id, "threads.0.messages", json!("b")).unwrap();
+    let doc = db.get(&id).unwrap();
+    assert_eq!(doc["threads"][0]["messages"], json!(["a", "b"]), "push must target the nested array");
+    assert!(doc.get("threads.0.messages").is_none(), "must not create a literal dotted top-level key");
+}
+
 #[test]
 fn query_eq() {
     let (db, _dir) = setup();
