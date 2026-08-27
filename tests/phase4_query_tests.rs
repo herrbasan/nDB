@@ -113,6 +113,41 @@ fn index_stays_in_sync() {
     assert_eq!(db.find("status", &json!("done")).len(), 0);
 }
 
+/// Regression: delta ops (set/remove/array_push) must maintain secondary
+/// indexes. Previously only insert/update/delete did — memory node #1233
+/// (false pending-embed flags in the chat app).
+#[test]
+fn index_stays_in_sync_after_delta_ops() {
+    let (db, _dir) = setup();
+    db.create_index("status").unwrap();
+
+    // set() changes an indexed field's value
+    let id = db.insert(json!({"status": "pending", "tags": ["a"]})).unwrap();
+    db.set(&id, "status", json!("embedded")).unwrap();
+    assert_eq!(db.find("status", &json!("pending")).len(), 0, "set(): old value must leave the index");
+    assert_eq!(db.find("status", &json!("embedded")).len(), 1, "set(): new value must enter the index");
+
+    // remove() deletes an indexed field
+    db.remove(&id, "status").unwrap();
+    assert_eq!(db.find("status", &json!("embedded")).len(), 0, "remove(): value must leave the index");
+
+    // set() re-adds it
+    db.set(&id, "status", json!("done")).unwrap();
+    assert_eq!(db.find("status", &json!("done")).len(), 1);
+
+    // array_push on a NON-indexed field must not corrupt the status index
+    db.array_push(&id, "tags", json!("b")).unwrap();
+    assert_eq!(db.find("status", &json!("done")).len(), 1, "array_push(): index must stay intact");
+
+    // indexed field IS an array: array_push changes its indexed value
+    db.drop_index("status").unwrap();
+    db.create_index("tags").unwrap();
+    assert_eq!(db.find("tags", &json!(["a", "b"])).len(), 1);
+    db.array_push(&id, "tags", json!("c")).unwrap();
+    assert_eq!(db.find("tags", &json!(["a", "b"])).len(), 0, "array_push(): old array value must leave the index");
+    assert_eq!(db.find("tags", &json!(["a", "b", "c"])).len(), 1, "array_push(): new array value must enter the index");
+}
+
 #[test]
 fn drop_index() {
     let (db, _dir) = setup();

@@ -391,6 +391,7 @@ fn walk_and_remove(current: &mut Value, segments: &[&str], depth: usize) {
 
 // ─── Database ───────────────────────────────────────────────────────
 
+
 /// The main nDB database.
 ///
 /// In-memory document store backed by JSON Lines persistence.
@@ -774,6 +775,28 @@ impl Database {
             .ok_or_else(|| Error::not_found(id))
     }
 
+    /// Sync secondary indexes for a document that was mutated in place
+    /// (delta ops: array_push / set / remove). Removes the old doc's indexed
+    /// values, inserts the new ones. Caller must hold the writer lock and
+    /// pass the doc's pre-mutation snapshot.
+    fn reindex_doc(&self, id: &str, old_doc: &Value) {
+        let mut indexes = self.indexes.write();
+        {
+            let docs = self.docs.read();
+            if let Some(new_doc) = docs.get(id) {
+                for (field, index) in indexes.iter_mut() {
+                    if let Some(old_val) = old_doc.get(field) {
+                        index.remove(old_val, id);
+                    }
+                    if let Some(new_val) = new_doc.get(field) {
+                        index.insert(new_val, id);
+                    }
+                }
+            }
+        }
+        drop(indexes);
+    }
+
     /// Update a document. Appends new version to file, old version superseded.
     /// O(1) operation.
     pub fn update(&self, id: &str, mut new_doc: Value) -> Result<()> {
@@ -844,7 +867,7 @@ impl Database {
     pub fn array_push(&self, id: &str, field: &str, value: Value) -> Result<()> {
         let _guard = self.writer.lock();
 
-        let mut old_doc = None;
+        let mut old_doc;
         {
             let mut docs = self.docs.write();
             if let Some(doc) = docs.get_mut(id) {
@@ -863,6 +886,9 @@ impl Database {
                 return Err(Error::not_found(id));
             }
         }
+
+        // Reindex: delta writes change indexed field values just like update()
+        self.reindex_doc(id, old_doc.as_ref().unwrap());
 
         // Write patch to file
         if !self.is_in_memory() {
@@ -897,7 +923,7 @@ impl Database {
     pub fn set(&self, id: &str, path: &str, value: Value) -> Result<()> {
         let _guard = self.writer.lock();
 
-        let mut old_doc = None;
+        let mut old_doc;
         {
             let mut docs = self.docs.write();
             if let Some(doc) = docs.get_mut(id) {
@@ -910,6 +936,9 @@ impl Database {
                 return Err(Error::not_found(id));
             }
         }
+
+        // Reindex: a set can change an indexed field's value
+        self.reindex_doc(id, old_doc.as_ref().unwrap());
 
         if !self.is_in_memory() {
             let patch = serde_json::json!({
@@ -943,7 +972,7 @@ impl Database {
     pub fn remove(&self, id: &str, path: &str) -> Result<()> {
         let _guard = self.writer.lock();
 
-        let mut old_doc = None;
+        let mut old_doc;
         {
             let mut docs = self.docs.write();
             if let Some(doc) = docs.get_mut(id) {
@@ -956,6 +985,9 @@ impl Database {
                 return Err(Error::not_found(id));
             }
         }
+
+        // Reindex: a remove can delete an indexed field
+        self.reindex_doc(id, old_doc.as_ref().unwrap());
 
         if !self.is_in_memory() {
             let patch = serde_json::json!({
