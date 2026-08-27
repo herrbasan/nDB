@@ -155,6 +155,8 @@ db.update(&id, json!({"title": "Updated", "count": 43}))?;
 
 ### `array_push(id: &str, field: &str, value: Value) -> Result<()>`
 
+Accepts a **dot-separated path** (v1.3+): `"threads.0.messages"` pushes into the nested array. A missing final key creates the array, mirroring top-level behavior.
+
 Append an element to a top-level array field. O(1) file write.
 
 - If the field doesn't exist, creates a new single-element array
@@ -301,7 +303,7 @@ let results = db.query(json!({
 
 ### `query_with(ast: Value, opts: QueryOptions) -> Vec<Value>`
 
-Execute a query with sorting, offset, and limit.
+Execute a query with sorting, offset, and limit. **Sort keys accept dot-notation** (`"meta.views"` resolves nested fields, not just top-level keys).
 
 ```rust
 use ndb::{QueryOptions, SortDir};
@@ -315,6 +317,27 @@ let results = db.query_with(
     },
 );
 ```
+
+### `query_projected(ast: Value, opts: QueryOptions, fields: Option<&[String]>) -> Vec<Value>`
+
+Query returning only the requested fields (plus `_id`). At multi-GB scale this is the right query entry point: under the read lock it clones only the sort key and projected fields (never whole documents), then sorts/paginates outside the lock — writers are not blocked by result materialization. `fields: None` behaves like `query_with`.
+
+```rust
+let names = db.query_projected(
+    json!({"status": {"$eq": "active"}}),
+    QueryOptions { limit: Some(10), ..Default::default() },
+    Some(&["name".to_string(), "meta.views".to_string()]),
+);
+// → [{"_id": "...", "name": "alice", "meta.views": 12}, ...]
+```
+
+### `validate_query_ast(ast: &Value) -> Result<()>`
+
+Validate a query AST before executing it. Rejects unknown operators (`$eqq` → `Err`), malformed combinators (non-array `$and`, empty `$and`), and non-object roots. **Use this at trust boundaries** (HTTP handlers, user input): `query()` itself still silently treats unknown operators as match-everything for backward compatibility, so a typo in an unvalidated AST degrades to a full-DB scan.
+
+### Path resolution (reads)
+
+All query/projection/sort paths support **dot notation with numeric array indexing**: `"messages.0.role"` resolves through arrays. Read paths, sort keys, and `set`/`remove`/`array_push` mutation paths share the same resolution rules.
 
 ### Query Operators
 

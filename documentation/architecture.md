@@ -6,6 +6,8 @@
 
 ## Overview
 
+**Three interfaces.** nDB is consumed three ways: the Rust crate (`Database::open`), the Node.js bindings (napi, `napi/`), and the **HTTP daemon** (`ndb serve`, design: `docs/ndb-serve-design.md`) — a resident process that owns the database in memory and serves queries to any client over HTTP. The daemon exists for large shared databases (multi-GB) where N apps must not each hold the data in their own heap: data and computation stay in Rust, only results cross the wire.
+
 **Database-as-a-Folder.** nDB's intended and production structure is one **directory per database**. The convention used by the primary consumer (LLM-Gateway-Chat) and produced by the CLI is:
 
 ```
@@ -40,6 +42,15 @@ Every document lives in a `HashMap<String, Value>` at runtime, providing O(1) lo
 └─────────────────────────────────────────────────┘
 ```
 `Database::open("my-app/data.jsonl")` → in-memory store backed by `my-app/data.jsonl`, with buckets in `my-app/_files/` and trash in `my-app/_trash/`.
+
+**Deployment (submodule workflow).** Consumers embed nDB as a git submodule. Per machine, after pulling:
+
+```
+node setup.js        # builds the CLI (ndb, incl. `ndb serve`) → bin/ndb[.exe]
+node napi/setup.js   # builds the Node bindings → napi/*.node
+```
+
+`bin/` and `target/` are per-machine artifacts (gitignored). The committed `napi/*.win32-x64-msvc.node` files are prebuilts for Windows x64; other platforms build via `napi/setup.js`.
 
 ---
 

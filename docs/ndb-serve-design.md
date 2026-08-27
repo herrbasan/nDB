@@ -1,7 +1,7 @@
 # ndb serve — Design Document
 
-> Status: DESIGN SETTLED, not yet implemented. Tracks issue #2.
-> Decisions agreed 2026-08-26 (herrbasan + Copilot session). Reviewed 2026-08-27 (Kimi) — see "Core prerequisites".
+> Status: **IMPLEMENTED** (v1.3, commit f17a016 + core prerequisites 0ea6afd/0031b1d). Tracks issue #2.
+> Decisions agreed 2026-08-26 (herrbasan + Copilot session). Reviewed 2026-08-27 (Kimi) — prerequisites landed before the server.
 > Change via this file, not memory.
 
 ## Motivation

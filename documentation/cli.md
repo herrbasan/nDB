@@ -1,6 +1,6 @@
 # nDB CLI Reference
 
-> The `ndb` command-line tool. A third interface alongside the Rust crate and the Node.js bindings — used for **maintenance and administration**, not for live serving. Every invocation is a one-shot process: it loads the whole database, does one thing, and exits.
+> The `ndb` command-line tool. A third interface alongside the Rust crate and the Node.js bindings — used for **maintenance and administration**, plus one long-running mode: `serve`.
 
 ## Folder model
 
@@ -36,6 +36,38 @@ Commands:
 | `dump <path>` | Print all documents as JSON Lines to stdout |
 | `config <get\|set> <key> [value]` | Read/write `meta.json` keys (dot notation) |
 | `query <path> <query_ast>` | Run a JSON query (equality / `$eq`) and print matches |
+| `serve <path> [options]` | Run as a resident HTTP daemon (blocks; see below) |
+
+## `ndb serve`
+
+Long-running HTTP daemon: loads the database once, keeps it in memory, serves queries until killed. Design and rationale: `docs/ndb-serve-design.md`.
+
+```
+ndb serve <path/to/data.jsonl> [--bind 127.0.0.1|0.0.0.0] [--port 8323] [--token <secret>]
+```
+
+- The file must already exist (`ndb init` first) — serve fails fast on a missing path.
+- `--token <secret>`: clients must send `Authorization: Bearer <secret>`. Required for LAN binds; 401 otherwise.
+- `--bind 0.0.0.0` exposes the server on the LAN. Windows Firewall prompts (or needs a `netsh advfirewall` rule) on first run. Never forward the port to the internet.
+
+Routes (all JSON unless noted):
+
+| Route | Description |
+|-------|-------------|
+| `POST /query` | `{filter, fields, sort: {field, dir}, limit, offset}` — Layer-3 AST, server-side projection, default limit 1000 |
+| `POST /find` | `{field, value}` or `{field, min, max}` |
+| `GET /doc/:id[?fields=a,b]` | Fetch one doc, optional projection |
+| `PUT /doc` | Insert |
+| `PUT /doc/:id` | Full replace |
+| `PATCH /doc/:id` | `{ops: [{op: set\|remove\|array_push, path, value}]}` — delta ops, returns per-op `applied` flags |
+| `DELETE /doc/:id` | Soft delete |
+| `POST /index` | `{field, type: hash\|btree}` |
+| `POST /compact` | 202 Accepted — runs in background, watch the server log |
+| `GET /stats` | Document count |
+| `PUT /file/:bucket` | Store file (body = raw bytes, `Content-Type` used as MIME) |
+| `GET /file/:bucket/:hash.ext` | Fetch file — raw bytes with real Content-Type |
+
+Limits: 64 concurrent connections (503 over), 64 MB request bodies (413), 30 s read timeout, query limit capped at 1000. Unknown query operators are 400, never silently-match.
 
 ## Exit codes
 
