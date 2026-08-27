@@ -64,6 +64,9 @@ fn print_usage() {
     eprintln!("  --bind <addr>    Bind address (default 127.0.0.1; 0.0.0.0 for LAN)");
     eprintln!("  --port <n>       Port (default 8323)");
     eprintln!("  --token <secret> Require 'Authorization: Bearer <secret>' (recommended for LAN)");
+    eprintln!("  --text-index <f>  Build a full-text index on field <f> at boot (repeatable;");
+    eprintln!("                     cached on disk - unchanged journal boots instantly)");
+    eprintln!("  --threads <n>     Threads for index builds (default: all logical cores)");
 }
 
 fn handle_serve(args: &[String]) {
@@ -78,6 +81,7 @@ fn handle_serve(args: &[String]) {
     }
 
     let mut config = ndb::server::ServerConfig::default();
+    let mut text_indexes = Vec::new();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -99,12 +103,27 @@ fn handle_serve(args: &[String]) {
                 config.token = Some(args[i + 1].clone());
                 i += 2;
             }
+            "--text-index" if i + 1 < args.len() => {
+                text_indexes.push(args[i + 1].clone());
+                i += 2;
+            }
+            "--threads" if i + 1 < args.len() => {
+                config.threads = match args[i + 1].parse::<usize>() {
+                    Ok(t) => t,
+                    Err(_) => {
+                        eprintln!("Error: invalid thread count: {}", args[i + 1]);
+                        process::exit(EXIT_GENERAL_ERROR);
+                    }
+                };
+                i += 2;
+            }
             other => {
                 eprintln!("Error: unknown serve option: {}", other);
                 process::exit(EXIT_GENERAL_ERROR);
             }
         }
     }
+    config.text_indexes = text_indexes;
 
     let db = match ndb::Database::open(path) {
         Ok(db) => db,

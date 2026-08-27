@@ -960,26 +960,71 @@ impl Database {
     }
 
     /// Create a full-text index on a text field (opt-in, like hash/btree
-    /// indexes). Existing documents are tokenized once. AND/OR/phrase/prefix
-    /// queries then run against the inverted index via `text_search`.
+    /// indexes). Boot path: load the disk cache if the journal is unchanged;
+    /// otherwise build in parallel across all logical cores and cache the
+    /// result. AND/OR/phrase/prefix queries then run via `text_search`.
     pub fn create_text_index(&self, field: &str) -> Result<()> {
+        self.create_text_index_with_threads(field, 0)
+    }
+
+    /// Same as `create_text_index` with an explicit thread count for the
+    /// (re)build. `threads = 0` means all logical cores. Ignored when the
+    /// disk cache is fresh.
+    pub fn create_text_index_with_threads(&self, field: &str, threads: usize) -> Result<()> {
         let _guard = self.writer.lock();
 
-        let mut tindex = search::TextIndex::new(field);
-        {
-            let docs = self.docs.read();
-            for (id, doc) in docs.iter() {
-                tindex.index_doc(id, doc);
+        // 1. Cache path: journal unchanged → load instead of building.
+        if !self.is_in_memory() {
+            let journal_size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+            let cache = self.base_dir.join(format!("_index_{}.fti", field));
+            if let Some(mut tindex) = search::TextIndex::load(&cache, journal_size, field) {
+                // Trust-but-verify: indexed-doc count must match the store's
+                // docs-with-this-field, else the stamp lied.
+                let with_field = self
+                    .docs
+                    .read()
+                    .values()
+                    .filter(|d| search::extract_text(d, field).is_some())
+                    .count();
+                if tindex.doc_count() == with_field {
+                    self.text_indexes.write().insert(field.to_string(), tindex);
+                    return Ok(());
+                }
             }
         }
+
+        // 2. Parallel build from (id, text) pairs.
+        let docs_text: Vec<(String, String)> = {
+            let docs = self.docs.read();
+            docs.iter()
+                .filter_map(|(id, doc)| {
+                    search::extract_text(doc, field).map(|t| (id.clone(), t))
+                })
+                .collect()
+        };
+        let mut tindex = search::TextIndex::new(field);
+        tindex.build_parallel(docs_text, threads);
+
+        // 3. Cache for the next boot.
+        if !self.is_in_memory() {
+            let journal_size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+            let cache = self.base_dir.join(format!("_index_{}.fti", field));
+            // Cache write failure is non-fatal (read-only dir): search still works.
+            let _ = tindex.save(&cache, journal_size);
+        }
+
         self.text_indexes.write().insert(field.to_string(), tindex);
         Ok(())
     }
 
-    /// Drop a full-text index.
+    /// Drop a full-text index (and its disk cache, if any).
     pub fn drop_text_index(&self, field: &str) -> Result<()> {
         let _guard = self.writer.lock();
         self.text_indexes.write().remove(field);
+        if !self.is_in_memory() {
+            let cache = self.base_dir.join(format!("_index_{}.fti", field));
+            let _ = std::fs::remove_file(cache);
+        }
         Ok(())
     }
 

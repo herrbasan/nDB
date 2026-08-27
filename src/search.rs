@@ -12,9 +12,16 @@
 use crate::error::{Error, Result};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::path::Path;
 
 /// Internal doc id used in postings (dense, u32).
 type DocId = u32;
+
+/// Default thread count for parallel index builds: all logical cores.
+pub fn default_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
 
 /// One searchable condition.
 #[derive(Debug, Clone)]
@@ -248,6 +255,177 @@ impl TextIndex {
     /// Number of indexed documents.
     pub fn doc_count(&self) -> usize {
         self.lookup.len()
+    }
+
+    /// Parallel bulk build from (id, text) pairs. Each thread tokenizes a
+    /// chunk into a local token→doc-ids map (unique tokens per doc); the
+    /// calling thread merges and sorts each posting list. `threads = 0`
+    /// means all logical cores. Zero new crates — std scoped threads.
+    pub fn build_parallel(&mut self, docs_text: Vec<(String, String)>, threads: usize) {
+        if docs_text.is_empty() {
+            return;
+        }
+        let threads = if threads == 0 { default_threads() } else { threads };
+        let threads = threads.min(docs_text.len());
+
+        // Assign dense internal ids in order.
+        self.ids.reserve(docs_text.len());
+        self.lookup.reserve(docs_text.len());
+        let mut texts: Vec<String> = Vec::with_capacity(docs_text.len());
+        for (i, (id, text)) in docs_text.into_iter().enumerate() {
+            self.ids.push(id.clone());
+            self.lookup.insert(id, i as DocId);
+            texts.push(text);
+        }
+
+        let chunk_size = (texts.len() + threads - 1) / threads;
+        let texts_ref = &texts;
+
+        let mut partials: Vec<HashMap<String, Vec<DocId>>> = Vec::with_capacity(threads);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads);
+            for (chunk_idx, chunk) in texts_ref.chunks(chunk_size).enumerate() {
+                handles.push(scope.spawn(move || {
+                    let base = (chunk_idx * chunk_size) as u32;
+                    let mut local: HashMap<String, Vec<DocId>> = HashMap::new();
+                    for (i, text) in chunk.iter().enumerate() {
+                        let doc_id = base + i as u32;
+                        // Unique tokens per doc: dedup so each doc appears once per token.
+                        let mut tokens = tokenize(text);
+                        tokens.sort_unstable();
+                        tokens.dedup();
+                        for token in tokens {
+                            local.entry(token).or_default().push(doc_id);
+                        }
+                    }
+                    local
+                }));
+            }
+            for h in handles {
+                partials.push(h.join().unwrap());
+            }
+        });
+
+        // Merge: concatenate per-token doc-id lists, then sort each.
+        for partial in partials {
+            for (token, list) in partial {
+                self.postings.entry(token).or_default().extend(list);
+            }
+        }
+        for list in self.postings.values_mut() {
+            list.sort_unstable();
+            list.dedup();
+        }
+    }
+
+    // ─── Disk cache ──────────────────────────────────────────────────
+    //
+    // The index is a pure in-memory structure rebuilt per process. To make
+    // daemon boots fast, `save` serializes the postings to a cache file
+    // stamped with the journal's byte size at save time. `load` accepts the
+    // cache only when the current journal size matches (the append-only log
+    // grows on every write; compaction shrinks it — any change moves it).
+    // Mismatch → None → caller rebuilds. Cache corruption → None as well.
+
+    fn write_u32(w: &mut Vec<u8>, v: u32) {
+        w.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn write_u64(w: &mut Vec<u8>, v: u64) {
+        w.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn read_exact_u32(r: &mut &[u8]) -> Option<u32> {
+        if r.len() < 4 {
+            return None;
+        }
+        let v = u32::from_le_bytes([r[0], r[1], r[2], r[3]]);
+        *r = &r[4..];
+        Some(v)
+    }
+
+    fn read_exact_u64(r: &mut &[u8]) -> Option<u64> {
+        if r.len() < 8 {
+            return None;
+        }
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&r[..8]);
+        *r = &r[8..];
+        Some(u64::from_le_bytes(b))
+    }
+
+    fn read_exact_bytes(r: &mut &[u8], len: usize) -> Option<Vec<u8>> {
+        if r.len() < len {
+            return None;
+        }
+        let v = r[..len].to_vec();
+        *r = &r[len..];
+        Some(v)
+    }
+
+    /// Serialize the index to `path`, stamped with the journal's byte size.
+    /// Atomic: temp file + rename.
+    pub fn save(&self, path: &Path, journal_size: u64) -> std::io::Result<()> {
+        let mut buf = Vec::new();
+        Self::write_u64(&mut buf, journal_size);
+        Self::write_u32(&mut buf, self.ids.len() as u32);
+        for id in &self.ids {
+            let bytes = id.as_bytes();
+            Self::write_u32(&mut buf, bytes.len() as u32);
+            buf.extend_from_slice(bytes);
+        }
+        Self::write_u32(&mut buf, self.postings.len() as u32);
+        for (token, list) in &self.postings {
+            let bytes = token.as_bytes();
+            Self::write_u32(&mut buf, bytes.len() as u32);
+            buf.extend_from_slice(bytes);
+            Self::write_u32(&mut buf, list.len() as u32);
+            for d in list {
+                Self::write_u32(&mut buf, *d);
+            }
+        }
+        let tmp = path.with_extension("fti.tmp");
+        std::fs::write(&tmp, &buf)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load a cached index if it exists and the journal size matches.
+    /// None on mismatch, absence, or corruption — a stale cache is an
+    /// optimization, not an invariant; the caller just rebuilds.
+    pub fn load(path: &Path, journal_size: u64, field: &str) -> Option<Self> {
+        let mut r: &[u8] = &std::fs::read(path).ok()?;
+        let stamped = Self::read_exact_u64(&mut r)?;
+        if stamped != journal_size {
+            return None;
+        }
+        let id_count = Self::read_exact_u32(&mut r)? as usize;
+        let mut ids = Vec::with_capacity(id_count);
+        let mut lookup = HashMap::with_capacity(id_count);
+        for i in 0..id_count {
+            let len = Self::read_exact_u32(&mut r)? as usize;
+            let id = String::from_utf8(Self::read_exact_bytes(&mut r, len)?).ok()?;
+            lookup.insert(id.clone(), i as DocId);
+            ids.push(id);
+        }
+        let token_count = Self::read_exact_u32(&mut r)? as usize;
+        let mut postings = HashMap::with_capacity(token_count);
+        for _ in 0..token_count {
+            let len = Self::read_exact_u32(&mut r)? as usize;
+            let token = String::from_utf8(Self::read_exact_bytes(&mut r, len)?).ok()?;
+            let n = Self::read_exact_u32(&mut r)? as usize;
+            let mut list = Vec::with_capacity(n);
+            for _ in 0..n {
+                list.push(Self::read_exact_u32(&mut r)?);
+            }
+            postings.insert(token, list);
+        }
+        Some(Self {
+            field: field.to_string(),
+            postings,
+            ids,
+            lookup,
+        })
     }
 
     fn docs_for_token(&self, token: &str) -> &[DocId] {

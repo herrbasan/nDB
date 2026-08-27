@@ -28,6 +28,11 @@ pub struct ServerConfig {
     pub max_body: usize,
     /// Default + hard cap for query limit.
     pub default_limit: usize,
+    /// Text fields to index at boot (cache-aware). Named like serve's
+    /// --text-index flag: one entry per field.
+    pub text_indexes: Vec<String>,
+    /// Threads for index (re)builds. 0 = all logical cores.
+    pub threads: usize,
 }
 
 impl Default for ServerConfig {
@@ -39,6 +44,8 @@ impl Default for ServerConfig {
             max_connections: 64,
             max_body: 64 * 1024 * 1024,
             default_limit: 1000,
+            text_indexes: Vec::new(),
+            threads: 0,
         }
     }
 }
@@ -47,6 +54,11 @@ impl Default for ServerConfig {
 
 /// Run the server. Blocks forever; each connection handled on its own thread.
 pub fn serve(db: Database, config: ServerConfig) -> Result<(), Error> {
+    // Boot indexes: cache hit → instant; miss → parallel build + cache.
+    for field in &config.text_indexes {
+        db.create_text_index_with_threads(field, config.threads)?;
+        eprintln!("text index ready: {}", field);
+    }
     let listener = TcpListener::bind((config.bind.as_str(), config.port))
         .map_err(|e| Error::invalid_arg(format!("bind {}:{} failed: {}", config.bind, config.port, e)))?;
     serve_listener(listener, db, config)

@@ -227,3 +227,85 @@ fn unicode_tokenization() {
     assert_eq!(ids(&db, TextSearch::and(vec![TextQuery::Term("2026".into())])).len(), 1);
     assert_eq!(ids(&db, TextSearch::and(vec![TextQuery::Prefix("müd".into())])).len(), 1);
 }
+
+/// Parallel build produces identical search results to the (implicit
+/// sequential) incremental path, including phrase and AND queries.
+#[test]
+fn parallel_build_matches_incremental() {
+    let texts: Vec<(String, String)> = (0..200)
+        .map(|i| {
+            let content = if i % 50 == 7 {
+                format!("story {} the hare was tired at the end of the race paul yesterday filler words", i)
+            } else {
+                format!("story {} ordinary filler text about rivers and mountains and coffee", i)
+            };
+            (format!("doc_{}", i), content)
+        })
+        .collect();
+
+    // Parallel-built index via create_text_index (build_parallel path)
+    let dir1 = TempDir::new().unwrap();
+    let db1 = Database::open(dir1.path().join("a.jsonl")).unwrap();
+    for (id, content) in &texts {
+        db1.insert(json!({"_id": id, "content": content.clone()})).unwrap();
+    }
+    db1.create_text_index_with_threads("content", 8).unwrap();
+
+    let headline = TextSearch::and(vec![
+        TextQuery::Phrase("the hare was tired".into()),
+        TextQuery::Phrase("at the end of the race".into()),
+        TextQuery::Term("paul".into()),
+        TextQuery::Term("yesterday".into()),
+    ]);
+    let mut hits1 = db1.text_search("content", &headline).unwrap();
+    hits1.sort();
+    assert_eq!(hits1.len(), 4, "docs 7, 57, 107, 157");
+
+    let mut common = db1
+        .text_search("content", &TextSearch::and(vec![TextQuery::Term("coffee".into())]))
+        .unwrap();
+    common.sort();
+    assert_eq!(common.len(), 196);
+}
+
+/// Disk cache: fresh journal loads the cache; any write invalidates it
+/// (journal size moves); drop_text_index removes the cache file.
+#[test]
+fn index_disk_cache_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("cache.jsonl");
+
+    // Build + cache
+    {
+        let db = Database::open(&path).unwrap();
+        db.insert(json!({"content": "alpha beta gamma"})).unwrap();
+        db.insert(json!({"content": "beta delta"})).unwrap();
+        db.create_text_index("content").unwrap();
+        assert_eq!(ids(&db, TextSearch::and(vec![TextQuery::Term("beta".into())])).len(), 2);
+        assert!(dir.path().join("_index_content.fti").exists(), "cache file written");
+    }
+
+    // Reopen, unchanged journal → cache load, same results
+    {
+        let db = Database::open(&path).unwrap();
+        db.create_text_index("content").unwrap();
+        assert_eq!(ids(&db, TextSearch::and(vec![TextQuery::Term("beta".into())])).len(), 2);
+        assert_eq!(ids(&db, TextSearch::and(vec![TextQuery::Term("gamma".into())])).len(), 1);
+
+        // Now write: journal grows → cache is stale for the next boot,
+        // but the running index updates incrementally.
+        db.insert(json!({"content": "gamma epsilon"})).unwrap();
+        assert_eq!(ids(&db, TextSearch::and(vec![TextQuery::Term("gamma".into())])).len(), 2);
+    }
+
+    // Reopen after write → stale stamp → rebuild → correct results
+    {
+        let db = Database::open(&path).unwrap();
+        db.create_text_index("content").unwrap();
+        assert_eq!(ids(&db, TextSearch::and(vec![TextQuery::Term("gamma".into())])).len(), 2);
+
+        // drop removes cache
+        db.drop_text_index("content").unwrap();
+        assert!(!dir.path().join("_index_content.fti").exists());
+    }
+}
