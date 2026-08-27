@@ -239,10 +239,15 @@ pub fn validate_query_ast(ast: &Value) -> Result<()> {
                         return Err(Error::invalid_arg(format!("unknown operator {}", op)));
                     }
                     _ => {
-                        // Field condition: value is either an operator object or an implicit $eq
+                        // Field condition: value is either an operator object or an implicit $eq.
+                        // Every key in an operator object must be a known operator — this makes
+                        // validation and evaluation agree (evaluate_condition's catch-all
+                        // `_ => true` is unreachable for validated ASTs). Consequence: an
+                        // object value can no longer be matched via implicit $eq on nested
+                        // keys ({"field": {"a": 1}} now 400s as "unknown operator a").
                         if let Value::Object(op_map) = val {
                             for op in op_map.keys() {
-                                if op.starts_with('$') && !KNOWN_OPERATORS.contains(&op.as_str()) {
+                                if !KNOWN_OPERATORS.contains(&op.as_str()) {
                                     return Err(Error::invalid_arg(format!("unknown operator {}", op)));
                                 }
                             }
@@ -352,16 +357,35 @@ fn evaluate_condition(field_val: &Value, condition: &Value) -> bool {
                 "$gte" => value_cmp(field_val, operand) != std::cmp::Ordering::Less,
                 "$lt" => value_cmp(field_val, operand) == std::cmp::Ordering::Less,
                 "$lte" => value_cmp(field_val, operand) != std::cmp::Ordering::Greater,
+                // Array-aware: if the field value is an array, match elements
+                // ({"tags": {"$in": ["a"]}} finds docs whose tags contain "a").
+                // Scalar field values keep whole-value comparison.
                 "$in" => operand
                     .as_array()
-                    .map(|arr| arr.iter().any(|v| values_equal(field_val, v)))
+                    .map(|arr| {
+                        if let Value::Array(field_arr) = field_val {
+                            field_arr.iter().any(|el| arr.iter().any(|v| values_equal(el, v)))
+                        } else {
+                            arr.iter().any(|v| values_equal(field_val, v))
+                        }
+                    })
                     .unwrap_or(false),
                 "$nin" => operand
                     .as_array()
-                    .map(|arr| !arr.iter().any(|v| values_equal(field_val, v)))
+                    .map(|arr| {
+                        let hit = if let Value::Array(field_arr) = field_val {
+                            field_arr.iter().any(|el| arr.iter().any(|v| values_equal(el, v)))
+                        } else {
+                            arr.iter().any(|v| values_equal(field_val, v))
+                        };
+                        !hit
+                    })
                     .unwrap_or(true),
                 "$exists" => operand.as_bool().unwrap_or(true),
-                _ => true, // Unknown operator = no filter
+                // Unknown op = no filter. Only reachable on unvalidated ASTs
+                // (napi/CLI query path) — the HTTP route runs validate_query_ast
+                // first, so every key is known there.
+                _ => true,
             })
         }
         // Implicit $eq: {"field": "value"}
@@ -977,7 +1001,7 @@ impl Database {
         if !self.is_in_memory() {
             let journal_size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
             let cache = self.base_dir.join(format!("_index_{}.fti", field));
-            if let Some(mut tindex) = search::TextIndex::load(&cache, journal_size, field) {
+            if let Some(tindex) = search::TextIndex::load(&cache, journal_size, field) {
                 // Trust-but-verify: indexed-doc count must match the store's
                 // docs-with-this-field, else the stamp lied.
                 let with_field = self
@@ -1517,19 +1541,28 @@ impl Database {
     /// after the lock is released, so writers are never blocked by
     /// materialization of the result page. `_id` is always included.
     ///
+    /// Returns `(total, page)` where `total` is the pre-pagination match count.
+    ///
     /// `fields: None` returns full documents (same as query_with).
+    /// `text_ids: Some(set)` additionally requires the doc id to be in the
+    /// set — the intersection of a full-text candidate set with the filter.
+    /// `None` = no text constraint (zero overhead).
     pub fn query_projected(
         &self,
         ast: Value,
         opts: QueryOptions,
         fields: Option<&[String]>,
-    ) -> Vec<Value> {
+        text_ids: Option<&HashSet<String>>,
+    ) -> (usize, Vec<Value>) {
         let sort_field = opts.sort_by.as_ref().map(|(f, _)| f.clone());
         let mut rows: Vec<(Value, Value)> = {
             let docs = self.docs.read();
-            docs.values()
-                .filter(|doc| query_matches(doc, &ast))
-                .map(|doc| {
+            docs.iter()
+                .filter(|(id, doc)| {
+                    query_matches(doc, &ast)
+                        && text_ids.map_or(true, |set| set.contains(*id))
+                })
+                .map(|(_id, doc)| {
                     let key = match &sort_field {
                         Some(f) => field_get(doc, f).cloned().unwrap_or(Value::Null),
                         None => Value::Null,
@@ -1550,6 +1583,8 @@ impl Database {
             });
         }
 
+        let total = rows.len();
+
         let offset = opts.offset.unwrap_or(0);
         if offset > 0 {
             rows.drain(..offset.min(rows.len()));
@@ -1558,7 +1593,34 @@ impl Database {
             rows.truncate(limit);
         }
 
-        rows.into_iter().map(|(_, proj)| proj).collect()
+        (total, rows.into_iter().map(|(_, proj)| proj).collect())
+    }
+
+    /// Term counts per field, single O(n) scan. Array fields count per element
+    /// (each category in `categories` counts once); scalar fields count per
+    /// value. Only string values are counted (numbers/bools are skipped).
+    /// Returns (field, counts) pairs in input order; counts are in BTreeMap
+    /// (sorted) order for deterministic output.
+    pub fn facet_counts(&self, fields: &[String]) -> Vec<(String, BTreeMap<String, usize>)> {
+        let mut counts: Vec<(String, BTreeMap<String, usize>)> =
+            fields.iter().map(|f| (f.clone(), BTreeMap::new())).collect();
+        {
+            let docs = self.docs.read();
+            for doc in docs.values() {
+                for (field, map) in counts.iter_mut() {
+                    let Some(val) = doc.get(field.as_str()) else { continue };
+                    let terms: Vec<&str> = match val {
+                        Value::String(s) => vec![s.as_str()],
+                        Value::Array(arr) => arr.iter().filter_map(|x| x.as_str()).collect(),
+                        _ => continue,
+                    };
+                    for t in terms {
+                        *map.entry(t.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        counts
     }
 
     // ─── Index Management ──────────────────────────────────────────

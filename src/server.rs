@@ -302,6 +302,7 @@ fn route(db: &Arc<Database>, config: &ServerConfig, req: &Request) -> Response {
         ("POST", ["query"]) => handle_query(db, config, req),
         ("POST", ["find"]) => handle_find(db, req),
         ("POST", ["search"]) => handle_search(db, config, req),
+        ("POST", ["facets"]) => handle_facets(db, req),
 
         ("GET", ["doc", id]) => handle_get_doc(db, req, id),
         ("PUT", ["doc"]) => handle_insert(db, req),
@@ -363,11 +364,28 @@ fn handle_query(db: &Database, config: &ServerConfig, req: &Request) -> (u16, Va
         .and_then(|f| f.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
 
-    let results = db.query_projected(filter, opts, fields.as_deref());
+    // Optional text constraint: filter ∩ full-text candidate set.
+    // Absent → no constraint, zero overhead.
+    let text_ids: Option<std::collections::HashSet<String>> = match body.get("text") {
+        Some(t) => {
+            let (tfield, tsearch) = match parse_text_search(t) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            match db.text_search(&tfield, &tsearch) {
+                Ok(ids) => Some(ids.into_iter().collect()),
+                Err(e) => return db_error(e),
+            }
+        }
+        None => None,
+    };
+
+    let (total, results) = db.query_projected(filter, opts, fields.as_deref(), text_ids.as_ref());
     (
         200,
         json!({
             "ok": true,
+            "total": total,
             "count": results.len(),
             "results": results,
         }),
@@ -408,39 +426,30 @@ fn parse_query_options(body: &Value, config: &ServerConfig) -> Result<QueryOptio
     Ok(opts)
 }
 
-/// POST /search — full-text search over a text-indexed field.
-/// Body: {field, mode: "and"|"or", case_sensitive?, queries: [{type, value, exclude?}],
-
-/// POST /search — full-text search over a text-indexed field.
-/// Body: {field, mode: "and"|"or", case_sensitive?, queries: [{type, value, exclude?}],
-///         fields?, limit?, offset?}
-fn handle_search(db: &Database, config: &ServerConfig, req: &Request) -> (u16, Value) {
-    let body = match parse_body(req) {
-        Ok(b) => b,
-        Err(e) => return e,
-    };
-
-    let field = match body.get("field").and_then(|v| v.as_str()) {
+/// Parse {field, mode, case_sensitive?, queries:[{type, value, exclude?}]} from a
+/// JSON object into a TextSearch. Shared by /search (body root) and /query (body["text"]).
+fn parse_text_search(obj: &Value) -> Result<(String, TextSearch), (u16, Value)> {
+    let field = match obj.get("field").and_then(|v| v.as_str()) {
         Some(f) => f.to_string(),
-        None => return (400, json!({"error": "field required"})),
+        None => return Err((400, json!({"error": "field required"}))),
     };
 
-    let mode = match body.get("mode").and_then(|v| v.as_str()).unwrap_or("and") {
+    let mode = match obj.get("mode").and_then(|v| v.as_str()).unwrap_or("and") {
         "and" => TextMode::And,
         "or" => TextMode::Or,
         other => {
-            return (
+            return Err((
                 400,
                 json!({"error": format!("mode must be 'and' or 'or', got '{}'", other)}),
-            )
+            ))
         }
     };
 
-    let case_sensitive = body.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false);
+    let case_sensitive = obj.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    let raw_queries = match body.get("queries").and_then(|q| q.as_array()) {
+    let raw_queries = match obj.get("queries").and_then(|q| q.as_array()) {
         Some(q) if !q.is_empty() => q,
-        _ => return (400, json!({"error": "queries: non-empty array required"})),
+        _ => return Err((400, json!({"error": "queries: non-empty array required"}))),
     };
 
     let mut queries = Vec::with_capacity(raw_queries.len());
@@ -448,17 +457,17 @@ fn handle_search(db: &Database, config: &ServerConfig, req: &Request) -> (u16, V
         let qtype = q.get("type").and_then(|v| v.as_str()).unwrap_or("term");
         let value = match q.get("value").and_then(|v| v.as_str()) {
             Some(v) if !v.trim().is_empty() => v.to_string(),
-            _ => return (400, json!({"error": "each query needs a non-empty value"})),
+            _ => return Err((400, json!({"error": "each query needs a non-empty value"}))),
         };
         let inner = match qtype {
             "term" => TextQuery::Term(value),
             "phrase" => TextQuery::Phrase(value),
             "prefix" => TextQuery::Prefix(value),
             other => {
-                return (
+                return Err((
                     400,
                     json!({"error": format!("query type must be term|phrase|prefix, got '{}'", other)}),
-                )
+                ))
             }
         };
         if q.get("exclude").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -470,8 +479,24 @@ fn handle_search(db: &Database, config: &ServerConfig, req: &Request) -> (u16, V
 
     let search = TextSearch { mode, case_sensitive, queries };
     if let Err(e) = search.validate() {
-        return (400, json!({"error": e.to_string()}));
+        return Err((400, json!({"error": e.to_string()})));
     }
+    Ok((field, search))
+}
+
+/// POST /search — full-text search over a text-indexed field.
+/// Body: {field, mode: "and"|"or", case_sensitive?, queries: [{type, value, exclude?}],
+///         fields?, limit?, offset?}
+fn handle_search(db: &Database, config: &ServerConfig, req: &Request) -> (u16, Value) {
+    let body = match parse_body(req) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+
+    let (field, search) = match parse_text_search(&body) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
 
     let ids = match db.text_search(&field, &search) {
         Ok(ids) => ids,
@@ -525,6 +550,34 @@ fn handle_search(db: &Database, config: &ServerConfig, req: &Request) -> (u16, V
             "results": page,
         }),
     )
+}
+
+/// POST /facets — term counts per field. Array fields count per element,
+/// scalar fields count per value; only string values are counted.
+/// Body: {fields: ["categories", "keywords", "age"]}
+fn handle_facets(db: &Database, req: &Request) -> (u16, Value) {
+    let body = match parse_body(req) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let fields: Vec<String> = body
+        .get("fields")
+        .and_then(|f| f.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if fields.is_empty() {
+        return (400, json!({"error": "fields: non-empty string array required"}));
+    }
+
+    let mut facets = serde_json::Map::new();
+    for (field, counts) in db.facet_counts(&fields) {
+        let mut m = serde_json::Map::new();
+        for (term, count) in counts {
+            m.insert(term, json!(count));
+        }
+        facets.insert(field, Value::Object(m));
+    }
+    (200, json!({"ok": true, "facets": facets}))
 }
 
 fn handle_find(db: &Database, req: &Request) -> (u16, Value) {

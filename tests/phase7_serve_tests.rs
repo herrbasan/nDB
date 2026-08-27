@@ -206,6 +206,141 @@ fn query_rejects_unknown_operator() {
         None,
     );
     assert_eq!(status, 400, "unknown operator must 400: {}", body);
+
+    // Unknown op key that does NOT start with $ (e.g. PowerShell 5.1 interpolating
+    // "$in" as empty). Validation and evaluation must agree: 400, not silent no-op.
+    let (status, body) = request(
+        port,
+        "POST",
+        "/query",
+        Some(&json!({"filter": {"status": {"": "x"}}})),
+        None,
+    );
+    assert_eq!(status, 400, "non-$ unknown op key must 400: {}", body);
+
+    // Implicit $eq on nested object values is no longer supported (op-map ambiguity).
+    let (status, body) = request(
+        port,
+        "POST",
+        "/query",
+        Some(&json!({"filter": {"meta": {"a": 1}}})),
+        None,
+    );
+    assert_eq!(status, 400, "implicit $eq on object must 400: {}", body);
+}
+
+/// total = pre-pagination match count; count = page size.
+#[test]
+fn query_total_is_pre_pagination() {
+    let (port, _db, _dir) = start_server(None);
+    for i in 0..5 {
+        request(port, "PUT", "/doc", Some(&json!({"n": i, "status": "warm"})), None);
+    }
+
+    let (status, body) = request(port, "POST", "/query", Some(&json!({"limit": 2})), None);
+    assert_eq!(status, 200, "{}", body);
+    assert_eq!(body["total"], 5, "total must be the full match count");
+    assert_eq!(body["count"], 2, "count must be the page size");
+
+    // offset shifts the page, not the total
+    let (_, body) = request(port, "POST", "/query", Some(&json!({"limit": 2, "offset": 3})), None);
+    assert_eq!(body["total"], 5);
+    assert_eq!(body["count"], 2);
+
+    // offset past the end: total stays, page empties
+    let (_, body) = request(port, "POST", "/query", Some(&json!({"limit": 2, "offset": 10})), None);
+    assert_eq!(body["total"], 5);
+    assert_eq!(body["count"], 0);
+}
+
+/// $in on an array field matches elements (old-fmrip category semantics).
+#[test]
+fn query_array_in_matches_elements() {
+    let (port, _db, _dir) = start_server(None);
+    request(port, "PUT", "/doc", Some(&json!({"categories": ["A", "B"], "n": 1})), None);
+    request(port, "PUT", "/doc", Some(&json!({"categories": ["C"], "n": 2})), None);
+    request(port, "PUT", "/doc", Some(&json!({"categories": ["B"], "n": 3})), None);
+    request(port, "PUT", "/doc", Some(&json!({"n": 4})), None);
+
+    // any selected category present
+    let (status, body) = request(port, "POST", "/query", Some(&json!({"filter": {"categories": {"$in": ["A", "C"]}}})), None);
+    assert_eq!(status, 200, "{}", body);
+    assert_eq!(body["total"], 2, "docs 1 (A) and 2 (C) must match");
+
+    // $nin on array fields = negation
+    let (_, body) = request(port, "POST", "/query", Some(&json!({"filter": {"categories": {"$nin": ["A", "C"]}}})), None);
+    assert_eq!(body["total"], 1, "only doc 3 (B) must match");
+
+    // scalar $in unchanged
+    let (_, body) = request(port, "POST", "/query", Some(&json!({"filter": {"n": {"$in": [1, 2]}}})), None);
+    assert_eq!(body["total"], 2);
+}
+
+/// /query with text: filter ∩ full-text candidate set, one endpoint.
+#[test]
+fn query_text_constraint_intersects_filter() {
+    let (port, _db, _dir) = start_server(None);
+    request(port, "PUT", "/doc", Some(&json!({"title": "tortoise", "content": "The hare was tired.", "tag": "x"})), None);
+    request(port, "PUT", "/doc", Some(&json!({"title": "hare", "content": "The hare was tired.", "tag": "y"})), None);
+    request(port, "PUT", "/doc", Some(&json!({"title": "other", "content": "Nothing relevant.", "tag": "x"})), None);
+
+    request(port, "POST", "/index", Some(&json!({"field": "content", "type": "text"})), None);
+
+    // text alone
+    let (status, body) = request(
+        port, "POST", "/query",
+        Some(&json!({"text": {"field": "content", "mode": "and", "queries": [{"type": "phrase", "value": "the hare was tired"}]}})),
+        None,
+    );
+    assert_eq!(status, 200, "{}", body);
+    assert_eq!(body["total"], 2);
+
+    // text ∩ filter: only the "x" doc
+    let (_, body) = request(
+        port, "POST", "/query",
+        Some(&json!({
+            "filter": {"tag": "x"},
+            "text": {"field": "content", "mode": "and", "queries": [{"type": "phrase", "value": "the hare was tired"}]},
+            "sort": {"field": "title", "dir": "asc"}
+        })),
+        None,
+    );
+    assert_eq!(body["total"], 1);
+    assert_eq!(body["results"][0]["title"], "tortoise");
+
+    // text on unindexed field fails loud
+    let (status, _) = request(
+        port, "POST", "/query",
+        Some(&json!({"text": {"field": "title", "queries": [{"type": "term", "value": "x"}]}})),
+        None,
+    );
+    assert_eq!(status, 500, "no text index → error, not silent");
+}
+
+/// /facets: array fields count per element, scalars per value, strings only.
+#[test]
+fn facets_endpoint() {
+    let (port, _db, _dir) = start_server(None);
+    request(port, "PUT", "/doc", Some(&json!({"categories": ["A", "B"], "status": "on"})), None);
+    request(port, "PUT", "/doc", Some(&json!({"categories": ["A"], "status": "off", "n": 7})), None);
+    request(port, "PUT", "/doc", Some(&json!({"categories": ["A", "B"], "status": "on"})), None);
+
+    let (status, body) = request(
+        port, "POST", "/facets",
+        Some(&json!({"fields": ["categories", "status", "n"]})),
+        None,
+    );
+    assert_eq!(status, 200, "{}", body);
+    assert_eq!(body["facets"]["categories"]["A"], 3, "array field counts per element");
+    assert_eq!(body["facets"]["categories"]["B"], 2);
+    assert_eq!(body["facets"]["status"]["on"], 2);
+    assert_eq!(body["facets"]["status"]["off"], 1);
+    assert!(body["facets"]["n"].is_null() || body["facets"]["n"].as_object().map(|m| m.is_empty()).unwrap_or(false),
+        "numeric-only field must yield no string terms");
+
+    // missing fields: 400
+    let (status, _) = request(port, "POST", "/facets", Some(&json!({})), None);
+    assert_eq!(status, 400);
 }
 
 #[test]

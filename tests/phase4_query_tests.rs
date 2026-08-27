@@ -212,11 +212,13 @@ fn query_projected_returns_only_requested_fields() {
     populate_db(&db);
 
     let fields = vec!["name".to_string(), "score".to_string()];
-    let results = db.query_projected(
+    let (total, results) = db.query_projected(
         json!({"status": "active"}),
         QueryOptions { sort_by: Some(("score".to_string(), SortDir::Desc)), ..Default::default() },
         Some(&fields),
+        None,
     );
+    assert_eq!(total, 3);
     assert_eq!(results.len(), 3);
     assert_eq!(results[0]["name"], "alice", "sorted by score desc: alice 150, diana 95, bob 80");
     for doc in &results {
@@ -225,12 +227,14 @@ fn query_projected_returns_only_requested_fields() {
         assert!(doc.get("_id").is_some(), "_id always included");
     }
 
-    // offset + limit
-    let results = db.query_projected(
+    // offset + limit: total is pre-pagination, page is truncated
+    let (total, results) = db.query_projected(
         json!({"status": "active"}),
         QueryOptions { sort_by: Some(("score".to_string(), SortDir::Desc)), offset: Some(1), limit: Some(1), ..Default::default() },
         Some(&fields),
+        None,
     );
+    assert_eq!(total, 3, "total must be the pre-pagination match count");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["name"], "diana");
 }

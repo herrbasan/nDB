@@ -375,22 +375,27 @@ let results = db.query_with(
 );
 ```
 
-### `query_projected(ast: Value, opts: QueryOptions, fields: Option<&[String]>) -> Vec<Value>`
+### `query_projected(ast: Value, opts: QueryOptions, fields: Option<&[String]>, text_ids: Option<&HashSet<String>>) -> (usize, Vec<Value>)`
 
 Query returning only the requested fields (plus `_id`). At multi-GB scale this is the right query entry point: under the read lock it clones only the sort key and projected fields (never whole documents), then sorts/paginates outside the lock — writers are not blocked by result materialization. `fields: None` behaves like `query_with`.
 
+Returns `(total, page)`: `total` is the pre-pagination match count, `page` the projected/sorted/paginated rows.
+
+`text_ids: Some(set)` intersects the filter with a full-text candidate set (doc ids from `text_search`) — the way `/query`'s `text` field works. `None` = no text constraint.
+
 ```rust
-let names = db.query_projected(
+let (total, names) = db.query_projected(
     json!({"status": {"$eq": "active"}}),
     QueryOptions { limit: Some(10), ..Default::default() },
     Some(&["name".to_string(), "meta.views".to_string()]),
+    None,
 );
-// → [{"_id": "...", "name": "alice", "meta.views": 12}, ...]
+// → total: 480, names: [{"_id": "...", "name": "alice", "meta.views": 12}, ...]
 ```
 
 ### `validate_query_ast(ast: &Value) -> Result<()>`
 
-Validate a query AST before executing it. Rejects unknown operators (`$eqq` → `Err`), malformed combinators (non-array `$and`, empty `$and`), and non-object roots. **Use this at trust boundaries** (HTTP handlers, user input): `query()` itself still silently treats unknown operators as match-everything for backward compatibility, so a typo in an unvalidated AST degrades to a full-DB scan.
+Validate a query AST before executing it. Rejects unknown operators (`$eqq` → `Err`), malformed combinators (non-array `$and`, empty `$and`), and non-object roots. Every key in a field-condition operator object must be a known operator (`$eq $ne $gt $gte $lt $lte $in $nin $exists`) — this makes validation and evaluation agree, with the consequence that implicit `$eq` on nested object values (`{"field": {"a": 1}}`) is not supported. **Use this at trust boundaries** (HTTP handlers, user input): `query()` itself still silently treats unknown operators as match-everything for backward compatibility, so a typo in an unvalidated AST degrades to a full-DB scan.
 
 ### Path resolution (reads)
 

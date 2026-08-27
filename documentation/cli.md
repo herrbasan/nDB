@@ -44,7 +44,11 @@ Long-running HTTP daemon: loads the database once, keeps it in memory, serves qu
 
 ```
 ndb serve <path/to/data.jsonl> [--bind 127.0.0.1|0.0.0.0] [--port 8323] [--token <secret>]
+       [--text-index <field>]... [--threads <n>]
 ```
+
+- `--text-index <field>`: boot a full-text index on the field (cache-aware: `base_dir/_index_<field>.fti` is journal-size-stamped; unchanged journal = instant boot).
+- `--threads <n>`: threads for index (re)builds. `0` (default) = all logical cores.
 
 - The file must already exist (`ndb init` first) — serve fails fast on a missing path.
 - `--token <secret>`: clients must send `Authorization: Bearer <secret>`. Required for LAN binds; 401 otherwise.
@@ -54,8 +58,9 @@ Routes (all JSON unless noted):
 
 | Route | Description |
 |-------|-------------|
-| `POST /query` | `{filter, fields, sort: {field, dir}, limit, offset}` — Layer-3 AST, server-side projection, default limit 1000 |
+| `POST /query` | `{filter, text, fields, sort: {field, dir}, limit, offset}` — Layer-3 AST ∩ optional full-text constraint, server-side projection, default limit 1000. Response `{ok, total, count, results}` — `total` is the pre-pagination match count |
 | `POST /search` | Full-text search — see below |
+| `POST /facets` | `{fields: [...]}` → `{ok, facets: {field: {term: count}}}` — array fields count per element, scalars per value, strings only |
 | `POST /find` | `{field, value}` or `{field, min, max}` |
 | `GET /doc/:id[?fields=a,b]` | Fetch one doc, optional projection |
 | `PUT /doc` | Insert |
@@ -107,6 +112,25 @@ Then query:
 - Response: `{ok, count, total, results: [...]}`.
 - Requires a text index on the field (`POST /index` with `type: "text"`);
   otherwise the request fails loud with `no text index on '<field>'`.
+
+### `POST /query` — `text` parameter
+
+`text` takes the same shape as the `/search` body (`{field, mode, case_sensitive?, queries}`):
+
+```json
+{
+  "filter": {"categories": {"$in": ["A", "B"]}},
+  "text": {"field": "story", "mode": "and", "queries": [{"type": "prefix", "value": "tentacle"}]},
+  "sort": {"field": "date", "dir": "desc"},
+  "limit": 50,
+  "offset": 0
+}
+```
+
+The filter and the text constraint are intersected: a doc must satisfy both.
+`total` is the count of that intersection (pre-pagination). Absent `text` = no
+constraint (zero overhead). `$in` on array fields matches elements
+(`{"categories": {"$in": ["A"]}}` finds docs whose `categories` contains `A`).
 
 ## Exit codes
 
