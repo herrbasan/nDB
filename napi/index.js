@@ -388,11 +388,15 @@ class Database {
   }
 
   /**
-   * Close the database and release its file handles immediately.
+   * Close the database and release its file handles.
    *
    * Safe to call more than once. Any later operation reports "Database closed".
    * Call this before renaming or deleting the database folder on Windows —
    * while a handle is open, the folder cannot be moved.
+   *
+   * Await any pending `query`, `queryWith` or `compact` first: those hold their
+   * own reference to the database, so close() alone will not release the folder
+   * while one is still running.
    */
   close() {
     this._native.close();

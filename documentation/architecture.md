@@ -214,10 +214,16 @@ At the napi boundary an `Err` becomes a **JavaScript exception** — the establi
 So the boundary makes three guarantees, and they are about crash-and-data, not about avoiding exceptions:
 
 - **No process abort.** Panics abort outright and cannot be caught on either side, so caller-supplied shape is validated rather than unwrapped — a non-object document raises a catchable error instead of taking the host down. A poisoned lock is reported for the same reason.
-- **No partial results.** An operation either does the thing or does not. `delete()` writes the restorable copy before anything destructive, so an unrecordable delete is refused rather than reported as success.
+- **A delete is never reported as reversible when it is not.** The restorable copy is written before anything destructive, so an unrecordable delete is refused rather than reported as success. This is delete-specific; see the caveat below.
 - **Cleanup never fails the operation.** Moving files to trash, sweeping buckets, purging trash and flushing at shutdown report failures on stderr (`ndb: suppressed failure: ...`) and leave the primary result intact. `gc_buckets()` returns a count of files that actually moved.
 
 The asymmetry is deliberate: protecting the data that exists outranks every reporting preference.
+
+#### What is not guaranteed yet
+
+**Atomicity across a failed journal write.** The delete path was reordered so that a failed append cannot strand anything, but the write paths were not. `update()`, `set()`, `remove()` and `arrayPush()` relinquish orphaned files and update in-memory indexes *before* appending to the journal (`src/lib.rs`, `handle_ref_delta_and_trash` before the append in `update`). If that append fails the call raises and the previous document version is still stored — but a file the document no longer references may already have moved to trash, leaving a live document pointing at media it cannot read.
+
+This predates the failure-discipline work and is tracked as issue #7. Fixing it means preparing the change, appending to the journal, and only then committing in-memory, index and file-bucket state, with tests that inject append failures. Until that lands, do not read the delete guarantee as a database-wide all-or-nothing promise.
 
 ### Trash Modes
 

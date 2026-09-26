@@ -412,16 +412,23 @@ db.flush();
 
 ### `close() → void`
 
-Close the database and release its file handles immediately. Safe to call more than once; any later operation reports `Database closed`.
+Close the database and release its file handles. Safe to call more than once; any later operation reports `Database closed`.
 
-Call this before renaming or deleting the database folder on Windows — while a handle is open, the folder cannot be moved. `Database.open(path, options)` opens exactly one handle, so `close()` releases it deterministically.
+Call this before renaming or deleting the database folder on Windows — while a handle is open, the folder cannot be moved.
+
+**Finish pending async work first.** `query`, `queryWith` and `compact` hold their own reference to the database while they run, so `close()` on its own does not release the folder if one is still in flight. Await them, then close, then move:
 
 ```js
 const db = Database.open('./data/app/data.jsonl');
+const pending = db.query({ status: { $eq: 'active' } });
 // … work …
+await pending;            // required, or the rename below fails with EPERM
+const rows = await pending;
 db.close();
 fs.renameSync('./data/app', './data/app-archived');
 ```
+
+`Database.open(path, options)` opens exactly one handle, so beyond in-flight operations there is no second handle to wait on.
 
 ---
 
@@ -520,8 +527,10 @@ Common errors:
 - `Delete failed: I/O error at {path}: ...` — the deletion could not be recorded; nothing was deleted
 - `Failed to open database: ...` — Constructor failure
 
-Two guarantees hold behind those errors:
+Three guarantees hold behind those errors:
 
-- **No partial results.** An operation either does the thing or does not. A delete that cannot preserve its restorable copy is refused, so you are never told a document is gone when it is not.
 - **No process abort.** Caller-supplied shape is validated rather than unwrapped, so bad input raises a catchable error instead of killing the process.
+- **A delete is never reported as reversible when it is not.** The restorable copy is written before anything destructive, so a delete that cannot record it is refused rather than reported as success.
 - **Cleanup never fails the operation.** Moving files to trash, sweeping buckets and purging trash report failures on stderr (`ndb: suppressed failure: ...`) and leave the primary result intact.
+
+**Not yet guaranteed: atomicity across a failed journal write.** `update()`, `set()`, `remove()` and `arrayPush()` retire orphaned files and update in-memory indexes before appending to the journal. If that append fails, the call throws and the previous document version is still stored — but a file it no longer references may already have moved to trash, leaving a live document with a reference it can no longer read. Tracked as issue #7, and not a behaviour introduced by the delete or lifecycle fixes.

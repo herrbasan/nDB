@@ -13,12 +13,15 @@ const path = require('path');
 const fs = require('fs');
 const { Database } = require(path.join(__dirname, '..', 'index.js'));
 
+// Real JSON values, not pre-stringified ones: the wrapper calls
+// JSON.stringify(doc) itself, so passing `JSON.stringify(null)` would test the
+// string "null" and never the null branch.
 const NON_OBJECTS = [
   'this is not a document',
-  JSON.stringify(null),
-  JSON.stringify(7),
-  JSON.stringify([1, 2, 3]),
-  JSON.stringify(true),
+  null,
+  7,
+  [1, 2, 3],
+  true,
 ];
 
 let failed = 0;
@@ -49,7 +52,7 @@ for (const bad of NON_OBJECTS) {
   }
   check(
     message !== null && /JSON object/.test(message),
-    `non-object rejected: ${bad}`,
+    `non-object rejected: ${JSON.stringify(bad)}`,
     message === null ? 'no error thrown' : message
   );
 }
@@ -61,7 +64,7 @@ check(db.len() === 2, 'only the two valid documents were stored', `len=${db.len(
 // update() and insertWithPrefix() take a serialized document too.
 let updateRejected = false;
 try {
-  db.update(db.iter()[0]._id, JSON.stringify(5));
+  db.update(db.iter()[0]._id, 5);
 } catch (e) {
   updateRejected = /JSON object/.test(e.message);
 }
@@ -69,19 +72,21 @@ check(updateRejected, 'update() rejects a non-object document');
 
 let prefixRejected = false;
 try {
-  db.insertWithPrefix('conv', JSON.stringify('nope'));
+  db.insertWithPrefix('conv', 'nope');
 } catch (e) {
   prefixRejected = /JSON object/.test(e.message);
 }
 check(prefixRejected, 'insertWithPrefix() rejects a non-object document');
 
-// The guard is about documents only: set/arrayPush take arbitrary JSON.
+// The guard is about documents only: set/arrayPush take arbitrary JSON, and the
+// values here must be real types for that to mean anything.
 const id = db.insert({ v: 1 });
 for (const [label, value] of [
-  ['scalar', '3.5'],
-  ['null', 'null'],
-  ['boolean', 'false'],
-  ['array', '[1,2]'],
+  ['scalar', 3.5],
+  ['null', null],
+  ['boolean', false],
+  ['array', [1, 2]],
+  ['object', { k: 'v' }],
 ]) {
   let ok = true;
   try {
@@ -91,6 +96,13 @@ for (const [label, value] of [
   }
   check(ok, `set() still accepts a ${label} value`);
 }
+
+// And the stored values are what was sent, not stringified copies.
+const stored = db.get(id);
+check(stored.f_scalar === 3.5, 'scalar stored as a number', typeof stored.f_scalar);
+check(stored.f_null === null, 'null stored as null', String(stored.f_null));
+check(stored.f_boolean === false, 'boolean stored as a boolean', typeof stored.f_boolean);
+check(Array.isArray(stored.f_array), 'array stored as an array', typeof stored.f_array);
 
 if (typeof db.close === 'function') db.close();
 fs.rmSync(dir, { recursive: true, force: true });

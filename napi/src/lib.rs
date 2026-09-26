@@ -226,8 +226,14 @@ impl Database {
         })
     }
 
-    /// Close the database and instantly release any holds (OS locks, memory).
+    /// Close the database and release its holds (OS locks, memory).
     /// Safe to call multiple times. Subsequent operations will throw "Database closed".
+    ///
+    /// A running async task (`query`, `queryWith`, `compact`) holds its own
+    /// reference to the database, so this does not necessarily release the file
+    /// handle — and on Windows the folder stays locked — until that task has
+    /// finished. Callers must await pending work before expecting the folder to
+    /// be moveable.
     #[napi]
     pub fn close(&self) -> Result<()> {
         let mut guard = self

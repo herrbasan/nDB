@@ -33,20 +33,36 @@ function assertEqual(actual, expected, message) {
   }
 }
 
+// Tests are registered, then run in order by run(). Awaiting each callback is
+// the point: a test returning a promise used to be counted as passed the moment
+// it was called, so its rejection surfaced later — after process.exit had
+// already reported success.
+const plan = [];
+
 function test(name, fn) {
-  try {
-    fn();
-    passed++;
-    console.log(`  ✓ ${name}`);
-  } catch (e) {
-    failed++;
-    errors.push({ name, error: e.message });
-    console.log(`  ✗ ${name}: ${e.message}`);
-  }
+  plan.push({ kind: 'test', name, fn });
 }
 
 function section(title) {
-  console.log(`\n── ${title} ${'─'.repeat(Math.max(0, 60 - title.length))}`);
+  plan.push({ kind: 'section', title });
+}
+
+async function run() {
+  for (const item of plan) {
+    if (item.kind === 'section') {
+      console.log(`\n── ${item.title} ${'─'.repeat(Math.max(0, 60 - item.title.length))}`);
+      continue;
+    }
+    try {
+      await item.fn();
+      passed++;
+      console.log(`  ✓ ${item.name}`);
+    } catch (e) {
+      failed++;
+      errors.push({ name: item.name, error: e.message });
+      console.log(`  ✗ ${item.name}: ${e.message}`);
+    }
+  }
 }
 
 function createTempDir() {
@@ -483,13 +499,13 @@ test('compact removes deleted docs from file', async () => {
   const dir = createTempDir();
   const path = join(dir, 'compact.jsonl');
 
-  const id = (() => {
+  const id = await (async () => {
     const db = new Database(path);
     const id = db.insert({ keep: true });
     const delId = db.insert({ delete: true });
     db.delete(delId);
     db.flush();
-    db.compact();
+    await db.compact();
     return id;
   })();
 
@@ -568,11 +584,11 @@ test('deleteFile removes file', async () => {
   const db = new Database(path);
 
   const meta = db.storeFile('temp', 'del.txt', Buffer.from('delete me'), 'text/plain');
-  db.deleteFile('temp', meta.id, meta.ext);
+  db.deleteFile('temp', meta._file.id, meta._file.ext);
 
   let threw = false;
   try {
-    db.getFile('temp', meta.id, meta.ext);
+    db.getFile('temp', meta._file.id, meta._file.ext);
   } catch (e) {
     threw = true;
   }
@@ -630,7 +646,7 @@ test('full lifecycle: insert, query, update, delete, compact', async () => {
   assertEqual(db.len(), 8, 'Should have 8 after 2 deletes');
 
   // Compact
-  db.compact();
+  await db.compact();
 
   // Reopen and verify
   db.flush();
@@ -834,7 +850,7 @@ test('stress: set array elements then compact', async () => {
   const dir = createTempDir();
   const path = join(dir, 'stress_compact.jsonl');
 
-  const id = (() => {
+  const id = await (async () => {
     const db = new Database(path);
     const id = db.insert({ items: [] });
     for (let i = 0; i < 100; i++) {
@@ -846,7 +862,7 @@ test('stress: set array elements then compact', async () => {
     for (let i = 0; i < 50; i++) {
       db.set(id, `items.${i}.v`, i * 100);
     }
-    db.compact();
+    await db.compact();
     return id;
   })();
 
@@ -947,7 +963,31 @@ test('open with options does not leave a second handle behind', async () => {
   rmSync(moved, { recursive: true, force: true });
 });
 
+test('pending work should be awaited before close releases the folder', async () => {
+  // A running async task holds its own reference to the database, so close()
+  // alone does not release the folder while one is in flight. Finishing pending
+  // work first is the supported sequence; this pins it.
+  const dir = createTempDir();
+  const db = Database.open(join(dir, 'drain.jsonl'));
+  db.insert({ v: 1 });
+  db.insert({ v: 2 });
+
+  const pending = db.query({ v: { $gte: 1 } });
+  db.close();
+
+  const rows = await pending;
+  assertEqual(rows.length, 2, 'in-flight query should still complete after close');
+
+  const moved = `${dir}-moved`;
+  renameSync(dir, moved);
+  assert(existsSync(moved), 'folder should be renameable once pending work is drained');
+
+  rmSync(moved, { recursive: true, force: true });
+});
+
 // ─── Results ─────────────────────────────────────────────────────────
+
+await run();
 
 console.log(`\n${'='.repeat(70)}`);
 console.log(`Results: ${passed} passed, ${failed} failed, ${passed + failed} total`);

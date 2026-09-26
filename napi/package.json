@@ -7,7 +7,7 @@
   "scripts": {
     "setup": "node setup.js",
     "build": "cargo build --release -p ndb-node",
-    "test": "node test/test-napi.js && node test/test-insert-shape.cjs"
+    "test": "node test/test-napi.js && node test/test-insert-shape.cjs && node test/test-harness.cjs"
   },
   "files": [
     "index.js",
