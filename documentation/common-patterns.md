@@ -72,8 +72,6 @@ The same "find by marker on startup, cache the ID" approach generalizes to any w
 - `len()` / `isEmpty()` / `contains()` count only active documents.
 - `deletedIds()` lists their IDs.
 
-`delete()` is the one method that **reports instead of throwing**: it returns `{ ok, code, message }`, so deleting something that is already gone is an ordinary result (`code: 'not_found'`) rather than an exception. See `nodejs-api.md` → Error Handling.
-
 The deleted document is preserved (with a `_deleted` timestamp) in the persistent trash file (`_trash/docs/data.jsonl`) until compaction or TTL purging, and can be brought back with `restore(id)`.
 
 **If you read the JSONL file directly** (e.g. with `fs.readFileSync`), you *will* see records of the form:

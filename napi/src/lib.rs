@@ -322,34 +322,18 @@ impl Database {
 
     /// Delete a document by ID (soft delete / tombstone).
     ///
-    /// Reports instead of throwing. An outcome the caller can act on is a
-    /// *result*, not an exception — and an exception nobody catches stops the
-    /// whole process, which is far too much to spend on "it was already gone".
-    ///
-    /// - `{ ok: true }` — deleted, and the copy that makes it restorable is on disk.
-    /// - `{ ok: false, code: 'not_found' }` — there was nothing to delete.
-    /// - `{ ok: false, code: 'io' }` — the deletion could not be recorded; the
-    ///   document is untouched and the call may be retried.
-    /// - `{ ok: false, code: 'closed' }` — the database was closed.
+    /// Reports through the ordinary error contract: throws when there is no such
+    /// document, and when the deletion could not be recorded. An unrecorded
+    /// delete is refused rather than reported as success, because the copy in
+    /// the trash is what makes the deletion reversible.
     ///
     /// ```js
-    /// const r = db.delete('V1StGXR8Z5jdHi6B');
-    /// if (!r.ok) console.warn(`delete skipped: ${r.code} ${r.message}`);
+    /// db.delete('V1StGXR8Z5jdHi6B');
     /// ```
     #[napi]
-    pub fn delete(&self, id: String) -> OpResult {
-        let db = match self.inner() {
-            Ok(db) => db,
-            Err(e) => return OpResult::failed("closed", e.to_string()),
-        };
-        match db.delete(&id) {
-            Ok(()) => OpResult::succeeded(),
-            Err(ndb::Error::NotFound { .. }) => {
-                OpResult::failed("not_found", format!("no document with id {id}"))
-            }
-            Err(e @ ndb::Error::Io { .. }) => OpResult::failed("io", e.to_string()),
-            Err(e) => OpResult::failed("error", e.to_string()),
-        }
+    pub fn delete(&self, id: String) -> Result<()> {
+        self.inner()?.delete(&id)
+            .map_err(|e| Error::from_reason(format!("Delete failed: {}", e)))
     }
 
     // ─── Iteration & Counting ──────────────────────────────────────
@@ -675,38 +659,5 @@ pub struct DatabaseOptions {
     pub trash_ttl: Option<u32>,
     /// Background interval in seconds to check for expired trash. Default: 3600 (1 hour).
     pub trash_purge_interval: Option<u32>,
-}
-
-/// Outcome of an operation whose failure is a normal, actionable result rather
-/// than a bug — returned as a value so the caller can report it without risking
-/// an unhandled exception that stops the process.
-///
-/// `code` is stable and machine-readable: `not_found`, `io`, `closed`, `error`.
-#[napi(object)]
-pub struct OpResult {
-    /// True when the operation did what was asked.
-    pub ok: bool,
-    /// Machine-readable reason when `ok` is false.
-    pub code: Option<String>,
-    /// Human-readable detail, for logs.
-    pub message: Option<String>,
-}
-
-impl OpResult {
-    fn succeeded() -> Self {
-        OpResult {
-            ok: true,
-            code: None,
-            message: None,
-        }
-    }
-
-    fn failed(code: &str, message: String) -> Self {
-        OpResult {
-            ok: false,
-            code: Some(code.to_string()),
-            message: Some(message),
-        }
-    }
 }
 

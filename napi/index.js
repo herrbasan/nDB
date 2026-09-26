@@ -128,11 +128,13 @@ class Database {
    * @returns {Database}
    */
   static open(path, options) {
-    const db = new Database(path);
-    // If options provided, reopen with options via native open
-    if (options) {
-      db._native = nativeBinding.Database.open(path, options);
-    }
+    // Never build a throwaway binding: `new Database(path)` would open a second
+    // handle that only the GC releases, and on Windows that handle keeps the
+    // folder locked even after close().
+    const db = Object.create(Database.prototype);
+    db._native = options
+      ? nativeBinding.Database.open(path, options)
+      : new nativeBinding.Database(path);
     return db;
   }
 
@@ -187,14 +189,13 @@ class Database {
   /**
    * Delete a document by ID (soft delete).
    *
-   * Reports instead of throwing: an already-deleted or missing document is a
-   * result, not an error. Inspect the returned object.
+   * Throws when there is no such document, and when the deletion could not be
+   * recorded — an unrecorded delete is refused, because the trash copy is what
+   * makes it reversible.
    * @param {string} id - Document ID.
-   * @returns {{ok: boolean, code?: string, message?: string}} `code` is one of
-   *   `not_found`, `io`, `closed`, `error` when `ok` is false.
    */
   delete(id) {
-    return this._native.delete(id);
+    this._native.delete(id);
   }
 
   /**
@@ -384,6 +385,17 @@ class Database {
    */
   flush() {
     this._native.flush();
+  }
+
+  /**
+   * Close the database and release its file handles immediately.
+   *
+   * Safe to call more than once. Any later operation reports "Database closed".
+   * Call this before renaming or deleting the database folder on Windows —
+   * while a handle is open, the folder cannot be moved.
+   */
+  close() {
+    this._native.close();
   }
 
   /**

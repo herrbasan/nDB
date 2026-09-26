@@ -9,7 +9,7 @@
  */
 
 const { Database } = require('../index.js');
-const { existsSync, mkdirSync, rmSync } = require('fs');
+const { existsSync, mkdirSync, renameSync, rmSync } = require('fs');
 const { join } = require('path');
 const os = require('os');
 
@@ -138,8 +138,7 @@ test('delete soft-deletes document', async () => {
   const db = Database.openInMemory();
   const id = db.insert({ x: 1 });
   assertEqual(db.len(), 1, 'Should have 1 doc');
-  const result = db.delete(id);
-  assertEqual(result.ok, true, 'delete should report ok');
+  db.delete(id);
   assertEqual(db.len(), 0, 'Should have 0 docs after delete');
   let threw = false;
   try {
@@ -150,16 +149,15 @@ test('delete soft-deletes document', async () => {
   assert(threw, 'Should throw when getting deleted doc');
 });
 
-test('delete reports a nonexistent ID instead of throwing', async () => {
+test('delete throws for nonexistent ID', async () => {
   const db = Database.openInMemory();
-  const result = db.delete('nonexistent');
-  assertEqual(result.ok, false, 'delete of a missing id should not report ok');
-  assertEqual(result.code, 'not_found', 'Should report code not_found');
-  assert(typeof result.message === 'string', 'Should carry a message');
-
-  // Reporting, not raising: the call must not have thrown, and the database
-  // is still usable.
-  assertEqual(db.insert({ still: 'usable' }).length > 0, true, 'db still usable');
+  let threw = false;
+  try {
+    db.delete('nonexistent');
+  } catch (e) {
+    threw = true;
+  }
+  assert(threw, 'Should throw for nonexistent ID');
 });
 
 test('iter returns all documents', async () => {
@@ -882,6 +880,71 @@ test('full update overwrites prior set patches', async () => {
   assertEqual(doc.z, 42, 'z should be 42');
 
   rmSync(dir, { recursive: true, force: true });
+});
+
+// ─── Phase 10: Lifecycle (close) ────────────────────────────────────
+
+test('close is exposed on the public wrapper', async () => {
+  const db = Database.openInMemory();
+  assert(typeof db.close === 'function', 'Wrapper should expose close()');
+  db.close();
+});
+
+test('close is idempotent and later operations report it', async () => {
+  const db = Database.openInMemory();
+  const id = db.insert({ v: 1 });
+
+  db.close();
+  db.close(); // a second call must not throw
+
+  let message = null;
+  try {
+    db.get(id);
+  } catch (e) {
+    message = e.message;
+  }
+  assert(message !== null, 'get after close should throw');
+  assert(/closed/i.test(message), `expected a "closed" error, got: ${message}`);
+
+  let insertMessage = null;
+  try {
+    db.insert({ v: 2 });
+  } catch (e) {
+    insertMessage = e.message;
+  }
+  assert(/closed/i.test(insertMessage), 'insert after close should report closed');
+});
+
+test('close releases the folder so it can be renamed', async () => {
+  // A live file handle keeps the folder locked on Windows, which is the whole
+  // point of the operation.
+  const dir = createTempDir();
+  const db = Database.open(join(dir, 'lifecycle.jsonl'));
+  db.insert({ v: 1 });
+
+  db.close();
+
+  const moved = `${dir}-moved`;
+  renameSync(dir, moved);
+  assert(existsSync(moved), 'folder should be renameable once the db is closed');
+
+  rmSync(moved, { recursive: true, force: true });
+});
+
+test('open with options does not leave a second handle behind', async () => {
+  // open(path, options) used to construct a throwaway binding first, which only
+  // the GC released — so close() left the folder locked anyway.
+  const dir = createTempDir();
+  const db = Database.open(join(dir, 'options.jsonl'), { persistence: 'immediate' });
+  db.insert({ v: 1 });
+
+  db.close();
+
+  const moved = `${dir}-moved`;
+  renameSync(dir, moved);
+  assert(existsSync(moved), 'folder should be renameable when opened with options');
+
+  rmSync(moved, { recursive: true, force: true });
 });
 
 // ─── Results ─────────────────────────────────────────────────────────

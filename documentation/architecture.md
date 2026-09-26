@@ -205,15 +205,19 @@ Two kinds of failure, two contracts:
 
 Nothing is swallowed. There is no bare `let _ =` on a `Result` anywhere in the library; the sink and its rationale live in `src/report.rs`.
 
-### Reporting at the JS boundary
+### Reliability at the JS boundary
 
-In Rust a `Result` is a returned value: it cannot crash anything, and the caller cannot proceed past it without looking at it. That is the right shape for the library and it stays.
+In Rust a `Result` is a returned value: it cannot crash anything, and the caller cannot proceed past it without looking at it. That stays the library's contract.
 
-At the napi boundary an `Err` becomes a **JavaScript exception**, and an exception nobody catches stops the process — far too much to spend on "it was already gone". So an operation whose failure is an ordinary, actionable outcome returns a result object instead: `delete(id)` gives `{ ok, code?, message? }` with `code` one of `not_found`, `io`, `closed`, `error`, and never throws. A caller can report it, branch on it, or ignore it, and either way the process lives.
+At the napi boundary an `Err` becomes a **JavaScript exception** — the established contract, and a fine one: a caught exception lets an application report a failed operation and carry on. What it does *not* tolerate is a failure that cannot be caught at all.
 
-`delete` is currently the method with that contract; the rest still throw. Reaching the whole surface is a deliberate, consumer-visible change, not a mechanical one.
+So the boundary makes three guarantees, and they are about crash-and-data, not about avoiding exceptions:
 
-Also note that a panic (as opposed to an `Err`) aborts the process outright and cannot be caught on either side — which is why caller-supplied shape is checked rather than unwrapped.
+- **No process abort.** Panics abort outright and cannot be caught on either side, so caller-supplied shape is validated rather than unwrapped — a non-object document raises a catchable error instead of taking the host down. A poisoned lock is reported for the same reason.
+- **No partial results.** An operation either does the thing or does not. `delete()` writes the restorable copy before anything destructive, so an unrecordable delete is refused rather than reported as success.
+- **Cleanup never fails the operation.** Moving files to trash, sweeping buckets, purging trash and flushing at shutdown report failures on stderr (`ndb: suppressed failure: ...`) and leave the primary result intact. `gc_buckets()` returns a count of files that actually moved.
+
+The asymmetry is deliberate: protecting the data that exists outranks every reporting preference.
 
 ### Trash Modes
 

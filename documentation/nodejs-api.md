@@ -193,24 +193,17 @@ db.remove(id, 'settings.volume');
 // Remove array element (shifts remaining)
 db.remove(id, 'messages.2');
 ```
-### `delete(id) → { ok, code?, message? }`
+### `delete(id) → void`
 
-Soft delete a document (tombstone). **Reports instead of throwing** — a document that is already gone is an ordinary result, not an error.
+Soft delete a document (tombstone).
+
+Throws if the ID does not exist — and also if the deletion could **not be recorded**. The copy that makes a deletion reversible is written first, so an unrecordable delete is refused rather than reported as success: the document is left untouched and the call may be retried.
+
+The document's orphaned files are a separate matter. A file that cannot be moved to trash is reported on stderr and swept by `gcBuckets()` later; the document is gone either way, so this never fails the delete.
 
 ```js
-const r = db.delete(id);
-if (r.ok) {
-    // Deleted, and the copy that makes it restorable is on disk.
-} else if (r.code === 'not_found') {
-    // There was nothing to delete. Not a failure.
-} else {
-    console.warn(`delete failed: ${r.code} ${r.message}`);
-    // 'io'     — the deletion could not be recorded; the document is untouched, retry.
-    // 'closed' — the database was closed.
-}
+db.delete(id);
 ```
-
-`ok: true` means the document was deleted **and** the restorable copy was recorded. It does not mean the document's orphaned files were moved to trash: a file that cannot be moved is reported on stderr and swept by `gcBuckets()` later, because the document is gone either way.
 
 ### `contains(id) → boolean`
 
@@ -417,6 +410,19 @@ Explicitly flush pending writes to disk (fsync).
 db.flush();
 ```
 
+### `close() → void`
+
+Close the database and release its file handles immediately. Safe to call more than once; any later operation reports `Database closed`.
+
+Call this before renaming or deleting the database folder on Windows — while a handle is open, the folder cannot be moved. `Database.open(path, options)` opens exactly one handle, so `close()` releases it deterministically.
+
+```js
+const db = Database.open('./data/app/data.jsonl');
+// … work …
+db.close();
+fs.renameSync('./data/app', './data/app-archived');
+```
+
 ---
 
 ## File Buckets
@@ -496,9 +502,7 @@ console.log(`Garbage collection trashed ${trashedCount} files.`);
 
 ## Error Handling
 
-An operation that can fail for an ordinary, actionable reason **reports** it as a return value instead of throwing. `delete(id)` is currently the method with that contract — it returns `{ ok, code?, message? }` and never throws for `not_found`, `io` or `closed`.
-
-Everything else throws, so wrap those calls:
+All methods throw on error. Use try/catch:
 
 ```js
 try {
@@ -513,4 +517,11 @@ Common errors:
 - `not found: {id}` — Document doesn't exist
 - `index error for field '{field}': index not found` — Tried to drop a nonexistent index
 - `I/O error at {path}: ...` — File system error
+- `Delete failed: I/O error at {path}: ...` — the deletion could not be recorded; nothing was deleted
 - `Failed to open database: ...` — Constructor failure
+
+Two guarantees hold behind those errors:
+
+- **No partial results.** An operation either does the thing or does not. A delete that cannot preserve its restorable copy is refused, so you are never told a document is gone when it is not.
+- **No process abort.** Caller-supplied shape is validated rather than unwrapped, so bad input raises a catchable error instead of killing the process.
+- **Cleanup never fails the operation.** Moving files to trash, sweeping buckets and purging trash report failures on stderr (`ndb: suppressed failure: ...`) and leave the primary result intact.
