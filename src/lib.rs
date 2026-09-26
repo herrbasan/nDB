@@ -1386,11 +1386,41 @@ impl Database {
             storage::append_doc_trash(&self.trash_doc_path(), &trash_doc)?;
         }
 
-        // Committed. Now retire the ref counts and move the orphans aside.
-        // A file that fails to move stays where it is and is named: leaving it
-        // behind is recoverable (the GC sweeps it later, and the document is
-        // honestly gone), whereas a silent failure would hide a stranded file
-        // for the lifetime of the database.
+        // The deletion commit, ordered *before* any destructive file move so
+        // that every prefix of this operation leaves a state that is at worst
+        // under-cleaned: a document whose files are still sitting in the active
+        // bucket is swept up later by gc_buckets, whereas a document that is
+        // still live while its files have already moved to trash is a dangling
+        // reference. Reaching here means the restorable copy is already on
+        // disk, so a failure now cannot strand an un-restorable delete.
+        if !self.is_in_memory() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let tombstone = serde_json::json!({
+                "_id": id,
+                "_deleted": now
+            });
+            let line = serde_json::to_string(&tombstone)?;
+            let mut handle = self.get_file_handle()?;
+            if let Some(ref mut file) = *handle {
+                match self.persistence {
+                    Persistence::Immediate => {
+                        storage::append_line_sync(file, &self.path, &line)?;
+                    }
+                    _ => {
+                        storage::append_line(file, &self.path, &line)?;
+                    }
+                }
+            }
+        }
+
+        // Now retire the ref counts and move the orphans aside. A file that
+        // fails to move stays where it is and is named: leaving it behind is
+        // recoverable (the GC sweeps it later, and the document is honestly
+        // gone), whereas a silent failure would hide a stranded file for the
+        // lifetime of the database.
         {
             let mut file_refs = self.file_refs.write();
             for r in &extracted_file_refs {
@@ -1431,30 +1461,6 @@ impl Database {
             let mut text_indexes = self.text_indexes.write();
             for (_, tindex) in text_indexes.iter_mut() {
                 tindex.remove_doc(id);
-            }
-        }
-
-        // Write tombstone to file
-        if !self.is_in_memory() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let tombstone = serde_json::json!({
-                "_id": id,
-                "_deleted": now
-            });
-            let line = serde_json::to_string(&tombstone)?;
-            let mut handle = self.get_file_handle()?;
-            if let Some(ref mut file) = *handle {
-                match self.persistence {
-                    Persistence::Immediate => {
-                        storage::append_line_sync(file, &self.path, &line)?;
-                    }
-                    _ => {
-                        storage::append_line(file, &self.path, &line)?;
-                    }
-                }
             }
         }
 
