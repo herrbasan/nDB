@@ -96,7 +96,15 @@ pub struct Database {
 
 impl Database {
     fn inner(&self) -> Result<Arc<RustDatabase>> {
-        self.inner.read().unwrap().clone().ok_or_else(|| Error::from_reason("Database closed"))
+        // A poisoned lock must surface as a JS error, never abort the host
+        // process — the same guarantee `insert` gives for a bad document.
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| Error::from_reason("Database lock poisoned"))?;
+        guard
+            .clone()
+            .ok_or_else(|| Error::from_reason("Database closed"))
     }
 }
 
@@ -222,7 +230,11 @@ impl Database {
     /// Safe to call multiple times. Subsequent operations will throw "Database closed".
     #[napi]
     pub fn close(&self) -> Result<()> {
-        *self.inner.write().unwrap() = None;
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| Error::from_reason("Database lock poisoned"))?;
+        *guard = None;
         Ok(())
     }
 
