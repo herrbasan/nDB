@@ -186,10 +186,15 @@ class Database {
 
   /**
    * Delete a document by ID (soft delete).
+   *
+   * Reports instead of throwing: an already-deleted or missing document is a
+   * result, not an error. Inspect the returned object.
    * @param {string} id - Document ID.
+   * @returns {{ok: boolean, code?: string, message?: string}} `code` is one of
+   *   `not_found`, `io`, `closed`, `error` when `ok` is false.
    */
   delete(id) {
-    this._native.delete(id);
+    return this._native.delete(id);
   }
 
   /**

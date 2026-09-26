@@ -121,7 +121,7 @@ let trashed = db.gc_buckets()?;
 println!("GC collected {} orphaned files.", trashed);
 ```
 
-The returned count is files that actually moved. A bucket that cannot be enumerated fails the call rather than being skipped in silence, and a file that cannot be moved is reported on stderr (`ndb: suppressed failure: ...`) and left out of the count — so calling this a successful sweep of *n* files is always true of *n* files.
+The returned count is files that actually moved. A bucket that cannot be enumerated, and a file that cannot be moved, are reported on stderr (`ndb: suppressed failure: ...`) and left out of the count — so calling this a successful sweep of *n* files is always true of *n* files. Nothing here throws: a sweep you asked for reports how far it got.
 
 ### `purge_trash_ttl(ttl: Duration) -> Result<()>`
 

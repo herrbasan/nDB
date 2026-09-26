@@ -1810,22 +1810,37 @@ impl Database {
         // Purge File Trash in all buckets using Folder-Led Purging
         let trash_files_dir = self.base_dir.join("_trash").join("files");
         if trash_files_dir.exists() {
-            // A caller asked for a purge and gets a count back, so structural
-            // failures fail loud; only per-bucket failures leave the count
-            // short, and each of those is named.
-            let entries = std::fs::read_dir(&trash_files_dir)
-                .map_err(Error::io_err(&trash_files_dir, "list bucket trash dir"))?;
-            for entry in entries {
-                let entry = entry.map_err(Error::io_err(&trash_files_dir, "read trash entry"))?;
-                let file_type = entry
-                    .file_type()
-                    .map_err(Error::io_err(entry.path(), "stat trash entry"))?;
-                if file_type.is_dir() {
-                    let bucket = self.bucket(&entry.file_name().to_string_lossy());
-                    if let Err(e) = bucket.purge_trash_ttl(ttl) {
-                        report::suppressed("purge_trash: purge bucket trash", e);
+            // Nothing here raises: every failure is named and skipped, and the
+            // count the caller gets back covers only what was really removed.
+            match std::fs::read_dir(&trash_files_dir) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry = match entry {
+                            Ok(entry) => entry,
+                            Err(e) => {
+                                report::suppressed("purge_trash: read bucket trash entry", e);
+                                continue;
+                            }
+                        };
+                        let file_type = match entry.file_type() {
+                            Ok(file_type) => file_type,
+                            Err(e) => {
+                                report::suppressed("purge_trash: stat bucket trash entry", e);
+                                continue;
+                            }
+                        };
+                        if file_type.is_dir() {
+                            let bucket = self.bucket(&entry.file_name().to_string_lossy());
+                            if let Err(e) = bucket.purge_trash_ttl(ttl) {
+                                report::suppressed("purge_trash: purge bucket trash", e);
+                            }
+                        }
                     }
                 }
+                Err(e) => report::suppressed(
+                    "purge_trash: list bucket trash directory",
+                    format!("{}: {e}", trash_files_dir.display()),
+                ),
             }
         }
 
@@ -2077,9 +2092,16 @@ impl Database {
                     let bucket_name = entry.file_name().to_string_lossy().to_string();
                     let bkt = self.bucket(&bucket_name);
 
-                    // A bucket we cannot enumerate is a bucket this sweep
-                    // silently did not cover — the point of the call fails loud.
-                    let files = bkt.list()?;
+                    // A bucket we cannot enumerate is named and skipped rather
+                    // than raised: the caller asked for a sweep, and the count
+                    // below still covers only files that really moved.
+                    let files = match bkt.list() {
+                        Ok(files) => files,
+                        Err(e) => {
+                            report::suppressed("gc_buckets: list bucket files", e);
+                            continue;
+                        }
+                    };
                     for filename in files {
                         let ref_str = format!("{}:{}", bucket_name, filename);
                         if !active_refs.contains(&ref_str) {

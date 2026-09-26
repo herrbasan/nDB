@@ -193,13 +193,24 @@ db.remove(id, 'settings.volume');
 // Remove array element (shifts remaining)
 db.remove(id, 'messages.2');
 ```
-### `delete(id) → void`
+### `delete(id) → { ok, code?, message? }`
 
-Soft delete a document (tombstone).
+Soft delete a document (tombstone). **Reports instead of throwing** — a document that is already gone is an ordinary result, not an error.
 
 ```js
-db.delete(id);
+const r = db.delete(id);
+if (r.ok) {
+    // Deleted, and the copy that makes it restorable is on disk.
+} else if (r.code === 'not_found') {
+    // There was nothing to delete. Not a failure.
+} else {
+    console.warn(`delete failed: ${r.code} ${r.message}`);
+    // 'io'     — the deletion could not be recorded; the document is untouched, retry.
+    // 'closed' — the database was closed.
+}
 ```
+
+`ok: true` means the document was deleted **and** the restorable copy was recorded. It does not mean the document's orphaned files were moved to trash: a file that cannot be moved is reported on stderr and swept by `gcBuckets()` later, because the document is gone either way.
 
 ### `contains(id) → boolean`
 
@@ -474,7 +485,7 @@ files.forEach(f => console.log(f));
 
 Perform garabage collection on all file buckets. Iterates over all files stored in `_files/` and moves any unreferenced file into `_trash/files/`. Returns the number of files successfully trashed.
 
-The count covers only files that actually moved, and a bucket that cannot be enumerated throws rather than being skipped silently.
+The count covers only files that actually moved. A bucket that cannot be enumerated is reported on stderr and skipped rather than throwing, so the number you get back never includes work that did not happen.
 
 ```js
 const trashedCount = db.gcBuckets();
@@ -485,7 +496,9 @@ console.log(`Garbage collection trashed ${trashedCount} files.`);
 
 ## Error Handling
 
-All methods throw on error. Use try/catch:
+An operation that can fail for an ordinary, actionable reason **reports** it as a return value instead of throwing. `delete(id)` is currently the method with that contract — it returns `{ ok, code?, message? }` and never throws for `not_found`, `io` or `closed`.
+
+Everything else throws, so wrap those calls:
 
 ```js
 try {

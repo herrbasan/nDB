@@ -205,6 +205,16 @@ Two kinds of failure, two contracts:
 
 Nothing is swallowed. There is no bare `let _ =` on a `Result` anywhere in the library; the sink and its rationale live in `src/report.rs`.
 
+### Reporting at the JS boundary
+
+In Rust a `Result` is a returned value: it cannot crash anything, and the caller cannot proceed past it without looking at it. That is the right shape for the library and it stays.
+
+At the napi boundary an `Err` becomes a **JavaScript exception**, and an exception nobody catches stops the process — far too much to spend on "it was already gone". So an operation whose failure is an ordinary, actionable outcome returns a result object instead: `delete(id)` gives `{ ok, code?, message? }` with `code` one of `not_found`, `io`, `closed`, `error`, and never throws. A caller can report it, branch on it, or ignore it, and either way the process lives.
+
+`delete` is currently the method with that contract; the rest still throw. Reaching the whole surface is a deliberate, consumer-visible change, not a mechanical one.
+
+Also note that a panic (as opposed to an `Err`) aborts the process outright and cannot be caught on either side — which is why caller-supplied shape is checked rather than unwrapped.
+
 ### Trash Modes
 
 | Mode | Behavior |

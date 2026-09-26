@@ -138,7 +138,8 @@ test('delete soft-deletes document', async () => {
   const db = Database.openInMemory();
   const id = db.insert({ x: 1 });
   assertEqual(db.len(), 1, 'Should have 1 doc');
-  db.delete(id);
+  const result = db.delete(id);
+  assertEqual(result.ok, true, 'delete should report ok');
   assertEqual(db.len(), 0, 'Should have 0 docs after delete');
   let threw = false;
   try {
@@ -149,15 +150,16 @@ test('delete soft-deletes document', async () => {
   assert(threw, 'Should throw when getting deleted doc');
 });
 
-test('delete throws for nonexistent ID', async () => {
+test('delete reports a nonexistent ID instead of throwing', async () => {
   const db = Database.openInMemory();
-  let threw = false;
-  try {
-    db.delete('nonexistent');
-  } catch (e) {
-    threw = true;
-  }
-  assert(threw, 'Should throw for nonexistent ID');
+  const result = db.delete('nonexistent');
+  assertEqual(result.ok, false, 'delete of a missing id should not report ok');
+  assertEqual(result.code, 'not_found', 'Should report code not_found');
+  assert(typeof result.message === 'string', 'Should carry a message');
+
+  // Reporting, not raising: the call must not have thrown, and the database
+  // is still usable.
+  assertEqual(db.insert({ still: 'usable' }).length > 0, true, 'db still usable');
 });
 
 test('iter returns all documents', async () => {
