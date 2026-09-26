@@ -194,7 +194,16 @@ db.delete(&id)?;      // Soft delete
 db.restore(&id)?;     // Bring it back
 ```
 
-Restore reads the file to find the last non-deleted version of the document and re-inserts it.
+Restore reads the file to find the last non-deleted version of the document and re-inserts it. Files recorded in the trash entry under `_trashed_files` are returned to their buckets first; a file that cannot be returned is reported and the document is restored anyway, so a dangling reference stays visible instead of being silently re-declared as restored.
+
+### Failure Discipline
+
+Two kinds of failure, two contracts:
+
+- **A precondition of the operation the caller asked for** fails — the call returns an error and the operation does not happen. `insert`, `insert_with_prefix` and `update` reject a non-object document with `InvalidArgument` instead of panicking on caller-supplied shape; `delete` treats the trash record as a precondition, so a document is never reported deleted when the copy that makes it restorable could not be written.
+- **Ancillary cleanup** fails — the primary result stands and the failure is reported on stderr with the operation named (`ndb: suppressed failure: ...`). A file that cannot be moved to trash, a bucket that cannot be swept, a flush at shutdown. The count `gc_buckets()` returns covers only files that actually moved.
+
+Nothing is swallowed. There is no bare `let _ =` on a `Result` anywhere in the library; the sink and its rationale live in `src/report.rs`.
 
 ### Trash Modes
 

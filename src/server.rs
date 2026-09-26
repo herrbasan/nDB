@@ -5,6 +5,7 @@
 //! with a cap, keep-alive, read timeout, body cap, static bearer token.
 //! The daemon owns the database in memory; clients receive only results.
 
+use crate::report;
 use crate::{Database, Error, QueryOptions, SortDir, TextMode, TextQuery, TextSearch};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -86,6 +87,8 @@ pub fn serve_listener(listener: TcpListener, db: Database, config: ServerConfig)
         if count > config.max_connections {
             // Over cap: 503 and close. Fail loud, no queueing.
             let mut stream = stream;
+            // The client is being refused regardless; a failed notice to one
+            // that already vanished changes nothing. Not a silent failure.
             let _ = write_response(&mut stream, &Response::Json(503, json!({"error": "connection cap exceeded"})));
             active.fetch_sub(1, Ordering::SeqCst);
             continue;
@@ -108,7 +111,11 @@ fn handle_connection(stream: TcpStream, db: &Arc<Database>, config: &ServerConfi
     if stream.set_read_timeout(Some(Duration::from_secs(30))).is_err() {
         return;
     }
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    // A stream without a write timeout can hold a thread forever on a client
+    // that stops reading, so failing to set it is reported, not passed over.
+    if let Err(e) = stream.set_write_timeout(Some(Duration::from_secs(30))) {
+        report::suppressed("serve: set write timeout", e);
+    }
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
@@ -134,6 +141,10 @@ fn handle_connection(stream: TcpStream, db: &Arc<Database>, config: &ServerConfi
                 } else {
                     json!({"error": e})
                 };
+                // The connection is closed immediately after this line on
+                // every path, so a failed write to a client that is already
+                // gone is not a suppressed failure — there is no later state
+                // it could have corrupted.
                 let _ = write_response(&mut stream, &Response::Json(status, body));
                 return;
             }

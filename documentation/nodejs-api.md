@@ -474,6 +474,8 @@ files.forEach(f => console.log(f));
 
 Perform garabage collection on all file buckets. Iterates over all files stored in `_files/` and moves any unreferenced file into `_trash/files/`. Returns the number of files successfully trashed.
 
+The count covers only files that actually moved, and a bucket that cannot be enumerated throws rather than being skipped silently.
+
 ```js
 const trashedCount = db.gcBuckets();
 console.log(`Garbage collection trashed ${trashedCount} files.`);

@@ -4,6 +4,7 @@
 //! Each bucket is a folder. Trash is per-bucket.
 
 use crate::error::{Error, Result};
+use crate::report;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -194,7 +195,10 @@ impl FileBucket {
         let mut files = Vec::new();
         for entry in fs::read_dir(&dir).map_err(Error::io_err(&dir, "list bucket files"))? {
             let entry = entry.map_err(Error::io_err(&dir, "read dir entry"))?;
-            if entry.file_type().unwrap().is_file() {
+            let file_type = entry
+                .file_type()
+                .map_err(Error::io_err(entry.path(), "stat bucket file"))?;
+            if file_type.is_file() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if !name.ends_with(".tmp") {
                     files.push(name);
@@ -226,27 +230,23 @@ impl FileBucket {
             return Ok(0);
         }
 
-        let now = std::time::SystemTime::now();
         let check_ttl = older_than > std::time::Duration::ZERO;
         let mut count = 0;
         for entry in fs::read_dir(&trash_dir).map_err(Error::io_err(&trash_dir, "read trash dir"))? {
             let entry = entry.map_err(Error::io_err(&trash_dir, "read trash entry"))?;
-            
+
             if check_ttl {
-                if let Ok(meta) = entry.metadata() {
-                    if let Ok(modified) = meta.modified() {
-                        if let Ok(age) = now.duration_since(modified) {
-                            if age <= older_than {
-                                continue;
-                            }
-                        }
-                    }
+                match trash_entry_age(&entry) {
+                    Some(age) if age <= older_than => continue,
+                    Some(_) => {}
+                    // Age unknown: purging anyway could destroy the only copy
+                    // of a file still inside its restore window. Leave it.
+                    None => continue,
                 }
             }
-            
+
             if let Err(e) = fs::remove_file(entry.path()) {
-                // Log but continue
-                eprintln!("purge warning: {}", e);
+                report::suppressed("purge_trash_ttl: remove expired trash file", e);
             } else {
                 count += 1;
             }
@@ -267,6 +267,31 @@ impl FileBucket {
     /// Get the bucket name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+}
+
+// ─── Trash Age ──────────────────────────────────────────────────────
+
+/// Age of a trashed file, or `None` when it cannot be established.
+///
+/// `None` must never be read as "old enough to delete": an unreadable or
+/// uncomparable timestamp says nothing about how long the file has been in
+/// trash, so deleting on that basis could destroy a file that is still inside
+/// its restore window. The failure is reported and the caller leaves it be.
+fn trash_entry_age(entry: &fs::DirEntry) -> Option<std::time::Duration> {
+    let modified = match entry.metadata().and_then(|m| m.modified()) {
+        Ok(modified) => modified,
+        Err(e) => {
+            report::suppressed("purge_trash_ttl: read trash file age", e);
+            return None;
+        }
+    };
+    match std::time::SystemTime::now().duration_since(modified) {
+        Ok(age) => Some(age),
+        Err(e) => {
+            report::suppressed("purge_trash_ttl: trash file age not comparable", e);
+            None
+        }
     }
 }
 

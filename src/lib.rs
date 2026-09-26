@@ -28,6 +28,7 @@
 pub mod bucket;
 pub mod error;
 pub mod id;
+pub mod report;
 pub mod search;
 pub mod server;
 pub mod storage;
@@ -737,8 +738,14 @@ impl Database {
                 match rx.recv_timeout(interval) {
                     Ok(_) => break, // Cancellation signal received via tx.send(())
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        // Time to purge
-                        let _ = Self::purge_trash_static(&base_dir, &trash_file, mode, Some(ttl_dur));
+                        // Time to purge. There is no caller on this path, so a
+                        // failing sweep would otherwise retry in silence every
+                        // interval for the life of the process.
+                        if let Err(e) =
+                            Self::purge_trash_static(&base_dir, &trash_file, mode, Some(ttl_dur))
+                        {
+                            report::detached("ttl sweep: purge expired trash", e);
+                        }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break, // DB dropped
                 }
@@ -793,13 +800,38 @@ impl Database {
 
         let trash_files_dir = base_dir.join("_trash").join("files");
         if trash_files_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(trash_files_dir) {
-                for entry in entries.flatten() {
-                    if let Ok(file_type) = entry.file_type() {
-                        if file_type.is_dir() {
-                            let bucket = FileBucket::new(&entry.file_name().to_string_lossy(), base_dir);
-                            let _ = bucket.purge_trash_ttl(ttl);
-                        }
+            // Detached path — there is no caller to fail to. But a directory or
+            // entry we cannot read means that slice of the file trash was never
+            // swept, which must not pass unremarked either.
+            let entries = match std::fs::read_dir(&trash_files_dir) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    report::detached(
+                        "ttl sweep: list bucket trash directory",
+                        format!("{}: {e}", trash_files_dir.display()),
+                    );
+                    return Ok(purged_count);
+                }
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        report::detached("ttl sweep: read bucket trash entry", e);
+                        continue;
+                    }
+                };
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(e) => {
+                        report::detached("ttl sweep: stat bucket trash entry", e);
+                        continue;
+                    }
+                };
+                if file_type.is_dir() {
+                    let bucket = FileBucket::new(&entry.file_name().to_string_lossy(), base_dir);
+                    if let Err(e) = bucket.purge_trash_ttl(ttl) {
+                        report::detached("ttl sweep: purge bucket trash", e);
                     }
                 }
             }
@@ -836,8 +868,11 @@ impl Database {
         drop(docs_reader);
 
         let id = generate_unique(&existing);
+        // Caller-supplied shape: never panic on it. A JSON scalar (a
+        // stringified string, null, a number, an array) is valid JSON but not
+        // a document, and the caller must hear that rather than lose a process.
         doc.as_object_mut()
-            .unwrap()
+            .ok_or_else(|| Error::invalid_arg("document must be a JSON object"))?
             .insert("_id".to_string(), Value::String(id.clone()));
 
         // Append to file
@@ -888,8 +923,9 @@ impl Database {
         drop(docs_reader);
 
         let id = generate_unique_with_prefix(prefix, &existing);
+        // See `insert`: a non-object is caller error, surfaced not aborted on.
         doc.as_object_mut()
-            .unwrap()
+            .ok_or_else(|| Error::invalid_arg("document must be a JSON object"))?
             .insert("_id".to_string(), Value::String(id.clone()));
 
         if !self.is_in_memory() {
@@ -1034,7 +1070,9 @@ impl Database {
             let journal_size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
             let cache = self.base_dir.join(format!("_index_{}.fti", field));
             // Cache write failure is non-fatal (read-only dir): search still works.
-            let _ = tindex.save(&cache, journal_size);
+            if let Err(e) = tindex.save(&cache, journal_size) {
+                report::suppressed("create_text_index: write disk cache", e);
+            }
         }
 
         self.text_indexes.write().insert(field.to_string(), tindex);
@@ -1047,7 +1085,13 @@ impl Database {
         self.text_indexes.write().remove(field);
         if !self.is_in_memory() {
             let cache = self.base_dir.join(format!("_index_{}.fti", field));
-            let _ = std::fs::remove_file(cache);
+            // The load-time doc-count check catches a stale cache either way,
+            // but failing to drop it is still said out loud.
+            if cache.exists() {
+                if let Err(e) = std::fs::remove_file(&cache) {
+                    report::suppressed("drop_text_index: remove disk cache", e);
+                }
+            }
         }
         Ok(())
     }
@@ -1079,10 +1123,10 @@ impl Database {
             }
         }
 
-        // Set _id on new doc
+        // Set _id on new doc. Same caller-shape rule as `insert`.
         new_doc
             .as_object_mut()
-            .unwrap()
+            .ok_or_else(|| Error::invalid_arg("document must be a JSON object"))?
             .insert("_id".to_string(), Value::String(id.to_string()));
 
         // Remove old values from indexes, add new
@@ -1285,7 +1329,6 @@ impl Database {
         Ok(())
     }
 
-    /// Delete a document (soft delete / tombstone). O(1).
     /// Helper to get the path of the persistent trash file.
     fn trash_doc_path(&self) -> PathBuf {
         let filename = self.path.file_name().unwrap_or(std::ffi::OsStr::new("data.jsonl"));
@@ -1299,41 +1342,32 @@ impl Database {
 
         let doc_to_trash = {
             let docs = self.docs.read();
-            if let Some(doc) = docs.get(id) {
-                doc.clone()
-            } else {
-                return Err(Error::not_found(id));
+            match docs.get(id) {
+                Some(doc) => doc.clone(),
+                None => return Err(Error::not_found(id)),
             }
         };
 
-        // Extract file references safely
+        // The file refs this document holds, and which of them losing it would
+        // orphan. Decided by *reading* the counters, not by mutating them, so
+        // that a failure before the commit below leaves the counters and the
+        // document store exactly as they were.
         let mut extracted_file_refs = HashSet::new();
         Self::extract_file_refs(&doc_to_trash, &mut extracted_file_refs);
+        let orphaned_files: Vec<String> = {
+            let file_refs = self.file_refs.read();
+            extracted_file_refs
+                .iter()
+                .filter(|r| file_refs.get(*r).map_or(false, |count| *count <= 1))
+                .cloned()
+                .collect()
+        };
 
-        let mut orphaned_files = Vec::new();
-        // Update in-memory file reference counter
-        {
-            let mut file_refs = self.file_refs.write();
-            for r in extracted_file_refs {
-                if let Some(count) = file_refs.get_mut(&r) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        file_refs.remove(&r);
-                        orphaned_files.push(r);
-                    }
-                }
-            }
-        }
-
-        // Trash the orphaned files
-        for f in &orphaned_files {
-            if let Some(file_ref) = FileRef::from_compact(f) {
-                let bucket = self.bucket(&file_ref.bucket);
-                let _ = bucket.delete(&file_ref);
-            }
-        }
-
-        // Append to persistent doc trash file
+        // The trash record *is* the restorability guarantee: a caller told
+        // "deleted" must be able to find the document again in the trash. So
+        // writing it is a precondition of the delete, not best-effort cleanup —
+        // if it cannot be written, the delete does not happen and the caller
+        // may retry, rather than being told a restorable deletion occurred.
         if !self.is_in_memory() && self.trash_mode != TrashMode::Off {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1343,10 +1377,38 @@ impl Database {
             if let Some(obj) = trash_doc.as_object_mut() {
                 obj.insert("_deleted".to_string(), serde_json::json!(now));
                 if !orphaned_files.is_empty() {
-                    obj.insert("_trashed_files".to_string(), serde_json::json!(orphaned_files));
+                    obj.insert(
+                        "_trashed_files".to_string(),
+                        serde_json::to_value(&orphaned_files)?,
+                    );
                 }
             }
-            let _ = storage::append_doc_trash(&self.trash_doc_path(), &trash_doc);
+            storage::append_doc_trash(&self.trash_doc_path(), &trash_doc)?;
+        }
+
+        // Committed. Now retire the ref counts and move the orphans aside.
+        // A file that fails to move stays where it is and is named: leaving it
+        // behind is recoverable (the GC sweeps it later, and the document is
+        // honestly gone), whereas a silent failure would hide a stranded file
+        // for the lifetime of the database.
+        {
+            let mut file_refs = self.file_refs.write();
+            for r in &extracted_file_refs {
+                if let Some(count) = file_refs.get_mut(r) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        file_refs.remove(r);
+                    }
+                }
+            }
+        }
+        for f in &orphaned_files {
+            if let Some(file_ref) = FileRef::from_compact(f) {
+                let bucket = self.bucket(&file_ref.bucket);
+                if let Err(e) = bucket.delete(&file_ref) {
+                    report::suppressed("delete: move orphaned file to trash", e);
+                }
+            }
         }
 
         // Remove from indexes
@@ -1742,13 +1804,20 @@ impl Database {
         // Purge File Trash in all buckets using Folder-Led Purging
         let trash_files_dir = self.base_dir.join("_trash").join("files");
         if trash_files_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(trash_files_dir) {
-                for entry in entries.flatten() {
-                    if let Ok(file_type) = entry.file_type() {
-                        if file_type.is_dir() {
-                            let bucket = self.bucket(&entry.file_name().to_string_lossy());
-                            let _ = bucket.purge_trash_ttl(ttl);
-                        }
+            // A caller asked for a purge and gets a count back, so structural
+            // failures fail loud; only per-bucket failures leave the count
+            // short, and each of those is named.
+            let entries = std::fs::read_dir(&trash_files_dir)
+                .map_err(Error::io_err(&trash_files_dir, "list bucket trash dir"))?;
+            for entry in entries {
+                let entry = entry.map_err(Error::io_err(&trash_files_dir, "read trash entry"))?;
+                let file_type = entry
+                    .file_type()
+                    .map_err(Error::io_err(entry.path(), "stat trash entry"))?;
+                if file_type.is_dir() {
+                    let bucket = self.bucket(&entry.file_name().to_string_lossy());
+                    if let Err(e) = bucket.purge_trash_ttl(ttl) {
+                        report::suppressed("purge_trash: purge bucket trash", e);
                     }
                 }
             }
@@ -1768,7 +1837,11 @@ impl Database {
         let active: Vec<&Value> = docs.values().collect();
         
         // 1. Write the clean JSON line docs
-        let target_db = target.join(self.path.file_name().unwrap());
+        let target_db = target.join(
+            self.path
+                .file_name()
+                .ok_or_else(|| Error::invalid_arg("database path has no file name"))?,
+        );
         storage::rewrite_atomic(&target_db, &active)?;
         
         // 2. Copy the meta.json across
@@ -1846,7 +1919,13 @@ impl Database {
                 if let Some(s) = f.as_str() {
                     if let Some(file_ref) = FileRef::from_compact(s) {
                         let bucket = self.bucket(&file_ref.bucket);
-                        let _ = bucket.restore(&file_ref.id, &file_ref.ext);
+                        // The document comes back either way; a file that did
+                        // not is a dangling reference, which the caller must be
+                        // able to see rather than have silently re-declared as
+                        // restored.
+                        if let Err(e) = bucket.restore(&file_ref.id, &file_ref.ext) {
+                            report::suppressed("restore: return file from trash", e);
+                        }
                     }
                 }
             }
@@ -1985,25 +2064,38 @@ impl Database {
         if files_base.exists() {
             for entry in fs::read_dir(&files_base).map_err(Error::io_err(&files_base, "list base files"))? {
                 let entry = entry.map_err(Error::io_err(&files_base, "read bucket entry"))?;
-                if entry.file_type().unwrap().is_dir() {
+                let file_type = entry
+                    .file_type()
+                    .map_err(Error::io_err(entry.path(), "stat bucket entry"))?;
+                if file_type.is_dir() {
                     let bucket_name = entry.file_name().to_string_lossy().to_string();
                     let bkt = self.bucket(&bucket_name);
-                    
-                    if let Ok(files) = bkt.list() {
-                        for filename in files {
-                            let ref_str = format!("{}:{}", bucket_name, filename);
-                            if !active_refs.contains(&ref_str) {
-                                // Missing from documents
-                                if let Some(dot_pos) = filename.rfind('.') {
-                                    let id = filename[..dot_pos].to_string();
-                                    let ext = filename[dot_pos + 1..].to_string();
-                                    let file_ref = FileRef {
-                                        bucket: bucket_name.clone(),
-                                        id,
-                                        ext,
-                                    };
-                                    let _ = bkt.delete(&file_ref); // Ignore deletion errors here
-                                    trashed_count += 1;
+
+                    // A bucket we cannot enumerate is a bucket this sweep
+                    // silently did not cover — the point of the call fails loud.
+                    let files = bkt.list()?;
+                    for filename in files {
+                        let ref_str = format!("{}:{}", bucket_name, filename);
+                        if !active_refs.contains(&ref_str) {
+                            // Missing from documents
+                            if let Some(dot_pos) = filename.rfind('.') {
+                                let id = filename[..dot_pos].to_string();
+                                let ext = filename[dot_pos + 1..].to_string();
+                                let file_ref = FileRef {
+                                    bucket: bucket_name.clone(),
+                                    id,
+                                    ext,
+                                };
+                                // Count only what actually moved: the returned
+                                // number is the caller's evidence that the
+                                // sweep happened, so it must not include files
+                                // that failed to move.
+                                match bkt.delete(&file_ref) {
+                                    Ok(()) => trashed_count += 1,
+                                    Err(e) => report::suppressed(
+                                        "gc_buckets: move unreferenced file to trash",
+                                        e,
+                                    ),
                                 }
                             }
                         }
@@ -2103,7 +2195,11 @@ impl Database {
         for f in &orphaned_files {
             if let Some(file_ref) = FileRef::from_compact(f) {
                 let bucket = self.bucket(&file_ref.bucket);
-                let _ = bucket.delete(&file_ref);
+                // Automatic post-write cleanup: the document write has already
+                // succeeded, so this reports instead of failing the operation.
+                if let Err(e) = bucket.delete(&file_ref) {
+                    report::suppressed("update: move orphaned file to trash", e);
+                }
             }
         }
     }
@@ -2119,26 +2215,6 @@ impl Database {
             *file_refs.entry(r).or_insert(0) += 1;
         }
     }
-
-    /// Decrement file ref counts and return any that hit zero (orphaned)
-    fn decrement_file_refs(&self, doc: &Value) -> Vec<String> {
-        let mut extracted = HashSet::new();
-        Self::extract_file_refs(doc, &mut extracted);
-        let mut orphaned = Vec::new();
-        if extracted.is_empty() { return orphaned; }
-        
-        let mut file_refs = self.file_refs.write();
-        for r in extracted {
-            if let Some(count) = file_refs.get_mut(&r) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    file_refs.remove(&r);
-                    orphaned.push(r);
-                }
-            }
-        }
-        orphaned
-    }
 }
 
 impl Error {
@@ -2152,18 +2228,25 @@ impl Error {
 
 impl Drop for Database {
     fn drop(&mut self) {
-        // Signal the TTL background thread to stop
+        // Signal the TTL background thread to stop. A send failure means the
+        // thread already exited, which is the outcome we were after.
         if let Some(tx) = self.ttl_tx.lock().take() {
             let _ = tx.send(());
         }
-        
+
         // Wait for it to finish gracefully to prevent Node.js hanging
         if let Some(handle) = self.ttl_thread.lock().take() {
-            let _ = handle.join();
+            if handle.join().is_err() {
+                report::detached("drop: join ttl thread", "background thread panicked");
+            }
         }
 
-        // Flush any pending writes if lazy
-        let _ = self.flush();
+        // Flush any pending writes. Drop has no error channel, and the process
+        // is about to exit and take the unwritten data with it — the one
+        // outcome that must never be silent.
+        if let Err(e) = self.flush() {
+            report::detached("drop: flush pending writes", e);
+        }
     }
 }
 

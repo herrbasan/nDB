@@ -65,6 +65,7 @@ Powered by **napi-rs**. The `napi/` crate wraps the Rust `Database` type and exp
 | Delta updates in Node.js backend | Complete (`arrayPush`, `set`, `remove` wired and used by consumers) |
 | `release_file` + `gc_buckets` (Rust + NAPI) | Complete |
 | TTL-based trash purging | Complete (`with_trash_ttl` + background thread; napi via `trash_ttl` option) |
+| Failure discipline | Complete — no bare `let _ =` on a `Result`; preconditions return `Err`, ancillary cleanup is reported (`src/report.rs`); a document is never reported deleted when its trash record could not be written |
 | Schema validation from `meta.json` | Not implemented (`meta.json` written but unenforced) |
 | nURI `link` type enforcement | Not implemented (file refs detected heuristically by string match, not by schema) |
 | Bucket migration script for legacy data | Not bundled here (the consumer's `migrate-ndb-to-folder.js` was used in production) |

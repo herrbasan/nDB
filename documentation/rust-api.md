@@ -114,7 +114,7 @@ Insert a document. Generates a 16-char NanoID `_id` and returns it.
 
 - **O(1)**: HashMap insert + file append
 - Automatically updates all indexes
-- Panics if `doc` is not a JSON object
+- Returns `Error::InvalidArgument` if `doc` is not a JSON object — a non-object is caller error, never a panic
 
 ```rust
 let id = db.insert(json!({"title": "Hello", "count": 42}))?;

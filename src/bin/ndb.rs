@@ -10,6 +10,16 @@ const EXIT_GENERAL_ERROR: i32 = 1;
 const EXIT_CORRUPTION: i32 = 2;
 const EXIT_LOCKED: i32 = 3;
 
+/// Report a fatal CLI error and exit non-zero.
+///
+/// Maintenance commands exist to produce a correct artifact; a step that could
+/// not be performed means the artifact is not the one that was asked for, so
+/// stop rather than print success over an incomplete result.
+fn fatal(msg: &str) -> ! {
+    eprintln!("Error: {msg}");
+    process::exit(EXIT_GENERAL_ERROR);
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -565,23 +575,27 @@ fn handle_merge(args: &[String]) {
     let mut resolved_docs: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
 
     for id in base_db.get_all_ids() {
-        if let Ok(doc) = base_db.get(&id) {
-            resolved_docs.insert(id, doc);
-        }
+        // Skipping a document we cannot read would emit a merge that silently
+        // lost it while still reporting success.
+        let doc = base_db
+            .get(&id)
+            .unwrap_or_else(|e| fatal(&format!("read {id} from base: {e}")));
+        resolved_docs.insert(id, doc);
     }
 
     for id in merge_db.get_all_ids() {
-        if let Ok(merge_doc) = merge_db.get(&id) {
-            if let Some(base_doc) = resolved_docs.get(&id) {
-                // Collision! Compare _modified
-                let base_mod = base_doc.get("_modified").and_then(|v| v.as_u64()).unwrap_or(0);
-                let merge_mod = merge_doc.get("_modified").and_then(|v| v.as_u64()).unwrap_or(0);
-                if merge_mod >= base_mod {
-                    resolved_docs.insert(id, merge_doc);
-                }
-            } else {
-                resolved_docs.insert(id.clone(), merge_doc);
+        let merge_doc = merge_db
+            .get(&id)
+            .unwrap_or_else(|e| fatal(&format!("read {id} from merge-in: {e}")));
+        if let Some(base_doc) = resolved_docs.get(&id) {
+            // Collision! Compare _modified
+            let base_mod = base_doc.get("_modified").and_then(|v| v.as_u64()).unwrap_or(0);
+            let merge_mod = merge_doc.get("_modified").and_then(|v| v.as_u64()).unwrap_or(0);
+            if merge_mod >= base_mod {
+                resolved_docs.insert(id, merge_doc);
             }
+        } else {
+            resolved_docs.insert(id.clone(), merge_doc);
         }
     }
 
@@ -600,16 +614,22 @@ fn handle_merge(args: &[String]) {
     }
     
     // Create the trash root (the library manages _trash/docs/ on demand)
-    let _ = fs::create_dir_all(dest_path.join("_trash"));
+    if let Err(e) = fs::create_dir_all(dest_path.join("_trash")) {
+        fatal(&format!("create trash directory: {e}"));
+    }
 
     // Copy and merge meta.json
     // Read meta from both, union their buckets array.
     let base_meta_path = base_path.join("meta.json");
     let merge_meta_path = merge_path.join("meta.json");
     
+    // A meta.json that exists but cannot be read or parsed must not quietly
+    // become an empty one: the merge would drop every bucket it declared.
     let mut meta: serde_json::Value = if base_meta_path.exists() {
-        let content = fs::read_to_string(&base_meta_path).unwrap_or_default();
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+        let content = fs::read_to_string(&base_meta_path)
+            .unwrap_or_else(|e| fatal(&format!("read {}: {e}", base_meta_path.display())));
+        serde_json::from_str(&content)
+            .unwrap_or_else(|e| fatal(&format!("parse {}: {e}", base_meta_path.display())))
     } else {
         serde_json::json!({})
     };
@@ -638,7 +658,9 @@ fn handle_merge(args: &[String]) {
     
     meta["buckets"] = serde_json::Value::Array(buckets_set.into_iter().map(serde_json::Value::String).collect());
     
-    if let Err(e) = fs::write(dest_path.join("meta.json"), serde_json::to_string_pretty(&meta).unwrap()) {
+    let meta_json = serde_json::to_string_pretty(&meta)
+        .unwrap_or_else(|e| fatal(&format!("serialize meta.json: {e}")));
+    if let Err(e) = fs::write(dest_path.join("meta.json"), meta_json) {
         eprintln!("Failed to write merged meta.json: {}", e);
         process::exit(EXIT_GENERAL_ERROR);
     }
@@ -791,21 +813,28 @@ fn handle_recover(args: &[String]) {
     
     // Copy meta.json safely
     let meta_src = src_path.join("meta.json");
+    let meta_dst = dest_path.join("meta.json");
     if meta_src.exists() {
-        let _ = fs::copy(&meta_src, dest_path.join("meta.json"));
+        if let Err(e) = fs::copy(&meta_src, &meta_dst) {
+            fatal(&format!("copy meta.json: {e}"));
+        }
     } else {
         // Mock a meta if missing
         let meta_json = format!(
             "{{\n  \"version\": 1,\n  \"created\": {},\n  \"buckets\": []\n}}\n", 
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
         );
-        let _ = fs::write(dest_path.join("meta.json"), meta_json);
+        if let Err(e) = fs::write(&meta_dst, meta_json) {
+            fatal(&format!("write meta.json: {e}"));
+        }
     }
     
     // Attempt bucket recovery
     let buckets_src = src_path.join("_files");
     if buckets_src.exists() {
-        let _ = copy_dir_recursive(&buckets_src, &dest_path.join("_files"));
+        if let Err(e) = copy_dir_recursive(&buckets_src, &dest_path.join("_files")) {
+            fatal(&format!("recover file buckets: {e}"));
+        }
     }
     
     eprintln!("[2/2] Scanning data.jsonl for surviving rows...");
@@ -813,14 +842,22 @@ fn handle_recover(args: &[String]) {
     let target_db = dest_path.join("data.jsonl");
     
     // Create the trash root (the library manages _trash/docs/ on demand)
-    let _ = fs::create_dir_all(dest_path.join("_trash"));
+    if let Err(e) = fs::create_dir_all(dest_path.join("_trash")) {
+        fatal(&format!("create trash directory: {e}"));
+    }
 
     if db_src.exists() {
         use std::io::{BufRead, BufReader, Write};
-        let src_file = fs::File::open(&db_src).unwrap();
+        let src_file = match fs::File::open(&db_src) {
+            Ok(file) => file,
+            Err(e) => fatal(&format!("open source data.jsonl: {e}")),
+        };
         let reader = BufReader::new(src_file);
         
-        let mut dest_file = fs::File::create(&target_db).unwrap();
+        let mut dest_file = match fs::File::create(&target_db) {
+            Ok(file) => file,
+            Err(e) => fatal(&format!("create destination data.jsonl: {e}")),
+        };
         
         let mut salvaged = 0;
         let mut skipped = 0;
@@ -829,7 +866,11 @@ fn handle_recover(args: &[String]) {
             if let Ok(line) = line_res {
                 if line.trim().is_empty() { continue; }
                 if serde_json::from_str::<serde_json::Value>(&line).is_ok() {
-                    let _ = writeln!(dest_file, "{}", line);
+                    // A write that fails here would report the row as salvaged
+                    // while leaving it out of the file.
+                    if let Err(e) = writeln!(dest_file, "{}", line) {
+                        fatal(&format!("Line {}: write failed: {e}", i + 1));
+                    }
                     salvaged += 1;
                 } else {
                     eprintln!("Line {}: Corrupted - Skipping", i+1);
@@ -841,7 +882,9 @@ fn handle_recover(args: &[String]) {
             }
         }
         
-        dest_file.sync_all().unwrap();
+        if let Err(e) = dest_file.sync_all() {
+            fatal(&format!("flush recovered data.jsonl: {e}"));
+        }
         eprintln!("Recovered {} rows, skipped {} corrupt rows.", salvaged, skipped);
     }
     

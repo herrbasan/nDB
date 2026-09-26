@@ -12,7 +12,6 @@
 use crate::error::{Error, Result};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::path::Path;
 
 /// Internal doc id used in postings (dense, u32).
