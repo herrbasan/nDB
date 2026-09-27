@@ -62,12 +62,15 @@ Six local commits, unpushed:
       inside the fix commits (`748ccb0`…`63264cb`); a fresh release build produces no diff.
       ⚠️ `napi/index.win32-x64-msvc.node` (May, 2 MB) is still tracked but never loaded — delete it
       in the push commit so it can't be mistaken for the live artifact (the #6 trap shape).
-- [ ] Push `main`; close #4, #5, #6, #8 citing commits. (#5 and #6 already carry independent
+- [x] Push `main`; close #4, #5, #6, #8 citing commits. (#5 and #6 already carry independent
       verification comments; #4/#8 get closed on the green runs above.) The push note must cover
       the "Louder ≠ breaking" behavior change (contract §4), so consumers don't read new `Err`s
       as regressions.
+      **DONE 2026-09-27:** pushed `987c7b1..f637de9` (8 commits: the six fixes, stale-binary
+      removal `f0262bb`, this plan `f637de9` with the §4 push note in the commit message).
+      #4, #5, #6, #8 closed with verification comments.
 
-**Exit:** origin/main carries all reviewed fixes; issue list down to #3, #7, #9, #10.
+**Phase 0 COMPLETE (2026-09-27).** Issue list down to #3, #7, #9, #10.
 
 ---
 
