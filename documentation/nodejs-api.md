@@ -525,7 +525,8 @@ Common errors:
 - `index error for field '{field}': index not found` — Tried to drop a nonexistent index
 - `I/O error at {path}: ...` — File system error
 - `Delete failed: I/O error at {path}: ...` — the deletion could not be recorded; nothing was deleted
-- `Failed to open database: ...` — Constructor failure
+- `bucket policy violation: ...` — the delete hit a bucket declared `onDocumentDelete: "restrict"` in `meta.json`; reassign or release the named file first (see [file-buckets.md](file-buckets.md))
+- `Failed to open database: ...` — Constructor failure, including a malformed `meta.json` policy block (fails loudly, never silently ignored)
 
 Four guarantees hold behind those errors:
 

@@ -46,6 +46,10 @@ pub enum Error {
     /// File bucket error.
     #[error("file bucket error: {reason}")]
     BucketError { reason: String },
+
+    /// Bucket policy from meta.json forbids the operation.
+    #[error("bucket policy violation: {reason}")]
+    PolicyViolation { reason: String },
 }
 
 impl Error {
@@ -77,6 +81,13 @@ impl Error {
     /// Create an invalid argument error.
     pub fn invalid_arg(reason: impl Into<String>) -> Self {
         Error::InvalidArgument {
+            reason: reason.into(),
+        }
+    }
+
+    /// Create a bucket-policy violation error.
+    pub fn policy_violation(reason: impl Into<String>) -> Self {
+        Error::PolicyViolation {
             reason: reason.into(),
         }
     }

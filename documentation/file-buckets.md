@@ -31,6 +31,26 @@ let bucket = db.bucket("avatars");
 
 The bucket name becomes a subdirectory under `_files/`. Valid names: alphanumeric, hyphens, underscores.
 
+### Bucket policies (`meta.json`)
+
+Buckets may be *declared* in the database folder's `meta.json`, and the core enforces two policy keys at open (#10):
+
+```json
+{
+  "buckets": {
+    "avatars":     { "onDocumentDelete": "restrict" },
+    "attachments": { "onDocumentDelete": "trash", "ttl_seconds": 2592000 },
+    "temp_exports": { "ttl_seconds": 86400 }
+  }
+}
+```
+
+- **`onDocumentDelete: "restrict"`** — deleting a document that references a file in this bucket **fails** (`PolicyViolation`) before anything moves. The caller must reassign or explicitly release the file first.
+- **`onDocumentDelete: "trash"`** — the explicit form of the default: the document's refs are released and orphaned files move to trash (refcount protection unchanged).
+- **`ttl_seconds`** — per-bucket trash TTL, used by `purge_trash()` and the background TTL sweep *instead of* the database-wide TTL for this bucket's trash. Independent of `onDocumentDelete`.
+
+Absence — no `meta.json`, no `buckets` block, no entry for the bucket — means exactly the default behavior. A **malformed** policy (unknown `onDocumentDelete` value, non-object block, non-numeric `ttl_seconds`, invalid JSON) fails `open()` with a corruption error: a config typo must never silently degrade to no-policy. Unknown top-level keys (`schemas`, future fields) are ignored. The file is read at open; changes require a reopen.
+
 ---
 
 ## Storing Files

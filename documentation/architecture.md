@@ -15,10 +15,10 @@ my-app/
 ├── data.jsonl     # The append-only document store (this file is passed to Database::open)
 ├── _files/        # Managed binary buckets (SHA-256 deduplication)
 ├── _trash/        # Soft-deleted documents and files
-└── meta.json      # Schema/bucket metadata — written by the CLI/migration, NOT yet read by the core
+└── meta.json      # Schema/bucket metadata — written by the CLI/migration; the core reads the `buckets` policy block at open (schema validation still not implemented)
 ```
 
-**Important nuance:** the Rust core's `Database::open(path)` takes the **`data.jsonl` file itself**, not the folder. The library derives the folder as the file's parent and creates `_files/` and `_trash/` as siblings of the `.jsonl`. So a "folder database" is a *container convention* imposed by the caller (or the CLI), not something `open()` sets up for you. `meta.json` is present in real folders but the core neither reads nor writes it — schema validation is not implemented.
+**Important nuance:** the Rust core's `Database::open(path)` takes the **`data.jsonl` file itself**, not the folder. The library derives the folder as the file's parent and creates `_files/` and `_trash/` as siblings of the `.jsonl`. So a "folder database" is a *container convention* imposed by the caller (or the CLI), not something `open()` sets up for you. `meta.json` is present in real folders; the core reads the `buckets` policy block at open (see below) but does not write the file, and schema validation is not implemented.
 
 ### Layout convention: database-as-a-folder
 
@@ -279,7 +279,7 @@ The canonical folder-per-database layout (as used by LLM-Gateway-Chat and create
 ```
 my-app/
 ├── data.jsonl              # Document store (JSON Lines) — passed to Database::open
-├── meta.json               # Engine metadata (version, buckets, schemas). Written by CLI/migration; not yet enforced by core.
+├── meta.json               # Engine metadata (version, buckets, schemas). Written by CLI/migration; the core enforces the `buckets` policy block (onDocumentDelete, ttl_seconds) — schemas are ignored for now.
 ├── _files/                 # File buckets root (created implicitly by bucket operations)
 │   ├── avatars/            # Named bucket "avatars"
 │   │   ├── a1b2c3d4.png    # Stored by SHA-256 hash prefix

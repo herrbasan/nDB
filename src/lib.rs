@@ -543,6 +543,84 @@ fn walk_and_remove(current: &mut Value, segments: &[&str], depth: usize) {
 // ─── Database ───────────────────────────────────────────────────────
 
 
+/// What happens to a document's files when the document is deleted,
+/// declared per bucket in `meta.json` (#10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnDocumentDelete {
+    /// Refuse the delete while the document references files in this bucket.
+    Restrict,
+    /// Release the document's refs; orphaned files move to trash.
+    /// This is the explicit form of the default behavior.
+    Trash,
+}
+
+/// Per-bucket policy parsed from `meta.json` (`buckets.<name>`, #10).
+#[derive(Clone, Debug, Default)]
+struct BucketPolicy {
+    on_document_delete: Option<OnDocumentDelete>,
+    /// Per-bucket trash TTL, overriding the database-wide one at purge.
+    ttl_seconds: Option<u64>,
+}
+
+/// Read `meta.json`'s bucket policy block. A missing file or block is not
+/// an error — it means "no policy", which is today's behavior. A
+/// *malformed* policy fails loudly: an admin config with a typo must not
+/// silently degrade to no-policy. Unknown top-level keys (`schemas`,
+/// future fields) are ignored.
+fn load_bucket_policies(base_dir: &Path) -> Result<HashMap<String, BucketPolicy>> {
+    let meta_path = base_dir.join("meta.json");
+    if !meta_path.exists() {
+        return Ok(HashMap::new());
+    }
+    let raw = fs::read_to_string(&meta_path)
+        .map_err(Error::io_err(&meta_path, "read meta.json"))?;
+    let meta: Value = serde_json::from_str(&raw)
+        .map_err(|e| Error::corruption(&meta_path, format!("invalid JSON: {e}")))?;
+
+    let mut policies = HashMap::new();
+    let buckets = match meta.get("buckets") {
+        None => return Ok(policies),
+        Some(Value::Null) => return Ok(policies),
+        Some(b) if b.is_object() => b.as_object().unwrap(),
+        Some(_) => {
+            return Err(Error::corruption(&meta_path, "'buckets' must be an object"))
+        }
+    };
+    for (name, block) in buckets {
+        let block = block.as_object().ok_or_else(|| {
+            Error::corruption(&meta_path, format!("buckets.{name} must be an object"))
+        })?;
+        let on_document_delete = match block.get("onDocumentDelete") {
+            None => None,
+            Some(Value::String(s)) if s == "restrict" => Some(OnDocumentDelete::Restrict),
+            Some(Value::String(s)) if s == "trash" => Some(OnDocumentDelete::Trash),
+            Some(v) => {
+                return Err(Error::corruption(
+                    &meta_path,
+                    format!("buckets.{name}.onDocumentDelete must be \"restrict\" or \"trash\", got {v}"),
+                ))
+            }
+        };
+        let ttl_seconds = match block.get("ttl_seconds") {
+            None => None,
+            Some(v) => Some(v.as_u64().ok_or_else(|| {
+                Error::corruption(
+                    &meta_path,
+                    format!("buckets.{name}.ttl_seconds must be a non-negative integer, got {v}"),
+                )
+            })?),
+        };
+        policies.insert(
+            name.clone(),
+            BucketPolicy {
+                on_document_delete,
+                ttl_seconds,
+            },
+        );
+    }
+    Ok(policies)
+}
+
 /// The main nDB database.
 ///
 /// In-memory document store backed by JSON Lines persistence.
@@ -578,6 +656,9 @@ pub struct Database {
     ttl_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Append-only file handle (held open for writes).
     file_handle: Mutex<Option<fs::File>>,
+    /// Per-bucket policies from `meta.json`, loaded at open (#10).
+    /// Empty means "no policy" — the pre-meta.json behavior.
+    bucket_policies: HashMap<String, BucketPolicy>,
 }
 
 impl Database {
@@ -658,6 +739,10 @@ impl Database {
             }
         }
 
+        // Bucket policies from meta.json (#10) — loaded before the struct
+        // literal moves base_dir.
+        let bucket_policies = load_bucket_policies(&base_dir)?;
+
         Ok(Database {
             path,
             base_dir,
@@ -674,6 +759,7 @@ impl Database {
             ttl_tx: Mutex::new(None),
             ttl_thread: Mutex::new(None),
             file_handle: Mutex::new(None),
+            bucket_policies,
         })
     }
 
@@ -695,6 +781,7 @@ impl Database {
             ttl_tx: Mutex::new(None),
             ttl_thread: Mutex::new(None),
             file_handle: Mutex::new(None),
+            bucket_policies: HashMap::new(),
         })
     }
 
@@ -729,6 +816,7 @@ impl Database {
         let trash_file = self.trash_doc_path();
         let mode = self.trash_mode;
         let ttl_dur = self.trash_ttl.unwrap();
+        let bucket_policies = self.bucket_policies.clone();
 
         let (tx, rx) = std::sync::mpsc::channel();
         *self.ttl_tx.lock() = Some(tx);
@@ -741,9 +829,13 @@ impl Database {
                         // Time to purge. There is no caller on this path, so a
                         // failing sweep would otherwise retry in silence every
                         // interval for the life of the process.
-                        if let Err(e) =
-                            Self::purge_trash_static(&base_dir, &trash_file, mode, Some(ttl_dur))
-                        {
+                        if let Err(e) = Self::purge_trash_static(
+                            &base_dir,
+                            &trash_file,
+                            mode,
+                            Some(ttl_dur),
+                            &bucket_policies,
+                        ) {
                             report::detached("ttl sweep: purge expired trash", e);
                         }
                     }
@@ -761,6 +853,7 @@ impl Database {
         trash_file: &Path,
         trash_mode: TrashMode,
         trash_ttl: Option<Duration>,
+        bucket_policies: &HashMap<String, BucketPolicy>,
     ) -> Result<usize> {
         let ttl = match (trash_mode, trash_ttl) {
             (TrashMode::TTL(t), _) => t,
@@ -829,8 +922,14 @@ impl Database {
                     }
                 };
                 if file_type.is_dir() {
-                    let bucket = FileBucket::new(&entry.file_name().to_string_lossy(), base_dir);
-                    if let Err(e) = bucket.purge_trash_ttl(ttl) {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let bucket = FileBucket::new(&name, base_dir);
+                    let bucket_ttl = bucket_policies
+                        .get(&name)
+                        .and_then(|p| p.ttl_seconds)
+                        .map(Duration::from_secs)
+                        .unwrap_or(ttl);
+                    if let Err(e) = bucket.purge_trash_ttl(bucket_ttl) {
                         report::detached("ttl sweep: purge bucket trash", e);
                     }
                 }
@@ -1358,6 +1457,24 @@ impl Database {
                 .collect()
         };
 
+        // Bucket policy (#10): a bucket declared `onDocumentDelete: "restrict"`
+        // refuses the delete while the document references its files — the
+        // consumer must reassign or explicitly release the file first. This
+        // is a precondition, checked before anything moves, so the refusal
+        // leaves document, counters and files exactly as they were.
+        for r in &extracted_file_refs {
+            if let Some(file_ref) = FileRef::from_compact(r) {
+                if let Some(policy) = self.bucket_policies.get(&file_ref.bucket) {
+                    if policy.on_document_delete == Some(OnDocumentDelete::Restrict) {
+                        return Err(Error::policy_violation(format!(
+                            "delete refused: bucket '{}' declares onDocumentDelete=restrict; reassign or release {} first",
+                            file_ref.bucket, r
+                        )));
+                    }
+                }
+            }
+        }
+
         // The trash record *is* the restorability guarantee: a caller told
         // "deleted" must be able to find the document again in the trash. So
         // writing it is a precondition of the delete, not best-effort cleanup —
@@ -1825,8 +1942,17 @@ impl Database {
                             }
                         };
                         if file_type.is_dir() {
-                            let bucket = self.bucket(&entry.file_name().to_string_lossy());
-                            if let Err(e) = bucket.purge_trash_ttl(ttl) {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            let bucket = self.bucket(&name);
+                            // Per-bucket TTL from meta.json overrides the
+                            // database-wide one for this bucket's trash (#10).
+                            let bucket_ttl = self
+                                .bucket_policies
+                                .get(&name)
+                                .and_then(|p| p.ttl_seconds)
+                                .map(Duration::from_secs)
+                                .unwrap_or(ttl);
+                            if let Err(e) = bucket.purge_trash_ttl(bucket_ttl) {
                                 report::suppressed("purge_trash: purge bucket trash", e);
                             }
                         }

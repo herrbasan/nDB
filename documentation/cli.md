@@ -8,7 +8,7 @@ The CLI uses the same **database-as-a-folder** layout as the library and the pri
 
 ```
 mydb/
-├── meta.json      # Engine metadata (version, created, buckets) — CLI/migration only, core ignores it
+├── meta.json      # Engine metadata (version, created, buckets) — written by CLI/migration; the core reads the `buckets` policy block at open
 ├── data.jsonl     # Document store
 ├── _files/        # File buckets
 └── _trash/        # Trash (the library manages _trash/docs/ on demand)
