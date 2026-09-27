@@ -164,6 +164,18 @@ hand-wiring file release for the in-database case.
 
 ## Phase 3 — Item buckets (#9, spec decided 2026-09-27)
 
+**Phase 3 IMPLEMENTED (2026-09-27).** Landed in `e76faa2`, pushed, commented on #9 — left
+open for independent verification per repo norm. Built: kind in the #10 policy loader,
+`src/item.rs` (ItemBucket: folder-as-unit + `items.jsonl` journal, reserve/commit/read/
+list/trash/restore, reserved sweep, streaming-sha256 verify), Database API + TTL-thread
+sweep, CLI verify item awareness, folder-aware purge, snapshot support, napi (8 methods
++ wrapper). Tests: phase11 (13, nCMS pool semantics + crash windows + failure injection),
+napi 71/71. Docs synced (file-buckets/architecture/cli/nodejs-api/AGENTS). Hash-kind
+oracle: all pre-existing suites unmodified and green.
+**Acceptance remaining (out of repo):** LLM-Gateway-Chat attachment suite (flagged to the
+nCMS-side session) and nCMS Phase 4 adoption. Incidental finding: `napi/index.d.ts` is
+empty — no build step generates it (pre-existing).
+
 The feature the earlier phases gate. Full spec lives in issue #9; this is the work breakdown.
 
 ### 3.1 Declaration & layout
@@ -197,9 +209,11 @@ item buckets; commit path follows Phase-1 ordering.
   disk directly; only add routes if a consumer needs them (likely: none for v1).
 
 ### 3.5 Acceptance (from the spec)
-- [ ] Rust suite mirroring the nCMS pool semantics (reserve/commit/trash/restore/
+- [x] Rust suite mirroring the nCMS pool semantics (reserve/commit/trash/restore/
       reserved-sweep/verify), synthetic oversized-file fixtures.
+      **DONE 2026-09-27:** `tests/phase11_item_bucket_tests.rs` (13 tests).
 - [ ] LLM-Gateway-Chat attachment suite passes bit-identical (hash-kind regression oracle).
+      Flagged to the nCMS-side session in the #9 comment — run from LLM-Gateway-Chat.
 - [ ] nCMS Phase 4 adoption tracked separately in the nCMS repo: `lib/media.js` on item
       buckets, pool folders migrated, duplicated bookkeeping deleted.
 
