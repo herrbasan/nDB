@@ -76,7 +76,14 @@ Six local commits, unpushed:
 
 ## Phase 1 — Correctness gate: journal write ordering (#7) + deployment fix (#3)
 
-### #7 — Commit path reorder (the only remaining runtime defect)
+**Phase 1 COMPLETE (2026-09-27).** #7 landed in `b13b0ac` (prepare → journal → commit for
+`update` + delta ops; fault-injected tests; docs re-strengthened to the fourth guarantee;
+rebuilt binary committed) — commented, left open for independent verification per repo norm.
+#3 landed in `5a5f3d1` (root `package.json`, `"type": "commonjs"`; verified against a
+simulated ESM parent) — closed. Oracles: full `cargo test` green, napi 66/66 + shape guard +
+harness self-check against the fresh binary.
+
+### #7 — Commit path reorder (the only remaining runtime defect) — DONE
 
 Current shape ([src/lib.rs](src/lib.rs)): `handle_ref_delta_and_trash` and the in-memory/index
 mutations run *before* the journal append, so a failed append leaves memory and files ahead of
