@@ -126,6 +126,15 @@ consumers (mcp_server, LLM-Gateway-Chat). **This phase gates Phase 3.**
 
 ## Phase 2 — `meta.json` policy wiring (#10)
 
+**Phase 2 COMPLETE (2026-09-27).** Semantics pinned in #10 before coding (the pre-commitment):
+restrict = refuse the delete naming bucket+ref; trash = the documented default; ttl_seconds =
+per-bucket trash TTL at purge; malformed policy fails `open()` loudly; unknown keys ignored.
+Landed in `10dd726` — `load_bucket_policies` at open, restrict as a delete() precondition
+(new `Error::PolicyViolation`), TTL overrides in both purge paths and the TTL thread.
+8 tests in `tests/phase10_meta_policy_tests.rs` incl. the opt-in oracles; docs synced
+(cli/architecture/file-buckets/nodejs-api). Oracles: cargo test green (12 suites), napi 66/66
+against the rebuilt binary. Commented, left open for independent verification per repo norm.
+
 The engine reads `meta.json` for the first time. Scope per the issue and
 `docs/database_evolution_plan.md` §2.3/§2.4.1:
 
