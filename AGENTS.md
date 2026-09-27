@@ -66,7 +66,10 @@ Powered by **napi-rs**. The `napi/` crate wraps the Rust `Database` type and exp
 | `release_file` + `gc_buckets` (Rust + NAPI) | Complete |
 | TTL-based trash purging | Complete (`with_trash_ttl` + background thread; napi via `trash_ttl` option) |
 | Failure discipline | Complete — no bare `let _ =` on a `Result`; preconditions return `Err`, ancillary cleanup is reported (`src/report.rs`); a document is never reported deleted when its trash record could not be written |
-| Schema validation from `meta.json` | Not implemented (`meta.json` written but unenforced) |
+| Journal-first write ordering | Complete — every mutating op appends before any in-memory/index/ref state moves; a failed append changes nothing (fault-injected tests) |
+| `meta.json` bucket policies | Complete — `kind`, `onDocumentDelete`, `ttl_seconds`, `reserved_ttl_seconds` enforced at open; malformed policy fails loudly; schema validation still unenforced |
+| Item buckets (`kind: "items"`) | Complete — item folders + `items.jsonl` journal, reserve/commit/trash/restore, reserved sweep, `verify` integrity; napi + CLI wired |
+| Schema validation from `meta.json` | Not implemented (`meta.json` schemas block ignored) |
 | nURI `link` type enforcement | Not implemented (file refs detected heuristically by string match, not by schema) |
 | Bucket migration script for legacy data | Not bundled here (the consumer's `migrate-ndb-to-folder.js` was used in production) |
 

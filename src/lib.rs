@@ -28,6 +28,7 @@
 pub mod bucket;
 pub mod error;
 pub mod id;
+pub mod item;
 pub mod report;
 pub mod search;
 pub mod server;
@@ -35,6 +36,7 @@ pub mod storage;
 
 pub use bucket::{FileBucket, FileMeta, FileRef};
 pub use error::{Error, Result};
+pub use item::{ItemBucket, ItemRecord, ItemState};
 pub use search::{TextMode, TextQuery, TextSearch};
 
 use parking_lot::{Mutex, RwLock};
@@ -554,12 +556,25 @@ enum OnDocumentDelete {
     Trash,
 }
 
-/// Per-bucket policy parsed from `meta.json` (`buckets.<name>`, #10).
+/// The bucket's keying strategy (#9). Absence of `kind` means `"hash"` —
+/// existing databases activate nothing by upgrading the binary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BucketKind {
+    /// Content-keyed blobs: SHA-256 dedup, refcounted. The default.
+    Hash,
+    /// Item-keyed folders: engine-issued id, app streams bytes itself.
+    Items,
+}
+
+/// Per-bucket policy parsed from `meta.json` (`buckets.<name>`, #9/#10).
 #[derive(Clone, Debug, Default)]
 struct BucketPolicy {
     on_document_delete: Option<OnDocumentDelete>,
     /// Per-bucket trash TTL, overriding the database-wide one at purge.
     ttl_seconds: Option<u64>,
+    kind: Option<BucketKind>,
+    /// Reserved-item TTL for `kind: "items"` buckets (default 30 min).
+    reserved_ttl_seconds: Option<u64>,
 }
 
 /// Read `meta.json`'s bucket policy block. A missing file or block is not
@@ -610,11 +625,33 @@ fn load_bucket_policies(base_dir: &Path) -> Result<HashMap<String, BucketPolicy>
                 )
             })?),
         };
+        let kind = match block.get("kind") {
+            None => None,
+            Some(Value::String(s)) if s == "hash" => Some(BucketKind::Hash),
+            Some(Value::String(s)) if s == "items" => Some(BucketKind::Items),
+            Some(v) => {
+                return Err(Error::corruption(
+                    &meta_path,
+                    format!("buckets.{name}.kind must be \"hash\" or \"items\", got {v}"),
+                ))
+            }
+        };
+        let reserved_ttl_seconds = match block.get("reserved_ttl_seconds") {
+            None => None,
+            Some(v) => Some(v.as_u64().ok_or_else(|| {
+                Error::corruption(
+                    &meta_path,
+                    format!("buckets.{name}.reserved_ttl_seconds must be a non-negative integer, got {v}"),
+                )
+            })?),
+        };
         policies.insert(
             name.clone(),
             BucketPolicy {
                 on_document_delete,
                 ttl_seconds,
+                kind,
+                reserved_ttl_seconds,
             },
         );
     }
@@ -659,6 +696,8 @@ pub struct Database {
     /// Per-bucket policies from `meta.json`, loaded at open (#10).
     /// Empty means "no policy" — the pre-meta.json behavior.
     bucket_policies: HashMap<String, BucketPolicy>,
+    /// Item buckets declared `kind: "items"` in `meta.json` (#9).
+    item_buckets: HashMap<String, std::sync::Arc<ItemBucket>>,
 }
 
 impl Database {
@@ -743,6 +782,24 @@ impl Database {
         // literal moves base_dir.
         let bucket_policies = load_bucket_policies(&base_dir)?;
 
+        // Item buckets (#9): one ItemBucket per bucket declared
+        // `kind: "items"`, journal replayed at open. Absence of the
+        // declaration means nothing activates.
+        let mut item_buckets = HashMap::new();
+        for (name, policy) in &bucket_policies {
+            if policy.kind == Some(BucketKind::Items) {
+                let ttl = Duration::from_secs(
+                    policy
+                        .reserved_ttl_seconds
+                        .unwrap_or(item::DEFAULT_RESERVED_TTL_SECS),
+                );
+                item_buckets.insert(
+                    name.clone(),
+                    std::sync::Arc::new(ItemBucket::open(name, &base_dir, ttl)?),
+                );
+            }
+        }
+
         Ok(Database {
             path,
             base_dir,
@@ -760,6 +817,7 @@ impl Database {
             ttl_thread: Mutex::new(None),
             file_handle: Mutex::new(None),
             bucket_policies,
+            item_buckets,
         })
     }
 
@@ -782,6 +840,7 @@ impl Database {
             ttl_thread: Mutex::new(None),
             file_handle: Mutex::new(None),
             bucket_policies: HashMap::new(),
+            item_buckets: HashMap::new(),
         })
     }
 
@@ -817,6 +876,9 @@ impl Database {
         let mode = self.trash_mode;
         let ttl_dur = self.trash_ttl.unwrap();
         let bucket_policies = self.bucket_policies.clone();
+        let persistence = self.persistence;
+        let item_buckets: Vec<std::sync::Arc<ItemBucket>> =
+            self.item_buckets.values().cloned().collect();
 
         let (tx, rx) = std::sync::mpsc::channel();
         *self.ttl_tx.lock() = Some(tx);
@@ -837,6 +899,13 @@ impl Database {
                             &bucket_policies,
                         ) {
                             report::detached("ttl sweep: purge expired trash", e);
+                        }
+                        // Reserved items past their TTL are swept on the
+                        // same cadence (#9).
+                        for bucket in &item_buckets {
+                            if let Err(e) = bucket.sweep_reserved(persistence) {
+                                report::detached("ttl sweep: sweep reserved items", e);
+                            }
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break, // DB dropped
@@ -1974,7 +2043,8 @@ impl Database {
     pub fn export_snapshot<P: AsRef<Path>>(&self, target_dir: P) -> Result<()> {
         let _guard = self.writer.lock();
         let target = target_dir.as_ref();
-        
+        fs::create_dir_all(target).map_err(Error::io_err(target, "create snapshot directory"))?;
+
         let docs = self.docs.read();
         let active: Vec<&Value> = docs.values().collect();
         
@@ -2005,12 +2075,18 @@ impl Database {
                     let dst_bucket = buckets_dst.join(&bucket_name);
                     fs::create_dir_all(&dst_bucket).map_err(Error::io_err(&dst_bucket, "create snapshot bucket"))?;
                     
-                    // Copy non-trash binaries
+                    // Copy non-trash binaries; item buckets (#9) store one
+                    // folder per item, copied whole.
                     for file_entry in fs::read_dir(entry.path()).map_err(Error::io_err(&entry.path(), "read bucket files"))? {
                         let f = file_entry.map_err(Error::io_err(&entry.path(), "read active binary"))?;
                         let file_name = f.file_name();
-                        if file_name != "_trash" && f.file_type().map_or(false, |t| t.is_file()) {
+                        if file_name == "_trash" {
+                            continue;
+                        }
+                        if f.file_type().map_or(false, |t| t.is_file()) {
                             fs::copy(f.path(), dst_bucket.join(&file_name)).map_err(Error::io_err(f.path(), "copy file to snapshot"))?;
+                        } else if f.file_type().map_or(false, |t| t.is_dir()) {
+                            copy_dir_recursive(&f.path(), &dst_bucket.join(&file_name))?;
                         }
                     }
                 }
@@ -2141,6 +2217,116 @@ impl Database {
     /// Get or create a named file bucket for binary storage.
     pub fn bucket(&self, name: &str) -> FileBucket {
         FileBucket::new(name, &self.base_dir)
+    }
+
+    // ─── Item buckets (#9) ──────────────────────────────────────────
+
+    /// Access a declared item bucket. Fails unless the bucket is
+    /// declared `kind: "items"` in `meta.json` — the declaration is
+    /// what activates the kind, per the safety-by-construction rule.
+    fn item_bucket(&self, name: &str) -> Result<&std::sync::Arc<ItemBucket>> {
+        self.item_buckets.get(name).ok_or_else(|| {
+            Error::invalid_arg(format!(
+                "bucket '{name}' is not declared kind:\"items\" in meta.json"
+            ))
+        })
+    }
+
+    /// Names of all buckets declared `kind: "items"`.
+    pub fn item_bucket_names(&self) -> Vec<String> {
+        self.item_buckets.keys().cloned().collect()
+    }
+
+    /// Reserve an item: the engine creates `_files/<bucket>/<itemId>/`
+    /// and returns the id and the folder path. The application streams
+    /// bytes to that path itself — nDB is never in the ingest path.
+    pub fn create_item(&self, bucket: &str) -> Result<(String, PathBuf)> {
+        let _guard = self.writer.lock();
+        self.item_bucket(bucket)?.create(self.persistence)
+    }
+
+    /// Commit a reserved item: one journal write carrying the caller's
+    /// facts (`name`, `size`, `sha256` required; `mime` and anything
+    /// else caller-supplied). The caller computes `sha256` while
+    /// streaming — it touched every byte anyway.
+    pub fn commit_item(&self, bucket: &str, item_id: &str, facts: Value) -> Result<()> {
+        let _guard = self.writer.lock();
+        self.item_bucket(bucket)?.commit(item_id, facts, self.persistence)
+    }
+
+    /// Read one item: record JSON plus the engine-issued `path`.
+    pub fn read_item(&self, bucket: &str, item_id: &str) -> Result<Value> {
+        let b = self.item_bucket(bucket)?;
+        let record = b.get(item_id)?;
+        Ok(Self::item_record_json(b, &record))
+    }
+
+    /// List items of a bucket. `state` filters to `"reserved"` or
+    /// `"live"`; `None` lists both. Tombstoned items are never listed.
+    pub fn list_items(&self, bucket: &str, state: Option<&str>) -> Result<Vec<Value>> {
+        let filter = match state {
+            None => None,
+            Some("reserved") => Some(ItemState::Reserved),
+            Some("live") => Some(ItemState::Live),
+            Some(other) => {
+                return Err(Error::invalid_arg(format!(
+                    "item state filter must be \"reserved\" or \"live\", got '{other}'"
+                )))
+            }
+        };
+        let b = self.item_bucket(bucket)?;
+        Ok(b.list(filter)
+            .iter()
+            .map(|r| Self::item_record_json(b, r))
+            .collect())
+    }
+
+    fn item_record_json(b: &ItemBucket, record: &ItemRecord) -> Value {
+        serde_json::json!({
+            "itemId": record.id,
+            "state": match record.state {
+                ItemState::Reserved => "reserved",
+                ItemState::Live => "live",
+            },
+            "facts": record.facts,
+            "created": record.created,
+            "committed": record.committed,
+            "path": b.item_path(&record.id),
+        })
+    }
+
+    /// Delete an item: record tombstoned, folder moved to trash.
+    pub fn delete_item(&self, bucket: &str, item_id: &str) -> Result<()> {
+        let _guard = self.writer.lock();
+        self.item_bucket(bucket)?.delete(item_id, self.persistence)
+    }
+
+    /// Restore a tombstoned item: tombstone lifted, folder moved back.
+    pub fn restore_item(&self, bucket: &str, item_id: &str) -> Result<()> {
+        let _guard = self.writer.lock();
+        self.item_bucket(bucket)?.restore(item_id, self.persistence)
+    }
+
+    /// Sweep reserved items older than the bucket's
+    /// `reserved_ttl_seconds` (default 30 min): tombstoned and trashed,
+    /// exactly like delete_item. Also runs in the TTL background thread.
+    pub fn sweep_reserved_items(&self, bucket: &str) -> Result<usize> {
+        let _guard = self.writer.lock();
+        self.item_bucket(bucket)?.sweep_reserved(self.persistence)
+    }
+
+    /// Verify all item buckets: live originals match committed
+    /// `size`/`sha256` (streaming — never read whole), reserved items
+    /// have their folder, orphan folders are flagged sweepable. Returns
+    /// human-readable anomalies, each prefixed with the bucket name.
+    pub fn verify_item_buckets(&self) -> Vec<String> {
+        let mut anomalies = Vec::new();
+        for (name, bucket) in &self.item_buckets {
+            for anomaly in bucket.verify() {
+                anomalies.push(format!("{name}/{anomaly}"));
+            }
+        }
+        anomalies
     }
 
     /// Check if a string occurs anywhere in a JSON value
@@ -2364,6 +2550,21 @@ impl Database {
             *file_refs.entry(r).or_insert(0) += 1;
         }
     }
+}
+
+/// Recursive directory copy for snapshot export (item folders, #9).
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst).map_err(Error::io_err(dst, "create directory for copy"))?;
+    for entry in fs::read_dir(src).map_err(Error::io_err(src, "read directory for copy"))? {
+        let entry = entry.map_err(Error::io_err(src, "read directory entry for copy"))?;
+        let target = dst.join(entry.file_name());
+        if entry.file_type().map_or(false, |t| t.is_dir()) {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target).map_err(Error::io_err(entry.path(), "copy file"))?;
+        }
+    }
+    Ok(())
 }
 
 impl Error {

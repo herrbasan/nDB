@@ -507,6 +507,44 @@ console.log(`Garbage collection trashed ${trashedCount} files.`);
 
 ---
 
+## Item Buckets (`kind: "items"`)
+
+Buckets declared `{ "kind": "items" }` in `meta.json` manage **item folders** instead of content-hashed blobs — for app-managed assets like a media pool. The engine hands out a folder path and keeps the records; **your code streams the bytes** (any size — nDB never holds a buffer). Full semantics: [file-buckets.md](file-buckets.md#item-buckets-kind-items).
+
+```js
+// meta.json: { "buckets": { "media": { "kind": "items" } } }
+
+const { itemId, path } = db.createItem('media');
+// → path: <db>/_files/media/<itemId>/ — stream the upload there yourself,
+// computing sha256 as you go; add variants/description files freely.
+
+db.commitItem('media', itemId, {
+  name: 'original.mp4',          // required: the original's filename
+  size: 418380144,               // required: bytes
+  sha256: '9f86d08…',            // required: 64-char hex of the original
+  mime: 'video/mp4',             // optional
+  duration: 742                  // anything else passes through
+});
+
+const item = db.readItem('media', itemId);
+// → { itemId, state: 'live', facts: {...}, created, committed, path }
+
+const all = db.listItems('media');
+const abandoned = db.listItems('media', 'reserved');
+
+db.deleteItem('media', itemId);  // folder → _trash/files/media/<itemId>/, whole
+db.restoreItem('media', itemId); // folder back, tombstone lifted
+
+const swept = db.sweepReservedItems('media'); // reserved past TTL → trashed
+
+const anomalies = db.verifyItemBuckets();
+// → [] when clean; else strings like "media/itm_…: sha256 mismatch"
+```
+
+Throws on undeclared buckets (the `kind` declaration is what activates the API), on unknown/deleted item ids, on commits without `name`/`size`/`sha256`, and on double commits. `state` is `'reserved'` (created, not committed — TTL-swept) or `'live'` (committed, deletable).
+
+---
+
 ## Error Handling
 
 All methods throw on error. Use try/catch:

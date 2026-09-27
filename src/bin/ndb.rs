@@ -735,7 +735,7 @@ fn handle_verify(args: &[String]) {
         process::exit(EXIT_GENERAL_ERROR);
     }
 
-    eprintln!("[1/2] Verifying data.jsonl syntax and references...");
+    eprintln!("[1/3] Verifying data.jsonl syntax and references...");
     let mut corruptions = 0;
     
     if db_path.exists() {
@@ -765,7 +765,7 @@ fn handle_verify(args: &[String]) {
         }
     }
     
-    eprintln!("[2/2] Verifying _trash/docs/data.jsonl syntax and references...");
+    eprintln!("[2/3] Verifying _trash/docs/data.jsonl syntax and references...");
     if trash_path.exists() {
         if let Ok(file) = fs::File::open(&trash_path) {
             use std::io::{BufRead, BufReader};
@@ -782,6 +782,27 @@ fn handle_verify(args: &[String]) {
         }
     }
     
+    // Item buckets (#9): for buckets declared `kind: "items"` in
+    // meta.json, check live originals against their committed facts,
+    // reserved folders, and orphan folders. Runs through the library so
+    // the check and the engine share one implementation; if the journal
+    // itself is unreadable the syntax pass above has already reported it.
+    if db_path.exists() {
+        match ndb::Database::open(&db_path) {
+            Ok(db) if !db.item_bucket_names().is_empty() => {
+                eprintln!("[3/3] Verifying item buckets...");
+                for anomaly in db.verify_item_buckets() {
+                    eprintln!("Item bucket: {anomaly}");
+                    corruptions += 1;
+                }
+            }
+            Ok(_) => {} // no items buckets declared
+            Err(e) => {
+                eprintln!("[3/3] Item bucket check skipped: database did not open cleanly ({e})");
+            }
+        }
+    }
+
     if corruptions > 0 {
         eprintln!("Verification failed. Found {} corrupt rows/missing references.", corruptions);
         process::exit(EXIT_CORRUPTION); // Code 2

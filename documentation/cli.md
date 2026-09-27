@@ -31,7 +31,7 @@ Commands:
 | `export <path> <dest> [--consistent]` | Create a portable snapshot |
 | `import <src> <path> [--force]` | Restore a snapshot |
 | `merge <base> <merge-in> --output <dest>` | Combine two databases (resolves `_modified` collisions) |
-| `verify <path>` | Check for corruptions and missing file references |
+| `verify <path>` | Check for corruptions, missing file references, and item-bucket integrity |
 | `recover <src> --output <dest>` | Salvage surviving rows from a corrupted database |
 | `dump <path>` | Print all documents as JSON Lines to stdout |
 | `config <get\|set> <key> [value]` | Read/write `meta.json` keys (dot notation) |
@@ -146,5 +146,5 @@ constraint (zero overhead). `$in` on array fields matches elements
 - **`destroy` checks for a `.lock` marker** and refuses if present (`EXIT_LOCKED`). The library does not create `.lock`/`.readonly` markers, so these checks are effectively advisory for CLI-created databases.
 - **`config`** operates on `meta.json` in the *current directory* — run it inside the database folder.
 - **`merge`** resolves ID collisions by comparing a `_modified` field on each document; documents without it default to `0`.
-- **`verify`** checks for `_file` object references inside documents (the `{bucket, id, ext}` form) against the `_files/` tree, and validates JSON on every journal line.
+- **`verify`** checks for `_file` object references inside documents (the `{bucket, id, ext}` form) against the `_files/` tree, and validates JSON on every journal line. For buckets declared `kind: "items"` in `meta.json` it additionally verifies each live item's original against its committed `size`/`sha256`, that reserved items have their folder, and flags orphan folders.
 - The `--consistent` export flag requires a `.readonly` marker file; without it the export is treated as "crash-consistent".

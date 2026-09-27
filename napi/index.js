@@ -489,6 +489,85 @@ class Database {
   gcBuckets() {
     return this._native.gcBuckets();
   }
+
+  // ─── Item Buckets (kind: "items" in meta.json) ─────────────────────
+  //
+  // The engine hands out a folder path; the application streams bytes to
+  // it itself — nDB is never in the ingest path and never holds a buffer.
+
+  /**
+   * Reserve an item. The engine creates `_files/<bucket>/<itemId>/` and
+   * returns the id and folder path. Stream bytes to that path yourself,
+   * then call commitItem.
+   * @param {string} bucket - A bucket declared `kind: "items"` in meta.json.
+   * @returns {{ itemId: string, path: string }}
+   */
+  createItem(bucket) {
+    return JSON.parse(this._native.createItem(bucket));
+  }
+
+  /**
+   * Commit a reserved item. One write carrying the facts; `name`, `size`
+   * and `sha256` (computed by you while streaming) are required, `mime`
+   * and any other fields pass through.
+   * @param {string} bucket
+   * @param {string} itemId
+   * @param {object} facts - { name, size, sha256, mime?, ...custom }
+   */
+  commitItem(bucket, itemId, facts) {
+    this._native.commitItem(bucket, itemId, JSON.stringify(facts));
+  }
+
+  /**
+   * Read one item. Throws when unknown or deleted.
+   * @returns {{ itemId: string, state: 'reserved'|'live', facts: object|null,
+   *   created: number, committed: number|null, path: string }}
+   */
+  readItem(bucket, itemId) {
+    return JSON.parse(this._native.readItem(bucket, itemId));
+  }
+
+  /**
+   * List items of a bucket, optionally filtered by state.
+   * @param {string} bucket
+   * @param {'reserved'|'live'} [state]
+   * @returns {Array} Items in the readItem shape.
+   */
+  listItems(bucket, state) {
+    return JSON.parse(this._native.listItems(bucket, state ?? null));
+  }
+
+  /**
+   * Delete an item: record tombstoned, folder moved to trash.
+   */
+  deleteItem(bucket, itemId) {
+    this._native.deleteItem(bucket, itemId);
+  }
+
+  /**
+   * Restore a tombstoned item: tombstone lifted, folder moved back.
+   */
+  restoreItem(bucket, itemId) {
+    this._native.restoreItem(bucket, itemId);
+  }
+
+  /**
+   * Sweep reserved items older than the bucket's reserved_ttl_seconds
+   * (default 30 min): tombstoned and trashed, exactly like deleteItem.
+   * @returns {number} The number of items swept.
+   */
+  sweepReservedItems(bucket) {
+    return this._native.sweepReservedItems(bucket);
+  }
+
+  /**
+   * Verify all item buckets: live originals match committed size/sha256,
+   * reserved items have their folder, orphan folders are flagged.
+   * @returns {string[]} Anomaly descriptions; empty means clean.
+   */
+  verifyItemBuckets() {
+    return JSON.parse(this._native.verifyItemBuckets());
+  }
 }
 
 // ─── Exports ─────────────────────────────────────────────────────────

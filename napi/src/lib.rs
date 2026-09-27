@@ -652,6 +652,92 @@ impl Database {
             .map(|c| c as u32)
             .map_err(|e| Error::from_reason(format!("GC buckets failed: {}", e)))
     }
+
+    // ─── Item Buckets (#9) ───────────────────────────────────────────
+    //
+    // Buckets declared `kind: "items"` in meta.json. The engine hands out
+    // a folder path; the application streams bytes to it itself — nDB is
+    // never in the ingest path and never holds a buffer.
+
+    /// Reserve an item. Returns JSON: `{ itemId, path }` — the app streams
+    /// bytes to `path` itself, then calls `commitItem`.
+    ///
+    /// ```js
+    /// const { itemId, path } = JSON.parse(db.createItem('media'));
+    /// // stream upload bytes to <path>/original.mp4, then:
+    /// db.commitItem('media', itemId, JSON.stringify({ name, size, sha256, mime }));
+    /// ```
+    #[napi]
+    pub fn create_item(&self, bucket: String) -> Result<String> {
+        let (item_id, path) = self.inner()?.create_item(&bucket)
+            .map_err(|e| Error::from_reason(format!("Create item failed: {}", e)))?;
+        serde_json::to_string(&serde_json::json!({ "itemId": item_id, "path": path }))
+            .map_err(|e| Error::from_reason(format!("Serialization failed: {}", e)))
+    }
+
+    /// Commit a reserved item. `facts` is a JSON string; `name`, `size`
+    /// and `sha256` (of the original, computed by the caller while
+    /// streaming) are required, everything else passes through.
+    #[napi]
+    pub fn commit_item(&self, bucket: String, item_id: String, facts: String) -> Result<()> {
+        let facts: serde_json::Value = serde_json::from_str(&facts)
+            .map_err(|e| Error::from_reason(format!("Invalid JSON facts: {}", e)))?;
+        self.inner()?.commit_item(&bucket, &item_id, facts)
+            .map_err(|e| Error::from_reason(format!("Commit item failed: {}", e)))
+    }
+
+    /// Read one item: JSON `{ itemId, state, facts, created, committed, path }`.
+    /// Throws when the item is unknown or deleted.
+    #[napi]
+    pub fn read_item(&self, bucket: String, item_id: String) -> Result<String> {
+        let v = self.inner()?.read_item(&bucket, &item_id)
+            .map_err(|e| Error::from_reason(format!("Read item failed: {}", e)))?;
+        serde_json::to_string(&v)
+            .map_err(|e| Error::from_reason(format!("Serialization failed: {}", e)))
+    }
+
+    /// List items of a bucket. `state` optionally filters to
+    /// "reserved" or "live". Returns a JSON array (same shape as readItem).
+    #[napi]
+    pub fn list_items(&self, bucket: String, state: Option<String>) -> Result<String> {
+        let v = self.inner()?.list_items(&bucket, state.as_deref())
+            .map_err(|e| Error::from_reason(format!("List items failed: {}", e)))?;
+        serde_json::to_string(&v)
+            .map_err(|e| Error::from_reason(format!("Serialization failed: {}", e)))
+    }
+
+    /// Delete an item: record tombstoned, folder moved to trash.
+    #[napi]
+    pub fn delete_item(&self, bucket: String, item_id: String) -> Result<()> {
+        self.inner()?.delete_item(&bucket, &item_id)
+            .map_err(|e| Error::from_reason(format!("Delete item failed: {}", e)))
+    }
+
+    /// Restore a tombstoned item: tombstone lifted, folder moved back.
+    #[napi]
+    pub fn restore_item(&self, bucket: String, item_id: String) -> Result<()> {
+        self.inner()?.restore_item(&bucket, &item_id)
+            .map_err(|e| Error::from_reason(format!("Restore item failed: {}", e)))
+    }
+
+    /// Sweep reserved items older than the bucket's reserved_ttl_seconds
+    /// (default 30 min). Returns the number swept.
+    #[napi]
+    pub fn sweep_reserved_items(&self, bucket: String) -> Result<u32> {
+        self.inner()?.sweep_reserved_items(&bucket)
+            .map(|c| c as u32)
+            .map_err(|e| Error::from_reason(format!("Sweep reserved items failed: {}", e)))
+    }
+
+    /// Verify all item buckets: live originals match committed size/sha256,
+    /// reserved items have their folder, orphan folders flagged. Returns a
+    /// JSON array of anomaly strings; empty means clean.
+    #[napi]
+    pub fn verify_item_buckets(&self) -> Result<String> {
+        let anomalies = self.inner()?.verify_item_buckets();
+        serde_json::to_string(&anomalies)
+            .map_err(|e| Error::from_reason(format!("Serialization failed: {}", e)))
+    }
 }
 
 /// Database options for `Database.open()`.

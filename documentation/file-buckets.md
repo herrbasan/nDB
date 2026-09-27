@@ -48,8 +48,51 @@ Buckets may be *declared* in the database folder's `meta.json`, and the core enf
 - **`onDocumentDelete: "restrict"`** — deleting a document that references a file in this bucket **fails** (`PolicyViolation`) before anything moves. The caller must reassign or explicitly release the file first.
 - **`onDocumentDelete: "trash"`** — the explicit form of the default: the document's refs are released and orphaned files move to trash (refcount protection unchanged).
 - **`ttl_seconds`** — per-bucket trash TTL, used by `purge_trash()` and the background TTL sweep *instead of* the database-wide TTL for this bucket's trash. Independent of `onDocumentDelete`.
+- **`kind`** — `"hash"` (default) or `"items"`; see *Item Buckets* below.
+- **`reserved_ttl_seconds`** — reserved-item TTL for `kind: "items"` buckets (default 1800).
 
 Absence — no `meta.json`, no `buckets` block, no entry for the bucket — means exactly the default behavior. A **malformed** policy (unknown `onDocumentDelete` value, non-object block, non-numeric `ttl_seconds`, invalid JSON) fails `open()` with a corruption error: a config typo must never silently degrade to no-policy. Unknown top-level keys (`schemas`, future fields) are ignored. The file is read at open; changes require a reopen.
+
+---
+
+## Item Buckets (`kind: "items"`)
+
+A second bucket kind for app-managed assets (#9). Where a hash bucket keys blobs by content, an item bucket keys **folders** by an engine-issued item id — and the application, not the engine, moves the bytes. nDB is never in the ingest path, so there is no buffer and no size ceiling on this kind.
+
+| | `hash` (default) | `items` |
+|---|---|---|
+| identity | the content (SHA-256) | the item (`itm_…` id → folder) |
+| dedup / refcounting | yes — the point | no — an item owns its folder |
+| byte motion | `store` / `get` (whole buffers) | the app streams; nDB never holds a buffer |
+| layout | `_files/<bucket>/<hash8>.<ext>` | `_files/<bucket>/<itemId>/` + `items.jsonl` |
+| deletion | `releaseFile` / `gc_buckets` | folder → `_trash/`, whole |
+| extra files per item | none | variants, description file — opaque payload, never parsed |
+
+### Declaration
+
+```json
+{ "buckets": { "media": { "kind": "items", "reserved_ttl_seconds": 1800 } } }
+```
+
+Absence of `kind` means `"hash"` — existing databases activate nothing. Records live in an append-only journal at `_files/<bucket>/items.jsonl` (full-record lines, last write wins, tombstones mark deletions), replayed at open.
+
+### Lifecycle
+
+1. **`createItem(bucket)` → `{ itemId, path }`**, state `reserved`. The engine creates the folder; the application streams bytes to `path` itself and may add variant/description files.
+2. **`commitItem(itemId, facts)`** — one write. `name`, `size`, `sha256` are required (the caller computes the hash while streaming — it touched every byte); `mime` and any other fields pass through. State `live`. Only a reserved item can be committed.
+3. **`readItem` / `listItems(bucket, state?)`** — record + engine-issued path. Tombstoned items are never listed.
+4. **`deleteItem(itemId)`** — record tombstoned, folder moved to `_trash/files/<bucket>/<itemId>/` whole. **`restoreItem(itemId)`** reverses it.
+5. **Reserved sweep** — reserved items older than `reserved_ttl_seconds` (default 30 min) are tombstoned and trashed by `sweepReservedItems()` and by the TTL background thread. An abandoned reservation is never an undeletable empty folder.
+
+### Integrity (`verify`)
+
+`ndb verify` and `verifyItemBuckets()` check, per items bucket: every **live** item's original (`facts.name`) exists and matches its committed `size`/`sha256` (hashed streaming — originals are never read whole); every **reserved** item has its folder; every folder has a live record, else it is flagged an orphan (sweepable).
+
+The crash windows are the design: folder-without-record → orphan, sweepable; record-without-commit → reserved, TTL-swept; bytes-differ-from-facts → verify flags; folder-fails-to-move on delete → tombstone stands, folder stays, verify flags it (under-cleaning, never silent).
+
+### Non-goals
+
+No streaming store/get API in the engine (the application owns byte motion, by design), no engine knowledge of variants, no dedup or refcounting on the item kind, no cross-database sharing. The hash kind is byte- and semantics-identical to before.
 
 ---
 

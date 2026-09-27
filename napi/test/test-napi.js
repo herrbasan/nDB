@@ -985,6 +985,132 @@ test('pending work should be awaited before close releases the folder', async ()
   rmSync(moved, { recursive: true, force: true });
 });
 
+// ─── Phase 11: Item Buckets (kind: "items" in meta.json) ────────────
+
+section('Phase 11: Item Buckets');
+
+const { writeFileSync, mkdirSync: mkDir } = require('fs');
+
+const HELLO_SHA256 = 'b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9';
+
+function itemsDb(extraPolicy) {
+  const dir = createTempDir();
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify({
+    buckets: { media: { kind: 'items', ...extraPolicy } }
+  }));
+  return { db: new Database(join(dir, 'data.jsonl')), dir };
+}
+
+test('createItem requires the kind declaration', async () => {
+  const dir = createTempDir();
+  const db = new Database(join(dir, 'data.jsonl'));
+  let threw = false;
+  try { db.createItem('media'); } catch (e) { threw = true; }
+  assert(threw, 'createItem without declaration should throw');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('reserve → stream → commit → read → list → delete → restore', async () => {
+  const { db, dir } = itemsDb();
+
+  // Reserve: engine hands out the folder path.
+  const { itemId, path } = db.createItem('media');
+  assert(itemId.startsWith('itm_'), 'item id should be itm_-prefixed');
+  assert(existsSync(path), 'item folder should exist');
+  assertEqual(db.readItem('media', itemId).state, 'reserved', 'fresh item is reserved');
+
+  // The application streams bytes itself; variants + description are
+  // opaque payload.
+  writeFileSync(join(path, 'photo.png'), 'hello world');
+  writeFileSync(join(path, 'photo_720.webp'), 'variant');
+  writeFileSync(join(path, 'asset.json'), '{"title":"x"}');
+
+  // Commit: one write; custom facts pass through.
+  db.commitItem('media', itemId, {
+    name: 'photo.png', size: 11, mime: 'image/png', sha256: HELLO_SHA256,
+    custom: { width: 100 }
+  });
+  const rec = db.readItem('media', itemId);
+  assertEqual(rec.state, 'live', 'committed item is live');
+  assertEqual(rec.facts.custom.width, 100, 'caller facts preserved');
+  assertEqual(db.verifyItemBuckets(), [], 'verify should be clean');
+
+  // List + state filter.
+  assertEqual(db.listItems('media').length, 1, 'one item listed');
+  assertEqual(db.listItems('media', 'reserved').length, 0, 'none reserved');
+  assertEqual(db.listItems('media', 'live').length, 1, 'one live');
+
+  // Delete: folder moves to trash whole.
+  db.deleteItem('media', itemId);
+  let threw = false;
+  try { db.readItem('media', itemId); } catch (e) { threw = true; }
+  assert(threw, 'deleted item should not read');
+  assert(!existsSync(path), 'folder should leave the active bucket');
+  assert(
+    existsSync(join(dir, '_trash', 'files', 'media', itemId, 'photo_720.webp')),
+    'trash should hold the whole folder, variants included'
+  );
+
+  // Restore: tombstone lifted, folder back whole.
+  db.restoreItem('media', itemId);
+  assertEqual(db.readItem('media', itemId).state, 'live', 'restored item is live');
+  assert(existsSync(join(path, 'asset.json')), 'description file restored too');
+  assertEqual(db.verifyItemBuckets(), [], 'verify clean after restore');
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('commitItem validates facts', async () => {
+  const { db, dir } = itemsDb();
+  const { itemId } = db.createItem('media');
+
+  for (const bad of [
+    { size: 11, sha256: HELLO_SHA256 },                    // no name
+    { name: 'x', sha256: HELLO_SHA256 },                   // no size
+    { name: 'x', size: 11 },                               // no sha256
+    { name: 'x', size: 11, sha256: 'nothex' },             // bad sha256
+  ]) {
+    let threw = false;
+    try { db.commitItem('media', itemId, bad); } catch (e) { threw = true; }
+    assert(threw, `facts ${JSON.stringify(bad)} should throw`);
+  }
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('sweepReservedItems sweeps stale reservations only', async () => {
+  const { db, dir } = itemsDb({ reserved_ttl_seconds: 0 });
+
+  // A live item and an abandoned reservation.
+  const { itemId: live, path: livePath } = db.createItem('media');
+  writeFileSync(join(livePath, 'photo.png'), 'hello world');
+  db.commitItem('media', live, { name: 'photo.png', size: 11, sha256: HELLO_SHA256 });
+  const { itemId: stale, path: stalePath } = db.createItem('media');
+
+  assertEqual(db.sweepReservedItems('media'), 1, 'one stale reservation swept');
+  assert(!existsSync(stalePath), 'swept folder trashed');
+  assertEqual(db.readItem('media', live).state, 'live', 'live item untouched');
+  assertEqual(db.sweepReservedItems('media'), 0, 'nothing left to sweep');
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('item records replay across reopen', async () => {
+  const { db, dir } = itemsDb();
+  const { itemId, path } = db.createItem('media');
+  writeFileSync(join(path, 'photo.png'), 'hello world');
+  db.commitItem('media', itemId, { name: 'photo.png', size: 11, sha256: HELLO_SHA256 });
+  const { itemId: reserved } = db.createItem('media');
+  db.close();
+
+  const db2 = new Database(join(dir, 'data.jsonl'));
+  assertEqual(db2.readItem('media', itemId).state, 'live', 'committed item replayed');
+  assertEqual(db2.readItem('media', reserved).state, 'reserved', 'reserved item replayed');
+  assertEqual(db2.verifyItemBuckets(), [], 'verify clean after reopen');
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
 // ─── Results ─────────────────────────────────────────────────────────
 
 await run();

@@ -279,7 +279,7 @@ The canonical folder-per-database layout (as used by LLM-Gateway-Chat and create
 ```
 my-app/
 ├── data.jsonl              # Document store (JSON Lines) — passed to Database::open
-├── meta.json               # Engine metadata (version, buckets, schemas). Written by CLI/migration; the core enforces the `buckets` policy block (onDocumentDelete, ttl_seconds) — schemas are ignored for now.
+├── meta.json               # Engine metadata (version, buckets, schemas). Written by CLI/migration; the core enforces the `buckets` policy block (kind, onDocumentDelete, ttl_seconds, reserved_ttl_seconds) — schemas are ignored for now.
 ├── _files/                 # File buckets root (created implicitly by bucket operations)
 │   ├── avatars/            # Named bucket "avatars"
 │   │   ├── a1b2c3d4.png    # Stored by SHA-256 hash prefix
