@@ -211,19 +211,20 @@ In Rust a `Result` is a returned value: it cannot crash anything, and the caller
 
 At the napi boundary an `Err` becomes a **JavaScript exception** — the established contract, and a fine one: a caught exception lets an application report a failed operation and carry on. What it does *not* tolerate is a failure that cannot be caught at all.
 
-So the boundary makes three guarantees, and they are about crash-and-data, not about avoiding exceptions:
+So the boundary makes four guarantees, and they are about crash-and-data, not about avoiding exceptions:
 
 - **No process abort.** Panics abort outright and cannot be caught on either side, so caller-supplied shape is validated rather than unwrapped — a non-object document raises a catchable error instead of taking the host down. A poisoned lock is reported for the same reason.
 - **A delete is never reported as reversible when it is not.** The restorable copy is written before anything destructive, so an unrecordable delete is refused rather than reported as success. This is delete-specific; see the caveat below.
 - **Cleanup never fails the operation.** Moving files to trash, sweeping buckets, purging trash and flushing at shutdown report failures on stderr (`ndb: suppressed failure: ...`) and leave the primary result intact. `gc_buckets()` returns a count of files that actually moved.
+- **A failed journal write changes nothing.** Every mutating operation — `insert`, `update`, the delta ops `set`/`remove`/`array_push`, and `delete` — appends to the journal *before* any in-memory, index, ref-counter or file-bucket state is touched. If the append fails, the call raises and the document, indexes, ref counts, live blobs and the journal itself are exactly as they were; the operation is retryable. What happens after a successful append is infallible bookkeeping or reported cleanup.
 
 The asymmetry is deliberate: protecting the data that exists outranks every reporting preference.
 
-#### What is not guaranteed yet
+#### The ordering contract
 
-**Atomicity across a failed journal write.** The delete path was reordered so that a failed append cannot strand anything, but the write paths were not. `update()`, `set()`, `remove()` and `arrayPush()` relinquish orphaned files and update in-memory indexes *before* appending to the journal (`src/lib.rs`, `handle_ref_delta_and_trash` before the append in `update`). If that append fails the call raises and the previous document version is still stored — but a file the document no longer references may already have moved to trash, leaving a live document pointing at media it cannot read.
+The write paths run prepare → journal → commit. The delete path adds a precondition before all of it (the restorable copy), and file moves run last inside the commit — a file that fails to move after the commit is under-cleaning: named, reported, and swept by `gc_buckets` later, never a silent loss. The contract is pinned by fault-injected tests (`tests/phase9_failure_discipline_tests.rs`): the journal path is replaced by a directory so the append-open fails, and the tests assert that document, indexes, ref counters, blobs and the replayed journal are all untouched — and that the same operation succeeds whole on retry.
 
-This predates the failure-discipline work and is tracked as issue #7. Fixing it means preparing the change, appending to the journal, and only then committing in-memory, index and file-bucket state, with tests that inject append failures. Until that lands, do not read the delete guarantee as a database-wide all-or-nothing promise.
+This was the resolution of issue #7: before the reorder, `update` and the delta ops mutated memory, indexes and ref counters *before* the append, so a failed write could trash live media while the document stayed old.
 
 ### Trash Modes
 

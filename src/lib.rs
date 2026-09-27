@@ -972,10 +972,10 @@ impl Database {
             .ok_or_else(|| Error::not_found(id))
     }
 
-    /// Sync secondary indexes for a document that was mutated in place
-    /// (delta ops: array_push / set / remove). Removes the old doc's indexed
-    /// values, inserts the new ones. Caller must hold the writer lock and
-    /// pass the doc's pre-mutation snapshot.
+    /// Sync secondary indexes after a document commit (delta ops:
+    /// array_push / set / remove). Removes the old doc's indexed values,
+    /// inserts the new ones. Caller must hold the writer lock, pass the
+    /// doc's pre-commit snapshot, and commit the new doc to the store first.
     fn reindex_doc(&self, id: &str, old_doc: &Value) {
         let mut indexes = self.indexes.write();
         {
@@ -1113,15 +1113,22 @@ impl Database {
 
     /// Update a document. Appends new version to file, old version superseded.
     /// O(1) operation.
+    ///
+    /// Ordering contract (#7): the journal append happens *before* any
+    /// in-memory, index, ref-counter or file-bucket state is touched. A
+    /// failed append therefore leaves every observable state exactly as it
+    /// was and the caller may retry; everything after the append is
+    /// infallible bookkeeping or reported cleanup.
     pub fn update(&self, id: &str, mut new_doc: Value) -> Result<()> {
         let _guard = self.writer.lock();
 
-        {
+        let old_doc = {
             let docs = self.docs.read();
-            if !docs.contains_key(id) {
-                return Err(Error::not_found(id));
+            match docs.get(id) {
+                Some(doc) => doc.clone(),
+                None => return Err(Error::not_found(id)),
             }
-        }
+        };
 
         // Set _id on new doc. Same caller-shape rule as `insert`.
         new_doc
@@ -1129,32 +1136,7 @@ impl Database {
             .ok_or_else(|| Error::invalid_arg("document must be a JSON object"))?
             .insert("_id".to_string(), Value::String(id.to_string()));
 
-        // Remove old values from indexes, add new
-        let mut old_doc_clone = None;
-        let mut indexes = self.indexes.write();
-        {
-            let docs = self.docs.read();
-            if let Some(old_doc) = docs.get(id) {
-                old_doc_clone = Some(old_doc.clone());
-                for (field, index) in indexes.iter_mut() {
-                    if let Some(old_val) = old_doc.get(field) {
-                        index.remove(old_val, id);
-                    }
-                }
-            }
-        }
-        for (field, index) in indexes.iter_mut() {
-            if let Some(val) = new_doc.get(field) {
-                index.insert(val, id);
-            }
-        }
-        drop(indexes);
-
-        if let Some(old) = old_doc_clone.clone() {
-            self.handle_ref_delta_and_trash(&old, &new_doc);
-        }
-
-        // Append to file
+        // Journal first: until the append succeeds, nothing else may move.
         if !self.is_in_memory() {
             let line = serde_json::to_string(&new_doc)?;
             let mut handle = self.get_file_handle()?;
@@ -1170,15 +1152,27 @@ impl Database {
             }
         }
 
-        // Update in-memory store
-        let mut docs = self.docs.write();
-        docs.insert(id.to_string(), new_doc.clone());
-        drop(docs);
-
-        // Full-text indexes (old_doc_clone is the pre-update snapshot)
-        if let Some(old) = &old_doc_clone {
-            self.retext_doc(id, old);
+        // Commit in-memory state: the write is durable, the rest is
+        // infallible bookkeeping or reported cleanup.
+        {
+            let mut indexes = self.indexes.write();
+            for (field, index) in indexes.iter_mut() {
+                if let Some(old_val) = old_doc.get(field) {
+                    index.remove(old_val, id);
+                }
+                if let Some(val) = new_doc.get(field) {
+                    index.insert(val, id);
+                }
+            }
         }
+        self.docs.write().insert(id.to_string(), new_doc.clone());
+
+        // Full-text indexes (old_doc is the pre-update snapshot)
+        self.retext_doc(id, &old_doc);
+
+        // Ref-count delta and orphan cleanup, last: a file that fails to
+        // move is under-cleaning — named, reported, swept by gc later.
+        self.handle_ref_delta_and_trash(&old_doc, &new_doc);
 
         Ok(())
     }
@@ -1190,24 +1184,20 @@ impl Database {
     pub fn array_push(&self, id: &str, field: &str, value: Value) -> Result<()> {
         let _guard = self.writer.lock();
 
-        let old_doc;
-        {
-            let mut docs = self.docs.write();
-            if let Some(doc) = docs.get_mut(id) {
-                old_doc = Some(doc.clone());
-                apply_path_push(doc, field, value.clone());
-                if let Some(old) = &old_doc {
-                    self.handle_ref_delta_and_trash(old, doc);
-                }
-            } else {
-                return Err(Error::not_found(id));
+        let old_doc = {
+            let docs = self.docs.read();
+            match docs.get(id) {
+                Some(doc) => doc.clone(),
+                None => return Err(Error::not_found(id)),
             }
-        }
+        };
 
-        // Reindex: delta writes change indexed field values just like update()
-        self.reindex_doc(id, old_doc.as_ref().unwrap());
+        // Apply the path op to a snapshot: the stored document does not
+        // move until the journal holds the patch (#7).
+        let mut new_doc = old_doc.clone();
+        apply_path_push(&mut new_doc, field, value.clone());
 
-        // Write patch to file
+        // Journal first.
         if !self.is_in_memory() {
             let patch = serde_json::json!({
                 "_id": id,
@@ -1229,6 +1219,11 @@ impl Database {
             }
         }
 
+        // Commit: store the new state, then sync indexes and ref counters.
+        self.docs.write().insert(id.to_string(), new_doc.clone());
+        self.reindex_doc(id, &old_doc);
+        self.handle_ref_delta_and_trash(&old_doc, &new_doc);
+
         Ok(())
     }
 
@@ -1240,23 +1235,18 @@ impl Database {
     pub fn set(&self, id: &str, path: &str, value: Value) -> Result<()> {
         let _guard = self.writer.lock();
 
-        let old_doc;
-        {
-            let mut docs = self.docs.write();
-            if let Some(doc) = docs.get_mut(id) {
-                old_doc = Some(doc.clone());
-                apply_path_set(doc, path, value.clone());
-                if let Some(old) = &old_doc {
-                    self.handle_ref_delta_and_trash(old, doc);
-                }
-            } else {
-                return Err(Error::not_found(id));
+        let old_doc = {
+            let docs = self.docs.read();
+            match docs.get(id) {
+                Some(doc) => doc.clone(),
+                None => return Err(Error::not_found(id)),
             }
-        }
+        };
 
-        // Reindex: a set can change an indexed field's value
-        self.reindex_doc(id, old_doc.as_ref().unwrap());
+        let mut new_doc = old_doc.clone();
+        apply_path_set(&mut new_doc, path, value.clone());
 
+        // Journal first (#7).
         if !self.is_in_memory() {
             let patch = serde_json::json!({
                 "_id": id,
@@ -1278,6 +1268,11 @@ impl Database {
             }
         }
 
+        // Commit: store the new state, then sync indexes and ref counters.
+        self.docs.write().insert(id.to_string(), new_doc.clone());
+        self.reindex_doc(id, &old_doc);
+        self.handle_ref_delta_and_trash(&old_doc, &new_doc);
+
         Ok(())
     }
 
@@ -1289,23 +1284,18 @@ impl Database {
     pub fn remove(&self, id: &str, path: &str) -> Result<()> {
         let _guard = self.writer.lock();
 
-        let old_doc;
-        {
-            let mut docs = self.docs.write();
-            if let Some(doc) = docs.get_mut(id) {
-                old_doc = Some(doc.clone());
-                apply_path_remove(doc, path);
-                if let Some(old) = &old_doc {
-                    self.handle_ref_delta_and_trash(old, doc);
-                }
-            } else {
-                return Err(Error::not_found(id));
+        let old_doc = {
+            let docs = self.docs.read();
+            match docs.get(id) {
+                Some(doc) => doc.clone(),
+                None => return Err(Error::not_found(id)),
             }
-        }
+        };
 
-        // Reindex: a remove can delete an indexed field
-        self.reindex_doc(id, old_doc.as_ref().unwrap());
+        let mut new_doc = old_doc.clone();
+        apply_path_remove(&mut new_doc, path);
 
+        // Journal first (#7).
         if !self.is_in_memory() {
             let patch = serde_json::json!({
                 "_id": id,
@@ -1325,6 +1315,11 @@ impl Database {
                 }
             }
         }
+
+        // Commit: store the new state, then sync indexes and ref counters.
+        self.docs.write().insert(id.to_string(), new_doc.clone());
+        self.reindex_doc(id, &old_doc);
+        self.handle_ref_delta_and_trash(&old_doc, &new_doc);
 
         Ok(())
     }

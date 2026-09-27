@@ -232,3 +232,114 @@ fn restore_returns_the_document_even_when_a_trashed_file_is_gone() {
 
     let _ = dir;
 }
+
+// ─── Journal-first ordering: a failed append moves nothing (#7) ─────
+//
+// The injection is the #7 probe shape: compact() drops the cached journal
+// handle, then the journal path is replaced by a directory so the next
+// append-open fails. The contract under test: update / set / array_push /
+// remove must leave the document, the secondary indexes, the ref counters,
+// the live blobs and the journal itself exactly as they were — and succeed
+// whole on retry.
+
+/// Replace the journal with a directory so the next append-open fails.
+/// Returns the path the original journal was moved aside to.
+fn break_journal(dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    let journal = dir.path().join("data.jsonl");
+    let aside = dir.path().join("data.jsonl.aside");
+    fs::rename(&journal, &aside).unwrap();
+    fs::create_dir(&journal).unwrap();
+    (journal, aside)
+}
+
+fn heal_journal(journal: &std::path::Path, aside: &std::path::Path) {
+    fs::remove_dir(journal).unwrap();
+    fs::rename(aside, journal).unwrap();
+}
+
+#[test]
+fn a_failed_journal_append_leaves_update_state_untouched() {
+    let (db, dir) = disk_db();
+
+    // A live media ref and an indexed field — the state the #7 probe showed
+    // being destroyed by a failed write.
+    let bucket = db.bucket("images");
+    let meta = bucket
+        .store("avatar.png", b"avatar bytes", "image/png")
+        .unwrap();
+    db.create_index("version").unwrap();
+    let id = db
+        .insert(json!({
+            "version": "old",
+            "avatar": meta._file.to_string_compact()
+        }))
+        .unwrap();
+    db.compact().unwrap(); // close the journal handle so the open below fails
+
+    let (journal, aside) = break_journal(&dir);
+    let err = db.update(&id, json!({"version": "new"})).unwrap_err();
+    assert!(matches!(err, Error::Io { .. }), "expected I/O error, got {err:?}");
+
+    // Document, index, ref counters and the blob itself: all as they were.
+    let doc = db.get(&id).unwrap();
+    assert_eq!(doc["version"], json!("old"));
+    assert_eq!(doc["avatar"], json!(meta._file.to_string_compact()));
+    assert_eq!(db.find("version", &json!("old")).len(), 1);
+    assert!(db.find("version", &json!("new")).is_empty());
+    assert!(
+        bucket.exists(&meta._file),
+        "live media trashed by a failed write — the #7 defect"
+    );
+
+    // Retry path: heal the journal and the same update commits whole —
+    // including the ref-counted cleanup that the failed attempt skipped.
+    heal_journal(&journal, &aside);
+    db.update(&id, json!({"version": "new"})).unwrap();
+    let doc = db.get(&id).unwrap();
+    assert_eq!(doc["version"], json!("new"));
+    assert!(doc.get("avatar").is_none());
+    assert!(
+        !bucket.exists(&meta._file),
+        "committed update should trash the orphaned blob"
+    );
+    assert_eq!(db.find("version", &json!("new")).len(), 1);
+}
+
+#[test]
+fn failed_delta_ops_leave_the_document_and_journal_untouched() {
+    let (db, dir) = disk_db();
+    let id = db
+        .insert(json!({"v": 1, "list": [1], "keep": true}))
+        .unwrap();
+    db.compact().unwrap();
+
+    let (journal, aside) = break_journal(&dir);
+    assert!(db.set(&id, "v", json!(2)).is_err());
+    assert!(db.array_push(&id, "list", json!(2)).is_err());
+    assert!(db.remove(&id, "keep").is_err());
+
+    // Nothing moved in memory.
+    assert_eq!(
+        db.get(&id).unwrap(),
+        json!({"_id": id, "v": 1, "list": [1], "keep": true})
+    );
+
+    // And nothing reached the journal: replayed from scratch, the database
+    // shows the same untouched document.
+    drop(db);
+    heal_journal(&journal, &aside);
+    let db = Database::open(dir.path().join("data.jsonl")).unwrap();
+    assert_eq!(
+        db.get(&id).unwrap(),
+        json!({"_id": id, "v": 1, "list": [1], "keep": true})
+    );
+
+    // The same ops succeed whole on retry.
+    db.set(&id, "v", json!(2)).unwrap();
+    db.array_push(&id, "list", json!(2)).unwrap();
+    db.remove(&id, "keep").unwrap();
+    assert_eq!(
+        db.get(&id).unwrap(),
+        json!({"_id": id, "v": 2, "list": [1, 2]})
+    );
+}

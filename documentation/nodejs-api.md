@@ -527,10 +527,9 @@ Common errors:
 - `Delete failed: I/O error at {path}: ...` — the deletion could not be recorded; nothing was deleted
 - `Failed to open database: ...` — Constructor failure
 
-Three guarantees hold behind those errors:
+Four guarantees hold behind those errors:
 
 - **No process abort.** Caller-supplied shape is validated rather than unwrapped, so bad input raises a catchable error instead of killing the process.
 - **A delete is never reported as reversible when it is not.** The restorable copy is written before anything destructive, so a delete that cannot record it is refused rather than reported as success.
 - **Cleanup never fails the operation.** Moving files to trash, sweeping buckets and purging trash report failures on stderr (`ndb: suppressed failure: ...`) and leave the primary result intact.
-
-**Not yet guaranteed: atomicity across a failed journal write.** `update()`, `set()`, `remove()` and `arrayPush()` retire orphaned files and update in-memory indexes before appending to the journal. If that append fails, the call throws and the previous document version is still stored — but a file it no longer references may already have moved to trash, leaving a live document with a reference it can no longer read. Tracked as issue #7, and not a behaviour introduced by the delete or lifecycle fixes.
+- **A failed journal write changes nothing.** `insert()`, `update()`, `set()`, `remove()`, `arrayPush()` and `delete()` append to the journal before any in-memory, index or file state is touched. If the append throws, the document, indexes, ref counts, blobs and journal are exactly as they were, and the call can be retried. (Resolved issue #7; pinned by fault-injected tests in the Rust suite.)
