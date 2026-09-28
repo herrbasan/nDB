@@ -20,6 +20,31 @@ fn fatal(msg: &str) -> ! {
     process::exit(EXIT_GENERAL_ERROR);
 }
 
+/// Read the `buckets` block in either form: the library's object form
+/// (`{"name": {policy}}`, #10) or the legacy CLI name array (`["name"]`).
+/// Legacy names map to an empty policy. The CLI writes the object form;
+/// the array form is read-compat for databases created by older binaries
+/// (B1).
+fn buckets_map(meta: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    match meta.get("buckets") {
+        Some(serde_json::Value::Object(obj)) => {
+            for (name, block) in obj {
+                out.insert(name.clone(), block.clone());
+            }
+        }
+        Some(serde_json::Value::Array(items)) => {
+            for item in items {
+                if let Some(name) = item.as_str() {
+                    out.insert(name.to_string(), serde_json::json!({}));
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -176,12 +201,20 @@ fn handle_init(args: &[String]) {
         process::exit(EXIT_GENERAL_ERROR);
     }
 
-    // Create meta.json
-    let meta_json = format!(
-        "{{\n  \"version\": 1,\n  \"created\": {},\n  \"buckets\": {:?}\n}}\n",
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
-        buckets
-    );
+    // Create meta.json. Buckets are written in the object form the
+    // library's policy loader expects (B1): name → empty policy block.
+    let buckets_obj: serde_json::Map<String, serde_json::Value> =
+        buckets.iter().map(|b| (b.clone(), serde_json::json!({}))).collect();
+    let meta = serde_json::json!({
+        "version": 1,
+        "created": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+        "buckets": buckets_obj,
+    });
+    let meta_json = serde_json::to_string_pretty(&meta)
+        .unwrap_or_else(|e| fatal(&format!("serialize meta.json: {e}")));
     if let Err(e) = fs::write(path.join("meta.json"), meta_json) {
         eprintln!("Failed to write meta.json: {}", e);
         process::exit(EXIT_GENERAL_ERROR);
@@ -285,9 +318,9 @@ fn handle_info(args: &[String]) {
         doc_count = reader.lines().count().saturating_sub(1);
     }
 
-    let buckets = meta.get("buckets").and_then(|v| v.as_array()).map(|a| {
-        a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()
-    }).unwrap_or_default();
+    // Both forms are read: object blocks from the library (#10), legacy
+    // name arrays from older CLIs (B1).
+    let buckets = buckets_map(&meta);
 
     println!("Status: Valid");
     println!("Database Path: {}", path.display());
@@ -308,7 +341,7 @@ fn handle_info(args: &[String]) {
         println!("Buckets: None configured");
     } else {
         println!("Buckets:");
-        for bucket in buckets {
+        for bucket in buckets.keys() {
             let bucket_dir = path.join("_files").join(bucket);
             let mut bucket_size = 0;
             let mut file_count = 0;
@@ -618,8 +651,11 @@ fn handle_merge(args: &[String]) {
         fatal(&format!("create trash directory: {e}"));
     }
 
-    // Copy and merge meta.json
-    // Read meta from both, union their buckets array.
+    // Copy and merge meta.json: union their buckets, written in the
+    // object form the library expects. Both forms are read — legacy name
+    // arrays from old CLIs, object blocks with policies from the library
+    // (#10) — and policy blocks are preserved. When both sides declare the
+    // same bucket, the base policy wins (deterministic; B1).
     let base_meta_path = base_path.join("meta.json");
     let merge_meta_path = merge_path.join("meta.json");
     
@@ -634,29 +670,18 @@ fn handle_merge(args: &[String]) {
         serde_json::json!({})
     };
 
-    let mut buckets_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if let Some(arr) = meta.get("buckets").and_then(|v| v.as_array()) {
-        for b in arr {
-            if let Some(s) = b.as_str() {
-                buckets_set.insert(s.to_string());
-            }
-        }
-    }
-    
+    let mut buckets = buckets_map(&meta);
     if merge_meta_path.exists() {
-        let content = fs::read_to_string(&merge_meta_path).unwrap_or_default();
-        if let Ok(merge_meta) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(arr) = merge_meta.get("buckets").and_then(|v| v.as_array()) {
-                for b in arr {
-                    if let Some(s) = b.as_str() {
-                        buckets_set.insert(s.to_string());
-                    }
-                }
-            }
+        let content = fs::read_to_string(&merge_meta_path)
+            .unwrap_or_else(|e| fatal(&format!("read {}: {e}", merge_meta_path.display())));
+        let merge_meta: serde_json::Value = serde_json::from_str(&content)
+            .unwrap_or_else(|e| fatal(&format!("parse {}: {e}", merge_meta_path.display())));
+        for (name, block) in buckets_map(&merge_meta) {
+            buckets.entry(name).or_insert(block);
         }
     }
-    
-    meta["buckets"] = serde_json::Value::Array(buckets_set.into_iter().map(serde_json::Value::String).collect());
+
+    meta["buckets"] = serde_json::Value::Object(buckets);
     
     let meta_json = serde_json::to_string_pretty(&meta)
         .unwrap_or_else(|e| fatal(&format!("serialize meta.json: {e}")));
@@ -840,12 +865,16 @@ fn handle_recover(args: &[String]) {
             fatal(&format!("copy meta.json: {e}"));
         }
     } else {
-        // Mock a meta if missing
-        let meta_json = format!(
-            "{{\n  \"version\": 1,\n  \"created\": {},\n  \"buckets\": []\n}}\n", 
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
-        );
-        if let Err(e) = fs::write(&meta_dst, meta_json) {
+        // Mock a meta if missing (object-form buckets; B1)
+        let meta = serde_json::json!({
+            "version": 1,
+            "created": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            "buckets": {},
+        });
+        if let Err(e) = fs::write(&meta_dst, serde_json::to_string_pretty(&meta).unwrap()) {
             fatal(&format!("write meta.json: {e}"));
         }
     }
@@ -975,7 +1004,10 @@ fn handle_config(args: &[String]) {
     }
 
     let mut meta: serde_json::Value = match fs::read_to_string(meta_path) {
-        Ok(c) => serde_json::from_str(&c).unwrap_or(serde_json::json!({})),
+        Ok(c) => serde_json::from_str::<serde_json::Value>(&c).unwrap_or_else(|e| {
+            eprintln!("Error: meta.json is not valid JSON: {e}");
+            process::exit(EXIT_GENERAL_ERROR);
+        }),
         Err(e) => {
             eprintln!("Failed to read meta.json: {}", e);
             process::exit(EXIT_GENERAL_ERROR);
@@ -1000,9 +1032,18 @@ fn handle_config(args: &[String]) {
         }
     } else if action == "set" {
         if let Some(value_str) = val {
-            let parsed_val: serde_json::Value = if value_str.contains(',') && key == "buckets" {
-                let vec: Vec<serde_json::Value> = value_str.split(',').map(|s| serde_json::Value::String(s.trim().to_string())).collect();
-                serde_json::Value::Array(vec)
+            // `buckets` is set as a comma-separated name list and stored in
+            // the object form the library expects; a policy block already
+            // present for a listed name is preserved (B1). Also covers the
+            // single-name case, which previously wrote a bare string.
+            let parsed_val: serde_json::Value = if key == "buckets" {
+                let mut existing = buckets_map(&meta);
+                let mut out = serde_json::Map::new();
+                for name in value_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    let block = existing.remove(name).unwrap_or_else(|| serde_json::json!({}));
+                    out.insert(name.to_string(), block);
+                }
+                serde_json::Value::Object(out)
             } else if let Ok(num) = value_str.parse::<i64>() {
                 serde_json::Value::Number(num.into())
             } else if let Ok(v) = serde_json::from_str(&value_str) {

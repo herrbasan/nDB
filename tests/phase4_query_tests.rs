@@ -167,10 +167,10 @@ fn query_nested_array_field() {
     db.insert(json!({"messages": [{"role": "user"}, {"role": "assistant"}]})).unwrap();
     db.insert(json!({"messages": [{"role": "system"}, {"role": "user"}]})).unwrap();
 
-    let results = db.query(json!({"messages.0.role": {"$eq": "user"}}));
+    let results = db.query(json!({"messages.0.role": {"$eq": "user"}})).unwrap();
     assert_eq!(results.len(), 1, "messages.0.role must resolve through the array");
 
-    let results = db.query(json!({"messages.1.role": {"$eq": "user"}}));
+    let results = db.query(json!({"messages.1.role": {"$eq": "user"}})).unwrap();
     assert_eq!(results.len(), 1, "messages.1.role must resolve through the array");
 }
 
@@ -185,7 +185,7 @@ fn query_sort_nested_field() {
     let results = db.query_with(
         json!({}),
         QueryOptions { sort_by: Some(("meta.views".to_string(), SortDir::Desc)), ..Default::default() },
-    );
+    ).unwrap();
     assert_eq!(results[0]["name"], "b", "sort by meta.views desc must order by nested value");
     assert_eq!(results[2]["name"], "c");
 }
@@ -204,6 +204,38 @@ fn validate_query_ast_rejects_unknown_operators() {
     assert!(ndb::validate_query_ast(&json!({"$and": []})).is_err(), "empty $and");
 }
 
+/// G4: the library query paths validate the AST themselves — a typo'd
+/// operator is an error on every path (library, napi, CLI-adjacent), not
+/// just HTTP. Previously `$eqq` silently matched EVERY document.
+#[test]
+fn query_rejects_unknown_operators_loudly() {
+    let (db, _dir) = setup();
+    populate_db(&db);
+
+    for bad in [
+        json!({"status": {"$eqq": "typo"}}),
+        json!({"$where": "something"}),
+        json!({"$and": [{"a": {"$gtee": 1}}]}),
+        json!({"meta": {"a": 1}}), // object value read as operator object
+        json!("not an object"),
+    ] {
+        let err = db.query(bad.clone()).unwrap_err();
+        assert!(
+            matches!(err, ndb::Error::InvalidArgument { .. }),
+            "query({bad}) returned {err:?}"
+        );
+        assert!(
+            db.query_with(bad.clone(), QueryOptions::default()).is_err(),
+            "query_with({bad}) must validate too"
+        );
+    }
+
+    // The lie is dead: 5 docs in the DB, a typo'd query no longer returns all 5.
+    // Valid queries unaffected.
+    assert_eq!(db.query(json!({})).unwrap().len(), 5);
+    assert_eq!(db.query(json!({"status": {"$eq": "active"}})).unwrap().len(), 3);
+}
+
 /// Prereq #5: query_projected returns only requested fields (+_id), honoring
 /// sort/offset/limit, without cloning full documents.
 #[test]
@@ -217,7 +249,7 @@ fn query_projected_returns_only_requested_fields() {
         QueryOptions { sort_by: Some(("score".to_string(), SortDir::Desc)), ..Default::default() },
         Some(&fields),
         None,
-    );
+    ).unwrap();
     assert_eq!(total, 3);
     assert_eq!(results.len(), 3);
     assert_eq!(results[0]["name"], "alice", "sorted by score desc: alice 150, diana 95, bob 80");
@@ -233,7 +265,7 @@ fn query_projected_returns_only_requested_fields() {
         QueryOptions { sort_by: Some(("score".to_string(), SortDir::Desc)), offset: Some(1), limit: Some(1), ..Default::default() },
         Some(&fields),
         None,
-    );
+    ).unwrap();
     assert_eq!(total, 3, "total must be the pre-pagination match count");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["name"], "diana");
@@ -256,7 +288,7 @@ fn query_eq() {
     let (db, _dir) = setup();
     populate_db(&db);
 
-    let results = db.query(json!({"name": {"$eq": "alice"}}));
+    let results = db.query(json!({"name": {"$eq": "alice"}})).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["name"], "alice");
 }
@@ -266,7 +298,7 @@ fn query_implicit_eq() {
     let (db, _dir) = setup();
     populate_db(&db);
 
-    let results = db.query(json!({"name": "bob"}));
+    let results = db.query(json!({"name": "bob"})).unwrap();
     assert_eq!(results.len(), 1);
 }
 
@@ -275,7 +307,7 @@ fn query_ne() {
     let (db, _dir) = setup();
     populate_db(&db);
 
-    let results = db.query(json!({"status": {"$ne": "active"}}));
+    let results = db.query(json!({"status": {"$ne": "active"}})).unwrap();
     assert_eq!(results.len(), 2); // charlie, eve
 }
 
@@ -284,10 +316,10 @@ fn query_gt_lt() {
     let (db, _dir) = setup();
     populate_db(&db);
 
-    let gt = db.query(json!({"score": {"$gt": 150}}));
+    let gt = db.query(json!({"score": {"$gt": 150}})).unwrap();
     assert_eq!(gt.len(), 2); // charlie(200), eve(300)
 
-    let lt = db.query(json!({"age": {"$lt": 30}}));
+    let lt = db.query(json!({"age": {"$lt": 30}})).unwrap();
     assert_eq!(lt.len(), 2); // bob(25), diana(28)
 }
 
@@ -296,10 +328,10 @@ fn query_gte_lte() {
     let (db, _dir) = setup();
     populate_db(&db);
 
-    let gte = db.query(json!({"score": {"$gte": 150}}));
+    let gte = db.query(json!({"score": {"$gte": 150}})).unwrap();
     assert_eq!(gte.len(), 3); // alice(150), charlie(200), eve(300)
 
-    let lte = db.query(json!({"age": {"$lte": 30}}));
+    let lte = db.query(json!({"age": {"$lte": 30}})).unwrap();
     assert_eq!(lte.len(), 3); // alice(30), bob(25), diana(28)
 }
 
@@ -308,7 +340,7 @@ fn query_in() {
     let (db, _dir) = setup();
     populate_db(&db);
 
-    let results = db.query(json!({"name": {"$in": ["alice", "eve"]}}));
+    let results = db.query(json!({"name": {"$in": ["alice", "eve"]}})).unwrap();
     assert_eq!(results.len(), 2);
 }
 
@@ -317,7 +349,7 @@ fn query_nin() {
     let (db, _dir) = setup();
     populate_db(&db);
 
-    let results = db.query(json!({"name": {"$nin": ["alice", "bob"]}}));
+    let results = db.query(json!({"name": {"$nin": ["alice", "bob"]}})).unwrap();
     assert_eq!(results.len(), 3); // charlie, diana, eve
 }
 
@@ -327,14 +359,14 @@ fn query_exists() {
     populate_db(&db);
 
     // All docs have "name"
-    let with_name = db.query(json!({"name": {"$exists": true}}));
+    let with_name = db.query(json!({"name": {"$exists": true}})).unwrap();
     assert_eq!(with_name.len(), 5);
 
     // None have "avatar"
-    let with_avatar = db.query(json!({"avatar": {"$exists": true}}));
+    let with_avatar = db.query(json!({"avatar": {"$exists": true}})).unwrap();
     assert_eq!(with_avatar.len(), 0);
 
-    let without_avatar = db.query(json!({"avatar": {"$exists": false}}));
+    let without_avatar = db.query(json!({"avatar": {"$exists": false}})).unwrap();
     assert_eq!(without_avatar.len(), 5);
 }
 
@@ -348,7 +380,7 @@ fn query_and() {
             {"status": {"$eq": "active"}},
             {"score": {"$gt": 100}}
         ]
-    }));
+    })).unwrap();
     assert_eq!(results.len(), 1); // alice(150)
     assert_eq!(results[0]["name"], "alice");
 }
@@ -363,7 +395,7 @@ fn query_or() {
             {"name": {"$eq": "alice"}},
             {"name": {"$eq": "eve"}}
         ]
-    }));
+    })).unwrap();
     assert_eq!(results.len(), 2);
 }
 
@@ -374,7 +406,7 @@ fn query_not() {
 
     let results = db.query(json!({
         "$not": {"status": {"$eq": "inactive"}}
-    }));
+    })).unwrap();
     assert_eq!(results.len(), 3); // active users
 }
 
@@ -392,7 +424,7 @@ fn query_nested_combinators() {
             ]},
             {"name": {"$eq": "eve"}}
         ]
-    }));
+    })).unwrap();
     // alice(150, active), diana(95, active), eve
     assert_eq!(results.len(), 3);
 }
@@ -409,7 +441,7 @@ fn query_with_sort_limit_offset() {
             offset: Some(1),
             sort_by: Some(("score".to_string(), SortDir::Desc)),
         },
-    );
+    ).unwrap();
 
     // Active sorted desc: alice(150), diana(95), bob(80)
     // Offset 1, limit 2: diana(95), bob(80)
@@ -430,7 +462,7 @@ fn query_with_sort_asc() {
             offset: None,
             sort_by: Some(("age".to_string(), SortDir::Asc)),
         },
-    );
+    ).unwrap();
 
     assert_eq!(results[0]["name"], "bob"); // 25
     assert_eq!(results[1]["name"], "diana"); // 28
@@ -444,7 +476,7 @@ fn query_empty_result() {
     let (db, _dir) = setup();
     populate_db(&db);
 
-    let results = db.query(json!({"name": {"$eq": "nonexistent"}}));
+    let results = db.query(json!({"name": {"$eq": "nonexistent"}})).unwrap();
     assert_eq!(results.len(), 0);
 }
 
@@ -453,7 +485,7 @@ fn query_all_docs() {
     let (db, _dir) = setup();
     populate_db(&db);
 
-    let results = db.query(json!({}));
+    let results = db.query(json!({})).unwrap();
     assert_eq!(results.len(), 5);
 }
 
@@ -466,7 +498,7 @@ fn query_multiple_conditions() {
     let results = db.query(json!({
         "status": "active",
         "age": {"$gte": 28}
-    }));
+    })).unwrap();
     // active AND age >= 28: alice(30), diana(28)
     assert_eq!(results.len(), 2);
 }

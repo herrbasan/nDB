@@ -190,6 +190,60 @@ fn commit_requires_a_reserved_item_and_valid_facts() {
 // ─── States and sweeps ───────────────────────────────────────────────
 
 #[test]
+fn ttl_sweep_races_commits_without_corruption() {
+    // G3: the TTL thread's reserved sweep must serialize against
+    // commit_item. reserved_ttl 0 makes every reservation instantly stale,
+    // so the product thread races every create→commit gap. Invariants:
+    // a commit that returned Ok reads back live (never silently
+    // tombstoned), and the journal replays to a clean verify.
+    let (db, dir) = db_with_meta(json!({
+        "buckets": { "media": { "kind": "items", "reserved_ttl_seconds": 0 } }
+    }));
+    let db = db
+        .with_trash_ttl(Duration::from_secs(3600), Duration::from_millis(25))
+        .with_persistence(ndb::Persistence::Immediate);
+
+    let mut committed = Vec::new();
+    let mut swept_before_commit = 0;
+    for n in 0..200 {
+        let (item_id, folder) = db.create_item("media").unwrap();
+        fs::write(folder.join("photo.png"), b"hello world").unwrap();
+        match db.commit_item("media", &item_id, hello_facts()) {
+            Ok(()) => committed.push(item_id),
+            // Legitimate serialized outcome: the sweep tombstoned the
+            // reservation before the commit acquired the writer lock.
+            Err(Error::NotFound { .. }) => swept_before_commit += 1,
+            Err(e) => panic!("unexpected commit error: {e:?}"),
+        }
+        let _ = n;
+    }
+    assert!(
+        !committed.is_empty(),
+        "hammer must produce committed items (got only sweeps)"
+    );
+
+    // Every Ok commit is live with intact facts.
+    for item_id in &committed {
+        let item = db.read_item("media", item_id).unwrap();
+        assert_eq!(item["state"], json!("live"), "{item_id} not live after Ok commit");
+        assert_eq!(item["facts"]["sha256"], json!(HELLO_SHA256));
+    }
+    let anomalies = db.verify_item_buckets();
+    assert!(anomalies.is_empty(), "verify anomalies: {anomalies:?}");
+
+    // Journal replay: reopen and require the same invariants from disk.
+    drop(db);
+    let db2 = Database::open(dir.path().join("data.jsonl")).unwrap();
+    for item_id in &committed {
+        let item = db2.read_item("media", item_id)
+            .unwrap_or_else(|e| panic!("committed item {item_id} lost on replay: {e}"));
+        assert_eq!(item["state"], json!("live"));
+    }
+    let anomalies = db2.verify_item_buckets();
+    assert!(anomalies.is_empty(), "post-replay verify anomalies: {anomalies:?}");
+}
+
+#[test]
 fn reserved_items_are_swept_by_their_ttl() {
     let (db, _dir) = db_with_meta(json!({
         "buckets": { "media": { "kind": "items", "reserved_ttl_seconds": 0 } }
@@ -249,6 +303,61 @@ fn the_ttl_background_thread_also_sweeps_reserved_items() {
 }
 
 // ─── Crash windows and verify (#9 states) ────────────────────────────
+
+/// G6: a hand-corrupted item journal fails open loudly (Corruption), and
+/// the failure names the line — never a panic in verify.
+#[test]
+fn live_record_without_facts_fails_open_not_verify_panic() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("meta.json"),
+        serde_json::to_string(&json!({"buckets": {"media": {"kind": "items"}}})).unwrap(),
+    )
+    .unwrap();
+    let journal = dir.path().join("_files").join("media").join("items.jsonl");
+    fs::create_dir_all(journal.parent().unwrap()).unwrap();
+
+    // Live without facts — the exact shape that used to reach verify and
+    // hit its expect().
+    fs::write(
+        &journal,
+        "{\"_item\":\"itm_x\",\"state\":\"live\",\"created\":100}\n",
+    )
+    .unwrap();
+    let err = match Database::open(dir.path().join("data.jsonl")) {
+        Ok(_) => panic!("live-without-facts opened successfully — corruption must fail open"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, Error::Corruption { .. }),
+        "live-without-facts must fail open with Corruption, got {err:?}"
+    );
+    assert!(err.to_string().contains("facts"), "error must name the defect: {err}");
+
+    // Live with facts that fail the contract — same boundary.
+    fs::write(
+        &journal,
+        "{\"_item\":\"itm_x\",\"state\":\"live\",\"facts\":{\"name\":\"a\"},\"created\":100}\n",
+    )
+    .unwrap();
+    let err = match Database::open(dir.path().join("data.jsonl")) {
+        Ok(_) => panic!("invalid facts opened successfully — corruption must fail open"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, Error::Corruption { .. }),
+        "invalid facts must fail open with Corruption, got {err:?}"
+    );
+
+    // Reserved without facts stays legal (facts arrive at commit).
+    fs::write(
+        &journal,
+        "{\"_item\":\"itm_x\",\"state\":\"reserved\",\"created\":100}\n",
+    )
+    .unwrap();
+    Database::open(dir.path().join("data.jsonl"))
+        .unwrap_or_else(|e| panic!("reserved-without-facts must open, got {e}"));
+}
 
 #[test]
 fn verify_flags_orphan_folders_and_missing_or_corrupt_originals() {

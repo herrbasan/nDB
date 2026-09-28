@@ -154,6 +154,61 @@ fn patch_delta_ops() {
     assert_eq!(status, 400);
 }
 
+#[test]
+fn patch_malformed_ops_are_400_not_crash() {
+    // B2 regression: the handler must reject malformed ops with 400,
+    // never panic — the release profile aborts on panic, killing the daemon.
+    let (port, _db, _dir) = start_server(None);
+    let (_, body) = request(port, "PUT", "/doc", Some(&json!({"status": "pending"})), None);
+    let id = body["id"].as_str().unwrap().to_string();
+
+    let malformed = [
+        json!({"op": "set", "value": 1}),          // set without path
+        json!({"op": "set", "path": "x"}),         // set without value
+        json!({"op": "remove"}),                     // remove without path
+        json!({"op": "array_push", "path": "x"}),   // array_push without value
+        json!({"op": "array_push", "value": 1}),    // array_push without path
+    ];
+    for op in &malformed {
+        let (status, body) =
+            request(port, "PATCH", &format!("/doc/{}", id), Some(&json!({"ops": [op]})), None);
+        assert_eq!(status, 400, "malformed op {:?} must be 400, got {}", op, body);
+    }
+
+    // The server survived every malformed patch: a valid op still answers.
+    let (status, body) = request(
+        port,
+        "PATCH",
+        &format!("/doc/{}", id),
+        Some(&json!({"ops": [{"op": "set", "path": "status", "value": "done"}]})),
+        None,
+    );
+    assert_eq!(status, 200, "server must live after malformed patches: {}", body);
+    assert_eq!(body["applied"], json!([true]));
+}
+
+#[test]
+fn patch_same_value_set_is_applied() {
+    // D1: applied comes from the path walker, not a before/after diff.
+    // Assigning the identical value is an applied write, not a no-op.
+    let (port, _db, _dir) = start_server(None);
+    let (_, body) = request(port, "PUT", "/doc", Some(&json!({"n": 1})), None);
+    let id = body["id"].as_str().unwrap().to_string();
+
+    let (status, body) = request(
+        port,
+        "PATCH",
+        &format!("/doc/{}", id),
+        Some(&json!({"ops": [
+            {"op": "set", "path": "n", "value": 1},
+            {"op": "set", "path": "no.such.path", "value": 1}
+        ]})),
+        None,
+    );
+    assert_eq!(status, 200, "patch: {}", body);
+    assert_eq!(body["applied"], json!([true, false]), "same-value set is applied; unresolvable path is not");
+}
+
 // ─── Query ──────────────────────────────────────────────────────────
 
 #[test]

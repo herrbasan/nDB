@@ -165,7 +165,7 @@ fn bench_query_simple_eq(c: &mut Criterion) {
             db.insert(json!({"status": if i % 2 == 0 { "active" } else { "inactive" }, "i": i})).unwrap();
         }
         b.iter(|| {
-            let results = db.query(json!({"status": {"$eq": "active"}}));
+            let results = db.query(json!({"status": {"$eq": "active"}})).unwrap();
             black_box(results);
         });
     });
@@ -185,7 +185,7 @@ fn bench_query_and_or(c: &mut Criterion) {
                     {"a": {"$eq": 3}},
                     {"$or": [{"b": {"$eq": 1}}, {"b": {"$eq": 2}}]}
                 ]
-            }));
+            })).unwrap();
             black_box(results);
         });
     });
@@ -200,7 +200,7 @@ fn bench_query_comparison(c: &mut Criterion) {
             db.insert(json!({"value": i})).unwrap();
         }
         b.iter(|| {
-            let results = db.query(json!({"value": {"$gte": 5000}}));
+            let results = db.query(json!({"value": {"$gte": 5000}})).unwrap();
             black_box(results);
         });
     });

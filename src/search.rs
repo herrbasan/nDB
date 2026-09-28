@@ -518,15 +518,30 @@ impl TextIndex {
             }
         };
         for q in &excludes {
-            let ex = self.candidates_for(q);
+            let mut ex = self.candidates_for(q);
+            // G5: a phrase's candidates are its token conjunction, and a
+            // case-sensitive term/prefix's candidates are case-insensitive
+            // index matches — both are supersets of the docs that genuinely
+            // match the exclude. Verify against the raw text BEFORE
+            // diffing: the final verification pass below can only trim,
+            // never resurrect a wrongly-diffed doc.
+            if search.case_sensitive || matches!(q, TextQuery::Phrase(_)) {
+                let cs = search.case_sensitive;
+                ex.retain(|doc_id| {
+                    let id = &self.ids[*doc_id as usize];
+                    !id.is_empty()
+                        && get_text(id).map_or(false, |t| matches_raw(q, &t, cs))
+                });
+            }
             result = difference(&result, &ex);
         }
 
         // Verification pass (only shortlisted candidates): phrase contiguity
-        // and/or case-sensitive matching against raw text.
+        // and/or case-sensitive matching against raw text. Excludes are NOT
+        // listed here — the diff above already verified them against raw
+        // text (G5).
         let needs_verify = search.case_sensitive
-            || positive.iter().any(|q| matches!(q, TextQuery::Phrase(_)))
-            || excludes.iter().any(|q| matches!(q, TextQuery::Phrase(_)));
+            || positive.iter().any(|q| matches!(q, TextQuery::Phrase(_)));
 
         let mut out = Vec::with_capacity(result.len());
         for doc_id in result {
@@ -557,36 +572,7 @@ fn verify(text: &str, search: &TextSearch) -> bool {
             TextQuery::Exclude(inner) => inner,
             _ => q,
         };
-        let s = match target {
-            TextQuery::Term(s) | TextQuery::Phrase(s) | TextQuery::Prefix(s) => s,
-            TextQuery::Exclude(_) => unreachable!("nested exclude rejected at validate"),
-        };
-        match target {
-            // Terms were already index-matched case-insensitively; for
-            // case-sensitive mode compare against the original text.
-            TextQuery::Term(_) => {
-                if search.case_sensitive {
-                    contains_token(text, s)
-                } else {
-                    true // index already proved presence
-                }
-            }
-            TextQuery::Phrase(_) => {
-                if search.case_sensitive {
-                    text.contains(s.as_str())
-                } else {
-                    text.to_lowercase().contains(&s.to_lowercase())
-                }
-            }
-            TextQuery::Prefix(_) => {
-                if search.case_sensitive {
-                    contains_token_prefix(text, s)
-                } else {
-                    true // index already proved presence
-                }
-            }
-            TextQuery::Exclude(_) => false,
-        }
+        matches_raw(target, text, search.case_sensitive)
     };
 
     match search.mode {
@@ -615,6 +601,41 @@ fn verify(text: &str, search: &TextSearch) -> bool {
             }
             any
         }
+    }
+}
+
+/// Does one (non-exclude) query match the raw field text? Phrase
+/// contiguity and case-sensitive term/prefix matching need the original
+/// text; case-insensitive terms and prefixes are index-proven. Shared by
+/// `verify` and the exclude diff (G5).
+fn matches_raw(q: &TextQuery, text: &str, case_sensitive: bool) -> bool {
+    let s = match q {
+        TextQuery::Term(s) | TextQuery::Phrase(s) | TextQuery::Prefix(s) => s,
+        TextQuery::Exclude(_) => return false,
+    };
+    match q {
+        TextQuery::Term(_) => {
+            if case_sensitive {
+                contains_token(text, s)
+            } else {
+                true // index already proved presence
+            }
+        }
+        TextQuery::Phrase(_) => {
+            if case_sensitive {
+                text.contains(s.as_str())
+            } else {
+                text.to_lowercase().contains(&s.to_lowercase())
+            }
+        }
+        TextQuery::Prefix(_) => {
+            if case_sensitive {
+                contains_token_prefix(text, s)
+            } else {
+                true // index already proved presence
+            }
+        }
+        TextQuery::Exclude(_) => false,
     }
 }
 

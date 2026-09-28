@@ -328,6 +328,30 @@ test('findRange returns documents in range', async () => {
 
 section('Phase 4: JSON AST Queries (Layer 3)');
 
+test('query rejects unknown operators instead of matching everything', async () => {
+  // G4: a typo'd operator must reject — it used to silently resolve to
+  // match-everything, returning the whole database as if the query worked.
+  const db = Database.openInMemory();
+  db.insert({ status: 'active', name: 'A' });
+  db.insert({ status: 'deleted', name: 'B' });
+
+  let threw = false;
+  try { await db.query({ status: { $eqq: 'typo' } }); } catch (e) { threw = true; }
+  assert(threw, 'unknown operator $eqq must throw');
+
+  threw = false;
+  try { await db.query({ $where: 'x' }); } catch (e) { threw = true; }
+  assert(threw, 'unknown top-level operator must throw');
+
+  threw = false;
+  try { await db.queryWith({ a: { $gtee: 1 } }, { limit: 5 }); } catch (e) { threw = true; }
+  assert(threw, 'queryWith must validate too');
+
+  // Valid queries unaffected.
+  const results = await db.query({ status: { $eq: 'active' } });
+  assertEqual(results.length, 1, 'Valid query after rejections still works');
+});
+
 test('query with $eq', async () => {
   const db = Database.openInMemory();
   db.insert({ status: 'active', name: 'A' });
@@ -808,6 +832,20 @@ test('arrayPush appends to array field', async () => {
   db.arrayPush(id, 'tags', 'c');
   const doc = db.get(id);
   assertEqual(doc.tags, ['a', 'b', 'c'], 'Tags should have all elements');
+});
+
+test('set/remove/arrayPush return applied flags', async () => {
+  const db = Database.openInMemory();
+  const id = db.insert({ title: 'old', items: [1], name: 'x' });
+  assertEqual(db.set(id, 'title', 'new'), true, 'Resolved set applies');
+  assertEqual(db.set(id, 'title', 'new'), true, 'Same-value set is still applied');
+  assertEqual(db.set(id, 'no.such.path', 1), false, 'Missing intermediate reports false');
+  assertEqual(db.remove(id, 'title'), true, 'Resolved remove applies');
+  assertEqual(db.remove(id, 'title'), false, 'Removing a missing field reports false');
+  assertEqual(db.arrayPush(id, 'tags', 'a'), true, 'Array creation applies');
+  assertEqual(db.arrayPush(id, 'items.9', 2), false, 'Out-of-bounds push reports false');
+  assertEqual(db.arrayPush(id, 'name', 2), false, 'Push onto a non-array reports false');
+  assertEqual(db.arrayPush(id, 'items.0', 2), false, 'Push onto a scalar element reports false');
 });
 
 test('set + remove + arrayPush persist and replay', async () => {

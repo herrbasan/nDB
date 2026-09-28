@@ -39,7 +39,9 @@ impl Task for QueryTask {
     type Output = Vec<serde_json::Value>;
     type JsValue = String;
     fn compute(&mut self) -> Result<Self::Output> {
-        Ok(self.db.query(self.ast.clone()))
+        self.db
+            .query(self.ast.clone())
+            .map_err(|e| Error::from_reason(format!("Query failed: {}", e)))
     }
     fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
         serde_json::to_string(&output).map_err(|e| Error::from_reason(format!("Serialization failed: {}", e)))
@@ -57,7 +59,9 @@ impl Task for QueryWithTask {
     type Output = Vec<serde_json::Value>;
     type JsValue = String;
     fn compute(&mut self) -> Result<Self::Output> {
-        Ok(self.db.query_with(self.ast.clone(), self.opts.clone()))
+        self.db
+            .query_with(self.ast.clone(), self.opts.clone())
+            .map_err(|e| Error::from_reason(format!("Query failed: {}", e)))
     }
     fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
         serde_json::to_string(&output).map_err(|e| Error::from_reason(format!("Serialization failed: {}", e)))
@@ -301,27 +305,32 @@ impl Database {
             .map_err(|e| Error::from_reason(format!("Update failed: {}", e)))
     }
 
-    /// Append an element to an array field.
+    /// Append an element to an array field. Returns true when the push
+    /// landed, false when the path did not resolve (no-op, nothing written).
     #[napi]
-    pub fn array_push(&self, id: String, field: String, value: String) -> Result<()> {
+    pub fn array_push(&self, id: String, field: String, value: String) -> Result<bool> {
         let val: serde_json::Value = serde_json::from_str(&value)
             .map_err(|e| Error::from_reason(format!("Invalid JSON value: {}", e)))?;
         self.inner()?.array_push(&id, &field, val)
             .map_err(|e| Error::from_reason(format!("Array push failed: {}", e)))
     }
 
-    /// Set a value at a dot-separated path within a document.
+    /// Set a value at a dot-separated path within a document. Returns true
+    /// when the assignment landed (including same-value re-assignment),
+    /// false when the path did not resolve (no-op, nothing written).
     #[napi]
-    pub fn set(&self, id: String, path: String, value: String) -> Result<()> {
+    pub fn set(&self, id: String, path: String, value: String) -> Result<bool> {
         let val: serde_json::Value = serde_json::from_str(&value)
             .map_err(|e| Error::from_reason(format!("Invalid JSON value: {}", e)))?;
         self.inner()?.set(&id, &path, val)
             .map_err(|e| Error::from_reason(format!("Set failed: {}", e)))
     }
 
-    /// Remove a field or array element at a dot-separated path.
+    /// Remove a field or array element at a dot-separated path. Returns
+    /// true when something was removed, false when the path did not resolve
+    /// (no-op, nothing written).
     #[napi]
-    pub fn remove(&self, id: String, path: String) -> Result<()> {
+    pub fn remove(&self, id: String, path: String) -> Result<bool> {
         self.inner()?.remove(&id, &path)
             .map_err(|e| Error::from_reason(format!("Remove failed: {}", e)))
     }

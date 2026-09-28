@@ -153,12 +153,13 @@ Replace a document. The `_id` field is preserved.
 db.update(&id, json!({"title": "Updated", "count": 43}))?;
 ```
 
-### `array_push(id: &str, field: &str, value: Value) -> Result<()>`
+### `array_push(id: &str, field: &str, value: Value) -> Result<bool>`
 
 Accepts a **dot-separated path** (v1.3+): `"threads.0.messages"` pushes into the nested array. A missing final key creates the array, mirroring top-level behavior.
 
 Append an element to a top-level array field. O(1) file write.
 
+- Returns `Ok(true)` when the push landed, `Ok(false)` when the path did not resolve (no-op — nothing changed, nothing journaled)
 - If the field doesn't exist, creates a new single-element array
 - Persists as a tiny delta patch in the JSONL (not a full document rewrite)
 - Patches are replayed on load and baked into the base document on `compact()`
@@ -168,13 +169,14 @@ Append an element to a top-level array field. O(1) file write.
 db.array_push(&id, "messages", json!({"role": "user", "content": "Hello"}))?;
 ```
 
-### `set(id: &str, path: &str, value: Value) -> Result<()>`
+### `set(id: &str, path: &str, value: Value) -> Result<bool>`
 
 Set a value at a dot-separated path within a document. O(1) file write.
 
 - Path examples: `"title"`, `"settings.theme"`, `"messages.3.content"`, `"a.b.c.d"`
 - Numeric path segments address array elements by index
-- If the path doesn't resolve (missing field, out-of-bounds index), the in-memory mutation is silently skipped
+- Returns `Ok(true)` when the assignment landed — including a same-value re-assignment, which is an applied write, not a no-op
+- Returns `Ok(false)` when the path doesn't resolve (missing intermediate, out-of-bounds index): a no-op — nothing changed, nothing journaled
 - Creates new fields if the leaf key doesn't exist
 - Persists as a tiny delta patch in the JSONL (not a full document rewrite)
 - Patches are replayed on load and baked into the base document on `compact()`
@@ -194,13 +196,13 @@ db.set(&id, "messages.1.text", json!("edited text"))?;
 db.set(&id, "a.b.c.d", json!(42))?;
 ```
 
-### `remove(id: &str, path: &str) -> Result<()>`
+### `remove(id: &str, path: &str) -> Result<bool>`
 
 Remove a field or array element at a dot-separated path. O(1) file write.
 
 - For object fields: the key is removed
 - For array elements: the element is removed and the array shifts (indices change)
-- If the path doesn't resolve, the in-memory mutation is silently skipped
+- Returns `Ok(true)` when something was removed, `Ok(false)` when the path didn't resolve (idempotent remove of a missing key — nothing changed, nothing journaled)
 - Persists as a tiny delta patch in the JSONL (not a full document rewrite)
 - Patches are replayed on load and baked into the base document on `compact()`
 - Returns `Error::NotFound` if ID doesn't exist
@@ -347,18 +349,20 @@ let ids = db.text_search("content", &TextSearch::and(vec![
 
 ## Layer 3: JSON AST Queries
 
-### `query(ast: Value) -> Vec<Value>`
+### `query(ast: Value) -> Result<Vec<Value>>`
 
 Execute a JSON AST query. The AST is a plain JSON object representing filter conditions.
+
+The AST is **validated before execution** (G4): an unknown operator, malformed combinator, or non-object root returns `Err(InvalidArgument)` — on every path (library, napi, HTTP), never a silent full-DB scan. `validate_query_ast` is the same check, exposed for pre-flight validation.
 
 ```rust
 let results = db.query(json!({
     "status": {"$eq": "active"},
     "age": {"$gte": 18}
-}));
+}))?;
 ```
 
-### `query_with(ast: Value, opts: QueryOptions) -> Vec<Value>`
+### `query_with(ast: Value, opts: QueryOptions) -> Result<Vec<Value>>`
 
 Execute a query with sorting, offset, and limit. **Sort keys accept dot-notation** (`"meta.views"` resolves nested fields, not just top-level keys).
 
@@ -395,7 +399,7 @@ let (total, names) = db.query_projected(
 
 ### `validate_query_ast(ast: &Value) -> Result<()>`
 
-Validate a query AST before executing it. Rejects unknown operators (`$eqq` → `Err`), malformed combinators (non-array `$and`, empty `$and`), and non-object roots. Every key in a field-condition operator object must be a known operator (`$eq $ne $gt $gte $lt $lte $in $nin $exists`) — this makes validation and evaluation agree, with the consequence that implicit `$eq` on nested object values (`{"field": {"a": 1}}`) is not supported. **Use this at trust boundaries** (HTTP handlers, user input): `query()` itself still silently treats unknown operators as match-everything for backward compatibility, so a typo in an unvalidated AST degrades to a full-DB scan.
+Validate a query AST before executing it. Rejects unknown operators (`$eqq` → `Err`), malformed combinators (non-array `$and`, empty `$and`), and non-object roots. Every key in a field-condition operator object must be a known operator (`$eq $ne $gt $gte $lt $lte $in $nin $exists`) — this makes validation and evaluation agree, with the consequence that implicit `$eq` on nested object values (`{"field": {"a": 1}}`) is not supported. **`query()`/`query_with()`/`query_projected()` run this same validation themselves** (G4): a typo'd operator is `Err(InvalidArgument)` on every path — library, napi, HTTP — never a silent match-everything scan. The exposed function remains useful to validate before doing other work in request handlers.
 
 ### Path resolution (reads)
 

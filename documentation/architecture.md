@@ -331,7 +331,7 @@ On `Database::open()`, all JSONL lines are processed sequentially:
 4. **`set` patch** → walks the dot-path and sets the value
 5. **`remove` patch** → walks the dot-path and removes the target
 
-If a patch's path can't be resolved (missing field, out-of-bounds index), it is **silently skipped**. No data corruption is possible.
+If a patch's path can't be resolved (missing intermediate segment, out-of-bounds index), it is a **no-op**: the call returns `Ok(false)`, nothing changes, and no journal line is written. Same-value assignment returns `Ok(true)` — idempotent re-assignment is an applied write. No data corruption is possible.
 
 ### Compaction
 

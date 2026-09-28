@@ -258,6 +258,62 @@ fn heal_journal(journal: &std::path::Path, aside: &std::path::Path) {
 }
 
 #[test]
+fn a_failed_restore_append_leaves_state_untouched() {
+    // G1: restore used to return files and bump ref counters before the
+    // journal append — a failed append left both moved, un-retryable. The
+    // contract now: journal first, then files/counters/memory, so a failed
+    // append changes nothing.
+    let (db, dir) = disk_db();
+
+    let bucket = db.bucket("images");
+    let meta = bucket
+        .store("avatar.png", b"avatar bytes", "image/png")
+        .unwrap();
+    let id = db
+        .insert(json!({
+            "name": "recover-me",
+            "avatar": meta._file.to_string_compact()
+        }))
+        .unwrap();
+    db.delete(&id).unwrap();
+    assert!(!bucket.exists(&meta._file), "delete trashes the orphaned file");
+    db.compact().unwrap(); // close the journal handle so the append below fails
+
+    let (journal, aside) = break_journal(&dir);
+    let err = db.restore(&id).unwrap_err();
+    assert!(matches!(err, Error::Io { .. }), "expected I/O error, got {err:?}");
+
+    // Nothing moved: still deleted, file still in trash, no half-restore.
+    assert!(
+        db.get(&id).is_err(),
+        "failed restore must not resurrect the document"
+    );
+    assert!(db.deleted_ids().contains(&id));
+    assert!(
+        !bucket.exists(&meta._file),
+        "file must still be in trash after the failed restore"
+    );
+
+    // Retry path: heal the journal and the restore commits whole.
+    heal_journal(&journal, &aside);
+    db.restore(&id).unwrap();
+    let doc = db.get(&id).unwrap();
+    assert_eq!(doc["name"], json!("recover-me"));
+    assert!(
+        bucket.exists(&meta._file),
+        "restored document's file must be back in the bucket"
+    );
+
+    // The failed attempt did not inflate the counters: a fresh delete sees
+    // the sole reference and trashes the file again.
+    db.delete(&id).unwrap();
+    assert!(
+        !bucket.exists(&meta._file),
+        "counters inflated by the failed restore — the G1 defect"
+    );
+}
+
+#[test]
 fn a_failed_journal_append_leaves_update_state_untouched() {
     let (db, dir) = disk_db();
 

@@ -391,7 +391,12 @@ fn handle_query(db: &Database, config: &ServerConfig, req: &Request) -> (u16, Va
         None => None,
     };
 
-    let (total, results) = db.query_projected(filter, opts, fields.as_deref(), text_ids.as_ref());
+    let (total, results) = match db.query_projected(filter, opts, fields.as_deref(), text_ids.as_ref()) {
+        Ok(r) => r,
+        // Unreachable for invalid ASTs — the pre-validation above already
+        // returned 400. Kept as the loud net rather than an unwrap.
+        Err(e) => return db_error(e),
+    };
     (
         200,
         json!({
@@ -676,24 +681,39 @@ fn handle_patch(db: &Database, req: &Request, id: &str) -> (u16, Value) {
         _ => return (400, json!({"error": "ops: non-empty array required"})),
     };
 
+    // Each op's applied flag comes from the core (the path walker is the
+    // only component that knows whether the path resolved) — not from a
+    // before/after diff, which reports same-value assignment as false.
     let mut applied = Vec::with_capacity(ops.len());
     for op in ops {
-        let before = db.get(id).ok();
         let result = match op.get("op").and_then(|v| v.as_str()) {
-            Some("set") => db.set(
-                id,
-                op.get("path").and_then(|v| v.as_str()).ok_or_else(|| Error::invalid_arg("set: path required")).unwrap(),
-                op.get("value").cloned().ok_or_else(|| Error::invalid_arg("set: value required")).unwrap(),
-            ),
-            Some("remove") => db.remove(
-                id,
-                op.get("path").and_then(|v| v.as_str()).ok_or_else(|| Error::invalid_arg("remove: path required")).unwrap(),
-            ),
-            Some("array_push") => db.array_push(
-                id,
-                op.get("path").and_then(|v| v.as_str()).ok_or_else(|| Error::invalid_arg("array_push: path required")).unwrap(),
-                op.get("value").cloned().ok_or_else(|| Error::invalid_arg("array_push: value required")).unwrap(),
-            ),
+            Some("set") => {
+                let path = match op.get("path").and_then(|v| v.as_str()) {
+                    Some(p) => p,
+                    None => return (400, json!({"error": "set: path required"})),
+                };
+                match op.get("value") {
+                    Some(v) => db.set(id, path, v.clone()),
+                    None => return (400, json!({"error": "set: value required"})),
+                }
+            }
+            Some("remove") => {
+                let path = match op.get("path").and_then(|v| v.as_str()) {
+                    Some(p) => p,
+                    None => return (400, json!({"error": "remove: path required"})),
+                };
+                db.remove(id, path)
+            }
+            Some("array_push") => {
+                let path = match op.get("path").and_then(|v| v.as_str()) {
+                    Some(p) => p,
+                    None => return (400, json!({"error": "array_push: path required"})),
+                };
+                match op.get("value") {
+                    Some(v) => db.array_push(id, path, v.clone()),
+                    None => return (400, json!({"error": "array_push: value required"})),
+                }
+            }
             other => {
                 return (
                     400,
@@ -701,15 +721,10 @@ fn handle_patch(db: &Database, req: &Request, id: &str) -> (u16, Value) {
                 )
             }
         };
-        if let Err(e) = result {
-            return db_error(e);
+        match result {
+            Ok(a) => applied.push(a),
+            Err(e) => return db_error(e),
         }
-        // set/remove silently skip unresolvable paths; surface it per-op.
-        let after = db.get(id).ok();
-        applied.push(match (&before, &after) {
-            (Some(b), Some(a)) => b != a,
-            _ => true,
-        });
     }
 
     (200, json!({"ok": true, "applied": applied}))

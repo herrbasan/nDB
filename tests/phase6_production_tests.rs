@@ -350,7 +350,7 @@ fn concurrent_queries_during_inserts() {
         let q_db = Arc::clone(&db);
         handles.push(thread::spawn(move || {
             for _ in 0..50 {
-                let results = q_db.query(json!({"status": {"$eq": "active"}}));
+                let results = q_db.query(json!({"status": {"$eq": "active"}})).unwrap();
                 assert!(results.len() <= 150);
             }
         }));
@@ -435,13 +435,13 @@ fn compact_reduces_file_size_significantly() {
 #[test]
 fn query_on_empty_db() {
     let db = Database::open_in_memory().unwrap();
-    assert_eq!(db.query(json!({"x": 1})).len(), 0);
+    assert_eq!(db.query(json!({"x": 1})).unwrap().len(), 0);
     assert_eq!(db.find("x", &json!(1)).len(), 0);
     assert_eq!(db.query_with(json!({"x": 1}), QueryOptions {
         limit: Some(10),
         offset: Some(0),
         sort_by: Some(("x".to_string(), SortDir::Asc)),
-    }).len(), 0);
+    }).unwrap().len(), 0);
 }
 
 #[test]
@@ -450,7 +450,7 @@ fn query_with_dot_notation() {
     db.insert(json!({"user": {"name": "alice", "age": 30}})).unwrap();
     db.insert(json!({"user": {"name": "bob", "age": 25}})).unwrap();
 
-    let results = db.query(json!({"user.name": {"$eq": "alice"}}));
+    let results = db.query(json!({"user.name": {"$eq": "alice"}})).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["user"]["name"], "alice");
 }
@@ -468,7 +468,7 @@ fn query_with_nested_and_or() {
             {"$or": [{"a": {"$eq": 1}}, {"a": {"$eq": 3}}]},
             {"b": {"$gte": 20}}
         ]
-    }));
+    })).unwrap();
     assert_eq!(results.len(), 2); // (a=3,b=30) and (a=1,b=30)
 }
 
@@ -531,7 +531,7 @@ fn full_lifecycle_persist_reopen() {
     assert!(db2.get(&ids[15]).is_err());
 
     // Query
-    let results = db2.query(json!({"val": {"$gte": 100}}));
+    let results = db2.query(json!({"val": {"$gte": 100}})).unwrap();
     assert_eq!(results.len(), 2); // 999 and 888
 
     // Compact

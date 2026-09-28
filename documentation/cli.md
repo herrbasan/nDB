@@ -73,7 +73,7 @@ Routes (all JSON unless noted):
 | `PUT /file/:bucket` | Store file (body = raw bytes, `Content-Type` used as MIME) |
 | `GET /file/:bucket/:hash.ext` | Fetch file — raw bytes with real Content-Type |
 
-Limits: 64 concurrent connections (503 over), 64 MB request bodies (413), 30 s read timeout, query limit capped at 1000. Unknown query operators are 400, never silently-match.
+Limits: 64 concurrent connections (503 over), 64 MB request bodies (413), 30 s read timeout, query limit capped at 1000. Unknown query operators are rejected on every path — 400 over HTTP, thrown errors from the library/napi — never silently-match.
 
 ### `POST /search`
 

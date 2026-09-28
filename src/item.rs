@@ -96,6 +96,18 @@ impl ItemRecord {
             Some(f) if f.is_object() => Some(f.clone()),
             _ => None,
         };
+        // G6: the journal boundary enforces the live-record contract —
+        // facts present AND satisfying the same validator commit uses.
+        // This is what makes verify's direct field access an invariant
+        // instead of a crash on hand-corrupted journals.
+        if state == ItemState::Live {
+            let f = facts
+                .as_ref()
+                .ok_or_else(|| bad("live item requires facts"))?;
+            if let Err(e) = validate_facts(f) {
+                return Err(bad(&format!("live item facts invalid: {e}")));
+            }
+        }
         let created = v
             .get("created")
             .and_then(|x| x.as_u64())
@@ -425,14 +437,27 @@ impl ItemBucket {
                 continue;
             }
             // Live: the committed original is the integrity contract.
-            let facts = record.facts.as_ref().expect("live item has facts");
-            let name = facts["name"].as_str().unwrap();
+            // The from_json boundary guarantees facts presence and shape
+            // (G6); these anomaly reports keep the diagnostic total even
+            // on states that cannot be parsed — verify must report, never
+            // crash on the corruption it exists to find.
+            let Some(facts) = record.facts.as_ref() else {
+                anomalies.push(format!("{}: live record has no facts", record.id));
+                continue;
+            };
+            let Some(name) = facts["name"].as_str() else {
+                anomalies.push(format!("{}: live record facts missing 'name'", record.id));
+                continue;
+            };
             let original = folder.join(name);
             if !original.is_file() {
                 anomalies.push(format!("{}: committed original '{name}' missing", record.id));
                 continue;
             }
-            let expected_size = facts["size"].as_u64().unwrap();
+            let Some(expected_size) = facts["size"].as_u64() else {
+                anomalies.push(format!("{}: live record facts missing 'size'", record.id));
+                continue;
+            };
             let actual_size = fs::metadata(&original).map(|m| m.len()).unwrap_or(0);
             if actual_size != expected_size {
                 anomalies.push(format!(

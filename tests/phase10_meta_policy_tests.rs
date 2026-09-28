@@ -172,7 +172,7 @@ fn malformed_policies_fail_open_loudly() {
         json!({"buckets": {"avatars": {"onDocumentDelete": "cascade"}}}),
         json!({"buckets": {"avatars": {"ttl_seconds": "30"}}}),
         json!({"buckets": {"avatars": "trash"}}),
-        json!({"buckets": ["avatars"]}),
+        json!({"buckets": [1]}),
     ] {
         let dir = TempDir::new().unwrap();
         fs::write(
@@ -189,6 +189,26 @@ fn malformed_policies_fail_open_loudly() {
             "meta {bad} → expected Corruption, got {err:?}"
         );
     }
+}
+
+// ─── Legacy CLI bucket arrays open as no-policy (B1 compat) ─────────
+
+#[test]
+fn legacy_array_buckets_open_with_default_policies() {
+    // `ndb init`/`merge`/`recover` wrote name arrays before #10; the
+    // loader must treat them as "names, no policy", not corruption.
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("meta.json"),
+        r#"{"version": 1, "buckets": ["avatars", "docs"]}"#,
+    )
+    .unwrap();
+    let db = Database::open(dir.path().join("data.jsonl"))
+        .unwrap_or_else(|e| panic!("legacy array meta must open, got {e}"));
+    // A declared name parses as a usable bucket with default (no) policy.
+    let handle = db.bucket("avatars");
+    let stored = handle.store("a.png", b"a", "image/png").unwrap();
+    assert_eq!(handle.get(&stored._file).unwrap(), b"a");
 }
 
 #[test]

@@ -423,17 +423,19 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
 
 // ─── Path-based Mutation Helpers ─────────────────────────────────────
 
-fn apply_path_set(doc: &mut Value, path: &str, value: Value) {
+/// Returns true when the assignment landed (path resolved, value written).
+/// False is a no-op: the path could not be resolved, nothing changed.
+fn apply_path_set(doc: &mut Value, path: &str, value: Value) -> bool {
     let segments: Vec<&str> = path.split('.').collect();
     if segments.is_empty() {
-        return;
+        return false;
     }
-    walk_and_set(doc, &segments, 0, value);
+    walk_and_set(doc, &segments, 0, value)
 }
 
-fn walk_and_set(current: &mut Value, segments: &[&str], depth: usize, value: Value) {
+fn walk_and_set(current: &mut Value, segments: &[&str], depth: usize, value: Value) -> bool {
     if depth >= segments.len() {
-        return;
+        return false;
     }
     let key = segments[depth];
     let is_last = depth + 1 == segments.len();
@@ -443,44 +445,53 @@ fn walk_and_set(current: &mut Value, segments: &[&str], depth: usize, value: Val
             if idx < arr.len() {
                 if is_last {
                     arr[idx] = value;
-                } else {
-                    walk_and_set(&mut arr[idx], segments, depth + 1, value);
+                    return true;
                 }
+                return walk_and_set(&mut arr[idx], segments, depth + 1, value);
             }
         }
     } else if let Some(obj) = current.as_object_mut() {
         if is_last {
+            // Assignment is applied even when the value is identical —
+            // idempotent re-assignment asserts state, it is not a no-op.
             obj.insert(key.to_string(), value);
+            return true;
         } else if obj.contains_key(key) {
             let next = obj.get_mut(key).unwrap();
-            walk_and_set(next, segments, depth + 1, value);
+            return walk_and_set(next, segments, depth + 1, value);
         }
     }
+    false
 }
 
-fn apply_path_remove(doc: &mut Value, path: &str) {
+/// Returns true when something was removed, false when the path did not
+/// resolve (idempotent remove of a missing key is a no-op).
+fn apply_path_remove(doc: &mut Value, path: &str) -> bool {
     let segments: Vec<&str> = path.split('.').collect();
     if segments.is_empty() {
-        return;
+        return false;
     }
-    walk_and_remove(doc, &segments, 0);
+    walk_and_remove(doc, &segments, 0)
 }
 
 /// Push a value onto the array at a dot-separated path. Array-aware:
 /// "threads.2.messages" addresses nested arrays. If the final key doesn't
 /// exist (or isn't an array), an array containing the value is created there —
 /// mirroring the top-level behavior.
-fn apply_path_push(doc: &mut Value, path: &str, value: Value) {
+/// Returns true when the push landed (existing array extended, or the
+/// array created). False is a no-op: path did not resolve, or the target
+/// exists but is not an array.
+fn apply_path_push(doc: &mut Value, path: &str, value: Value) -> bool {
     let segments: Vec<&str> = path.split('.').collect();
     if segments.is_empty() {
-        return;
+        return false;
     }
-    walk_and_push(doc, &segments, 0, value);
+    walk_and_push(doc, &segments, 0, value)
 }
 
-fn walk_and_push(current: &mut Value, segments: &[&str], depth: usize, value: Value) {
+fn walk_and_push(current: &mut Value, segments: &[&str], depth: usize, value: Value) -> bool {
     if depth >= segments.len() {
-        return;
+        return false;
     }
     let key = segments[depth];
     let is_last = depth + 1 == segments.len();
@@ -491,33 +502,42 @@ fn walk_and_push(current: &mut Value, segments: &[&str], depth: usize, value: Va
                 if is_last {
                     if let Some(inner) = arr[idx].as_array_mut() {
                         inner.push(value);
+                        return true;
                     }
-                } else {
-                    walk_and_push(&mut arr[idx], segments, depth + 1, value);
+                    return false;
                 }
+                return walk_and_push(&mut arr[idx], segments, depth + 1, value);
             }
         }
-    } else if let Some(obj) = current.as_object_mut() {
+        return false;
+    }
+
+    if let Some(obj) = current.as_object_mut() {
         if is_last {
-            match obj.get_mut(key) {
+            return match obj.get_mut(key) {
                 Some(slot) => {
                     if let Some(inner) = slot.as_array_mut() {
                         inner.push(value);
+                        return true;
                     }
+                    false
                 }
                 None => {
                     obj.insert(key.to_string(), serde_json::json!([value]));
+                    true
                 }
-            }
-        } else if obj.contains_key(key) {
-            walk_and_push(obj.get_mut(key).unwrap(), segments, depth + 1, value);
+            };
+        }
+        if obj.contains_key(key) {
+            return walk_and_push(obj.get_mut(key).unwrap(), segments, depth + 1, value);
         }
     }
+    false
 }
 
-fn walk_and_remove(current: &mut Value, segments: &[&str], depth: usize) {
+fn walk_and_remove(current: &mut Value, segments: &[&str], depth: usize) -> bool {
     if depth >= segments.len() {
-        return;
+        return false;
     }
     let key = segments[depth];
     let is_last = depth + 1 == segments.len();
@@ -527,19 +547,20 @@ fn walk_and_remove(current: &mut Value, segments: &[&str], depth: usize) {
             if idx < arr.len() {
                 if is_last {
                     arr.remove(idx);
-                } else {
-                    walk_and_remove(&mut arr[idx], segments, depth + 1);
+                    return true;
                 }
+                return walk_and_remove(&mut arr[idx], segments, depth + 1);
             }
         }
     } else if let Some(obj) = current.as_object_mut() {
         if is_last {
-            obj.remove(key);
+            return obj.remove(key).is_some();
         } else if obj.contains_key(key) {
             let next = obj.get_mut(key).unwrap();
-            walk_and_remove(next, segments, depth + 1);
+            return walk_and_remove(next, segments, depth + 1);
         }
     }
+    false
 }
 
 // ─── Database ───────────────────────────────────────────────────────
@@ -597,6 +618,21 @@ fn load_bucket_policies(base_dir: &Path) -> Result<HashMap<String, BucketPolicy>
         None => return Ok(policies),
         Some(Value::Null) => return Ok(policies),
         Some(b) if b.is_object() => b.as_object().unwrap(),
+        // Legacy CLI form: `ndb init`/`merge`/`recover` wrote name arrays
+        // before bucket policies existed (#10). A string entry is a bucket
+        // name with no policy; anything else in the array is malformed.
+        Some(Value::Array(items)) => {
+            for item in items {
+                let name = item.as_str().ok_or_else(|| {
+                    Error::corruption(
+                        &meta_path,
+                        format!("'buckets' array entries must be bucket-name strings, got {item}"),
+                    )
+                })?;
+                policies.insert(name.to_string(), BucketPolicy::default());
+            }
+            return Ok(policies);
+        }
         Some(_) => {
             return Err(Error::corruption(&meta_path, "'buckets' must be an object"))
         }
@@ -677,8 +713,15 @@ pub struct Database {
     indexes: RwLock<HashMap<String, Box<dyn Index>>>,
     /// Full-text indexes (opt-in): field → inverted index.
     text_indexes: RwLock<HashMap<String, search::TextIndex>>,
-    /// Single-writer mutex.
-    writer: Mutex<()>,
+    /// Single-writer mutex. Arc-shared with the TTL thread so its
+    /// reserved-item sweep serializes against writers exactly like the
+    /// public item API does (G3).
+    writer: std::sync::Arc<Mutex<()>>,
+    /// Serializes the document-trash file: delete()'s restorable-record
+    /// append against the purgers' read-all→rewrite (B3). Always taken
+    /// AFTER `writer` when both are held; the purge paths never take
+    /// `writer`, so no lock inversion is possible.
+    trash_lock: std::sync::Arc<Mutex<()>>,
     /// Persistence mode.
     persistence: Persistence,
     /// Trash mode.
@@ -808,7 +851,8 @@ impl Database {
             file_refs: RwLock::new(file_refs),
             indexes: RwLock::new(HashMap::new()),
             text_indexes: RwLock::new(HashMap::new()),
-            writer: Mutex::new(()),
+            writer: std::sync::Arc::new(Mutex::new(())),
+            trash_lock: std::sync::Arc::new(Mutex::new(())),
             persistence: Persistence::Lazy,
             trash_mode: TrashMode::Manual,
             trash_ttl: None,
@@ -831,7 +875,8 @@ impl Database {
             file_refs: RwLock::new(HashMap::new()),
             indexes: RwLock::new(HashMap::new()),
             text_indexes: RwLock::new(HashMap::new()),
-            writer: Mutex::new(()),
+            writer: std::sync::Arc::new(Mutex::new(())),
+            trash_lock: std::sync::Arc::new(Mutex::new(())),
             persistence: Persistence::Lazy,
             trash_mode: TrashMode::Manual,
             trash_ttl: None,
@@ -877,6 +922,8 @@ impl Database {
         let ttl_dur = self.trash_ttl.unwrap();
         let bucket_policies = self.bucket_policies.clone();
         let persistence = self.persistence;
+        let trash_lock = std::sync::Arc::clone(&self.trash_lock);
+        let writer = std::sync::Arc::clone(&self.writer);
         let item_buckets: Vec<std::sync::Arc<ItemBucket>> =
             self.item_buckets.values().cloned().collect();
 
@@ -897,14 +944,25 @@ impl Database {
                             mode,
                             Some(ttl_dur),
                             &bucket_policies,
+                            &trash_lock,
                         ) {
                             report::detached("ttl sweep: purge expired trash", e);
                         }
                         // Reserved items past their TTL are swept on the
-                        // same cadence (#9).
-                        for bucket in &item_buckets {
-                            if let Err(e) = bucket.sweep_reserved(persistence) {
-                                report::detached("ttl sweep: sweep reserved items", e);
+                        // same cadence (#9) — under the writer lock, exactly
+                        // like the public sweep_reserved_items: without it,
+                        // selection here is not atomic with a concurrent
+                        // commit_item acting on the same reserved item (G3).
+                        // G3: under the writer lock, exactly like the public
+                        // sweep_reserved_items — without it, selection here
+                        // is not atomic with a concurrent commit_item
+                        // acting on the same reserved item.
+                        {
+                            let _w = writer.lock();
+                            for bucket in &item_buckets {
+                                if let Err(e) = bucket.sweep_reserved(persistence) {
+                                    report::detached("ttl sweep: sweep reserved items", e);
+                                }
                             }
                         }
                     }
@@ -923,6 +981,7 @@ impl Database {
         trash_mode: TrashMode,
         trash_ttl: Option<Duration>,
         bucket_policies: &HashMap<String, BucketPolicy>,
+        trash_lock: &Mutex<()>,
     ) -> Result<usize> {
         let ttl = match (trash_mode, trash_ttl) {
             (TrashMode::TTL(t), _) => t,
@@ -933,6 +992,10 @@ impl Database {
         if ttl == Duration::ZERO {
             return Ok(0);
         }
+
+        // Same B3 contract as purge_trash(): serialize the doc-trash
+        // read-all→rewrite against delete()'s record append.
+        let _trash_guard = trash_lock.lock();
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1349,7 +1412,11 @@ impl Database {
     ///
     /// Dot-separated paths address nested arrays ("threads.2.messages");
     /// numeric segments index into arrays. A missing final key creates the array.
-    pub fn array_push(&self, id: &str, field: &str, value: Value) -> Result<()> {
+    ///
+    /// Returns `Ok(true)` when the push landed. `Ok(false)` is a no-op, not a
+    /// failure: the path did not resolve (missing intermediate, out-of-bounds
+    /// index, non-array at the target) — nothing changed, nothing journaled.
+    pub fn array_push(&self, id: &str, field: &str, value: Value) -> Result<bool> {
         let _guard = self.writer.lock();
 
         let old_doc = {
@@ -1363,7 +1430,11 @@ impl Database {
         // Apply the path op to a snapshot: the stored document does not
         // move until the journal holds the patch (#7).
         let mut new_doc = old_doc.clone();
-        apply_path_push(&mut new_doc, field, value.clone());
+        if !apply_path_push(&mut new_doc, field, value.clone()) {
+            // Unresolvable path: nothing mutated, so journal-first ordering
+            // imposes nothing — return before the journal append (D1).
+            return Ok(false);
+        }
 
         // Journal first.
         if !self.is_in_memory() {
@@ -1392,15 +1463,19 @@ impl Database {
         self.reindex_doc(id, &old_doc);
         self.handle_ref_delta_and_trash(&old_doc, &new_doc);
 
-        Ok(())
+        Ok(true)
     }
 
     /// Set a value at a dot-separated path within a document. O(1) file write.
     ///
     /// Path examples: "title", "messages.3.content", "settings.theme"
     /// Array indices are addressed by numeric path segments.
-    /// If the path doesn't resolve, the patch is silently skipped during replay.
-    pub fn set(&self, id: &str, path: &str, value: Value) -> Result<()> {
+    ///
+    /// Returns `Ok(true)` when the assignment landed — including a same-value
+    /// re-assignment, which is an applied write, not a no-op. `Ok(false)`: the
+    /// path did not resolve (missing intermediate segment, out-of-bounds
+    /// index) — nothing changed, nothing journaled.
+    pub fn set(&self, id: &str, path: &str, value: Value) -> Result<bool> {
         let _guard = self.writer.lock();
 
         let old_doc = {
@@ -1412,7 +1487,11 @@ impl Database {
         };
 
         let mut new_doc = old_doc.clone();
-        apply_path_set(&mut new_doc, path, value.clone());
+        if !apply_path_set(&mut new_doc, path, value.clone()) {
+            // Unresolvable path: nothing mutated, so journal-first ordering
+            // imposes nothing — return before the journal append (D1).
+            return Ok(false);
+        }
 
         // Journal first (#7).
         if !self.is_in_memory() {
@@ -1441,15 +1520,18 @@ impl Database {
         self.reindex_doc(id, &old_doc);
         self.handle_ref_delta_and_trash(&old_doc, &new_doc);
 
-        Ok(())
+        Ok(true)
     }
 
     /// Remove a field or array element at a dot-separated path. O(1) file write.
     ///
     /// Path examples: "title", "messages.3", "settings.theme"
     /// For array elements, the index is removed and the array shifts.
-    /// If the path doesn't resolve, the patch is silently skipped during replay.
-    pub fn remove(&self, id: &str, path: &str) -> Result<()> {
+    ///
+    /// Returns `Ok(true)` when something was removed. `Ok(false)` is a no-op:
+    /// the path did not resolve (remove of a missing key is idempotent) —
+    /// nothing changed, nothing journaled.
+    pub fn remove(&self, id: &str, path: &str) -> Result<bool> {
         let _guard = self.writer.lock();
 
         let old_doc = {
@@ -1461,7 +1543,11 @@ impl Database {
         };
 
         let mut new_doc = old_doc.clone();
-        apply_path_remove(&mut new_doc, path);
+        if !apply_path_remove(&mut new_doc, path) {
+            // Unresolvable path: nothing mutated, so journal-first ordering
+            // imposes nothing — return before the journal append (D1).
+            return Ok(false);
+        }
 
         // Journal first (#7).
         if !self.is_in_memory() {
@@ -1489,7 +1575,7 @@ impl Database {
         self.reindex_doc(id, &old_doc);
         self.handle_ref_delta_and_trash(&old_doc, &new_doc);
 
-        Ok(())
+        Ok(true)
     }
 
     /// Helper to get the path of the persistent trash file.
@@ -1564,6 +1650,11 @@ impl Database {
                     );
                 }
             }
+            // B3: without this lock a concurrent purge (foreground or TTL
+            // thread) can read the trash file before this append lands and
+            // rewrite it after — erasing the very record this delete is
+            // about to guarantee.
+            let _trash_guard = self.trash_lock.lock();
             storage::append_doc_trash(&self.trash_doc_path(), &trash_doc)?;
         }
 
@@ -1745,17 +1836,24 @@ impl Database {
     // ─── Layer 3: JSON AST Queries ─────────────────────────────────
 
     /// Execute a JSON AST query. Returns all matching documents.
-    pub fn query(&self, ast: Value) -> Vec<Value> {
+    ///
+    /// The AST is validated first (G4): an unknown operator or malformed
+    /// combinator is `Err(InvalidArgument)` — on every path, not just HTTP.
+    /// A typo must fail loud, never silently degrade to a full-DB scan.
+    pub fn query(&self, ast: Value) -> Result<Vec<Value>> {
+        validate_query_ast(&ast)?;
         let docs = self.docs.read();
-        docs.values()
+        Ok(docs
+            .values()
             .filter(|doc| query_matches(doc, &ast))
             .cloned()
-            .collect()
+            .collect())
     }
 
     /// Execute a JSON AST query with options (limit, sort, offset).
-    pub fn query_with(&self, ast: Value, opts: QueryOptions) -> Vec<Value> {
-        let mut results = self.query(ast);
+    /// Validated like `query` (G4).
+    pub fn query_with(&self, ast: Value, opts: QueryOptions) -> Result<Vec<Value>> {
+        let mut results = self.query(ast)?;
 
         // Sort (dot-notation aware — "meta.views" resolves, not just top-level)
         if let Some((ref field, dir)) = opts.sort_by {
@@ -1781,7 +1879,7 @@ impl Database {
             results.truncate(limit);
         }
 
-        results
+        Ok(results)
     }
 
     /// Execute a query returning only the projected fields, cloning the
@@ -1802,7 +1900,8 @@ impl Database {
         opts: QueryOptions,
         fields: Option<&[String]>,
         text_ids: Option<&HashSet<String>>,
-    ) -> (usize, Vec<Value>) {
+    ) -> Result<(usize, Vec<Value>)> {
+        validate_query_ast(&ast)?;
         let sort_field = opts.sort_by.as_ref().map(|(f, _)| f.clone());
         let mut rows: Vec<(Value, Value)> = {
             let docs = self.docs.read();
@@ -1842,7 +1941,7 @@ impl Database {
             rows.truncate(limit);
         }
 
-        (total, rows.into_iter().map(|(_, proj)| proj).collect())
+        Ok((total, rows.into_iter().map(|(_, proj)| proj).collect()))
     }
 
     /// Term counts per field, single O(n) scan. Array fields count per element
@@ -1954,6 +2053,9 @@ impl Database {
     /// Purge documents from the persistent trash file and files from the file trash 
     /// that are older than the configured TTL (or all if duration is ZERO).
     pub fn purge_trash(&self) -> Result<usize> {
+        // Held for the whole sweep: the doc-trash read-all→rewrite must not
+        // interleave with delete()'s record append (B3).
+        let _trash_guard = self.trash_lock.lock();
         let ttl = match (self.trash_mode, self.trash_ttl) {
             (TrashMode::TTL(t), _) => t,
             (_, Some(t)) => t,
@@ -2119,6 +2221,14 @@ impl Database {
             return Err(Error::invalid_arg("cannot restore in in-memory database"));
         }
 
+        // G1: only a currently-deleted document can be restored. The trash
+        // file keeps entries after a restore, so a second restore would
+        // re-return files and re-inflate the ref counters for a document
+        // that is already live.
+        if !self.deleted.read().contains(id) {
+            return Err(Error::invalid_arg(format!("restore: {id} is not deleted")));
+        }
+
         // Read TRASH file to find the most recent trash entry for this ID
         let trash_docs = storage::read_trash(&self.trash_doc_path())?;
         let mut last_trash_entry: Option<Value> = None;
@@ -2131,23 +2241,17 @@ impl Database {
 
         let mut trash_doc = last_trash_entry.ok_or_else(|| Error::not_found(id))?;
 
-        // Extract and restore any implicitly trashed files
-        if let Some(trashed_files) = trash_doc.get("_trashed_files").and_then(|v| v.as_array()) {
-            for f in trashed_files {
-                if let Some(s) = f.as_str() {
-                    if let Some(file_ref) = FileRef::from_compact(s) {
-                        let bucket = self.bucket(&file_ref.bucket);
-                        // The document comes back either way; a file that did
-                        // not is a dangling reference, which the caller must be
-                        // able to see rather than have silently re-declared as
-                        // restored.
-                        if let Err(e) = bucket.restore(&file_ref.id, &file_ref.ext) {
-                            report::suppressed("restore: return file from trash", e);
-                        }
-                    }
-                }
-            }
-        }
+        // The file list is needed after the metadata strip below — owned,
+        // because the strip mutates the document it came from.
+        let trashed_files: Vec<String> = trash_doc
+            .get("_trashed_files")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Strictly strip engine metadata
         if let Some(obj) = trash_doc.as_object_mut() {
@@ -2157,17 +2261,9 @@ impl Database {
 
         let doc = trash_doc;
 
-        // Restore file reference counters
-        let mut extracted_file_refs = HashSet::new();
-        Self::extract_file_refs(&doc, &mut extracted_file_refs);
-        {
-            let mut file_refs = self.file_refs.write();
-            for r in extracted_file_refs {
-                *file_refs.entry(r).or_insert(0) += 1;
-            }
-        }
-
-        // Append restored doc to file
+        // Journal first (G1): the restored document is appended before any
+        // file, counter, or in-memory state moves, so a failed append leaves
+        // everything exactly as it was and the restore is retryable.
         let line = serde_json::to_string(&doc)?;
         let mut handle = self.get_file_handle()?;
         if let Some(ref mut file) = *handle {
@@ -2178,6 +2274,29 @@ impl Database {
                 _ => {
                     storage::append_line(file, &self.path, &line)?;
                 }
+            }
+        }
+
+        // Return any implicitly trashed files — after the journal holds the
+        // restored document. The document comes back either way; a file that
+        // did not is a dangling reference, which the caller must be able to
+        // see rather than have silently re-declared as restored.
+        for s in &trashed_files {
+            if let Some(file_ref) = FileRef::from_compact(s) {
+                let bucket = self.bucket(&file_ref.bucket);
+                if let Err(e) = bucket.restore(&file_ref.id, &file_ref.ext) {
+                    report::suppressed("restore: return file from trash", e);
+                }
+            }
+        }
+
+        // Restore file reference counters
+        let mut extracted_file_refs = HashSet::new();
+        Self::extract_file_refs(&doc, &mut extracted_file_refs);
+        {
+            let mut file_refs = self.file_refs.write();
+            for r in extracted_file_refs {
+                *file_refs.entry(r).or_insert(0) += 1;
             }
         }
 
@@ -2346,6 +2465,13 @@ impl Database {
     /// Documents may store either the compact nURI or an API URL
     /// (`/api/buckets/images/a1b2c3d4.png`). Both count as live references.
     pub fn release_file(&self, file_ref_str: &str) -> Result<bool> {
+        // G2: the scan of active documents and the trash of the file must
+        // not interleave with a writer — an insert referencing this file
+        // landing mid-scan would leave a live document pointing at a
+        // trashed file. Serialized against all writers via the same lock
+        // they hold.
+        let _guard = self.writer.lock();
+
         let compact = Self::normalize_file_ref(file_ref_str)
             .ok_or_else(|| Error::invalid_arg("Invalid file ref format, expected bucket:hash.ext or /api/buckets/..."))?;
         let file_ref = FileRef::from_compact(&compact)
@@ -2376,6 +2502,13 @@ impl Database {
     /// then sweeps all buckets moving unreferenced physical files to trash.
     /// Returns the number of files moved to trash.
     pub fn gc_buckets(&self) -> Result<usize> {
+        // G2: mark-and-sweep under the writer lock — without it, an insert
+        // landing between the mark phase and the sweep could reference a
+        // file the sweep is about to trash (dangling reference in a live
+        // document). Maintenance sweeps blocking writers briefly is the
+        // correct trade.
+        let _guard = self.writer.lock();
+
         let mut active_refs = HashSet::new();
         
         // 1. Mark phase: extract all possible `{bucket}:{hash}.{ext}` strings
@@ -2772,6 +2905,33 @@ mod tests {
     }
 
     #[test]
+    fn restore_refuses_a_live_document() {
+        // G1: the trash file keeps entries after a restore, so without this
+        // guard a second restore would re-inflate the ref counters (and a
+        // restore of a never-deleted doc would resurrect a stale copy).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("restore_guard.jsonl");
+        let db = Database::open(&path).unwrap();
+
+        let id = db.insert(json!({"v": 1})).unwrap();
+        let err = db.restore(&id).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument { .. }),
+            "restore of a live doc must be refused, got {err:?}"
+        );
+
+        db.delete(&id).unwrap();
+        db.restore(&id).unwrap();
+        let err = db.restore(&id).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument { .. }),
+            "double restore must be refused, got {err:?}"
+        );
+        // The refused double-restore left the document exactly as it was.
+        assert_eq!(db.get(&id).unwrap()["v"], json!(1));
+    }
+
+    #[test]
     fn persistence_immediate() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("immediate.jsonl");
@@ -2842,7 +3002,7 @@ mod tests {
         db.insert(json!({"status": "active", "name": "a"})).unwrap();
         db.insert(json!({"status": "deleted", "name": "b"})).unwrap();
 
-        let results = db.query(json!({"status": {"$eq": "active"}}));
+        let results = db.query(json!({"status": {"$eq": "active"}})).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["name"], "a");
     }
@@ -2853,7 +3013,7 @@ mod tests {
         db.insert(json!({"color": "red"})).unwrap();
         db.insert(json!({"color": "blue"})).unwrap();
 
-        let results = db.query(json!({"color": "red"}));
+        let results = db.query(json!({"color": "red"})).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -2864,16 +3024,16 @@ mod tests {
         db.insert(json!({"score": 50})).unwrap();
         db.insert(json!({"score": 100})).unwrap();
 
-        let gt = db.query(json!({"score": {"$gt": 40}}));
+        let gt = db.query(json!({"score": {"$gt": 40}})).unwrap();
         assert_eq!(gt.len(), 2);
 
-        let lt = db.query(json!({"score": {"$lt": 60}}));
+        let lt = db.query(json!({"score": {"$lt": 60}})).unwrap();
         assert_eq!(lt.len(), 2);
 
-        let gte = db.query(json!({"score": {"$gte": 50}}));
+        let gte = db.query(json!({"score": {"$gte": 50}})).unwrap();
         assert_eq!(gte.len(), 2);
 
-        let lte = db.query(json!({"score": {"$lte": 50}}));
+        let lte = db.query(json!({"score": {"$lte": 50}})).unwrap();
         assert_eq!(lte.len(), 2);
     }
 
@@ -2883,7 +3043,7 @@ mod tests {
         db.insert(json!({"x": 1})).unwrap();
         db.insert(json!({"x": 2})).unwrap();
 
-        let results = db.query(json!({"x": {"$ne": 1}}));
+        let results = db.query(json!({"x": {"$ne": 1}})).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["x"], 2);
     }
@@ -2895,7 +3055,7 @@ mod tests {
         db.insert(json!({"status": "pending"})).unwrap();
         db.insert(json!({"status": "deleted"})).unwrap();
 
-        let results = db.query(json!({"status": {"$in": ["active", "pending"]}}));
+        let results = db.query(json!({"status": {"$in": ["active", "pending"]}})).unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -2906,7 +3066,7 @@ mod tests {
         db.insert(json!({"status": "pending"})).unwrap();
         db.insert(json!({"status": "deleted"})).unwrap();
 
-        let results = db.query(json!({"status": {"$nin": ["deleted"]}}));
+        let results = db.query(json!({"status": {"$nin": ["deleted"]}})).unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -2916,10 +3076,10 @@ mod tests {
         db.insert(json!({"name": "a", "avatar": "yes"})).unwrap();
         db.insert(json!({"name": "b"})).unwrap();
 
-        let exists = db.query(json!({"avatar": {"$exists": true}}));
+        let exists = db.query(json!({"avatar": {"$exists": true}})).unwrap();
         assert_eq!(exists.len(), 1);
 
-        let not_exists = db.query(json!({"avatar": {"$exists": false}}));
+        let not_exists = db.query(json!({"avatar": {"$exists": false}})).unwrap();
         assert_eq!(not_exists.len(), 1);
         assert_eq!(not_exists[0]["name"], "b");
     }
@@ -2936,7 +3096,7 @@ mod tests {
                 {"user": {"$eq": "alice"}},
                 {"status": {"$eq": "active"}}
             ]
-        }));
+        })).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["score"], 150);
     }
@@ -2953,7 +3113,7 @@ mod tests {
                 {"x": {"$eq": 1}},
                 {"x": {"$eq": 3}}
             ]
-        }));
+        })).unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -2965,7 +3125,7 @@ mod tests {
 
         let results = db.query(json!({
             "$not": {"status": {"$eq": "deleted"}}
-        }));
+        })).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["status"], "active");
     }
@@ -2984,7 +3144,7 @@ mod tests {
                 offset: Some(2),
                 sort_by: Some(("score".to_string(), SortDir::Desc)),
             },
-        );
+        ).unwrap();
         assert_eq!(results.len(), 3);
         // Descending: 90, 80, 70, 60, 50, 40, 30, 20, 10, 0
         // Offset 2: 70, 60, 50
@@ -3071,7 +3231,7 @@ mod tests {
         assert_eq!(db.len(), 0);
         assert_eq!(db.iter().len(), 0);
         assert_eq!(db.find("x", &json!(1)).len(), 0);
-        assert_eq!(db.query(json!({"x": 1})).len(), 0);
+        assert_eq!(db.query(json!({"x": 1})).unwrap().len(), 0);
     }
 
     #[test]
@@ -3329,6 +3489,292 @@ mod tests {
         assert_eq!(doc["a"], 1);
         assert_eq!(doc["c"], 3);
         assert!(doc.get("b").is_none());
+    }
+
+    // ─── Applied Flags (D1) ────────────────────────────────────────
+
+    #[test]
+    fn set_returns_applied_flag() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"title": "old", "items": [1, 2]})).unwrap();
+        assert!(db.set(&id, "title", json!("new")).unwrap(), "resolved path applies");
+        assert!(
+            db.set(&id, "title", json!("new")).unwrap(),
+            "same-value re-set is an applied write, not a no-op"
+        );
+        assert!(db.set(&id, "new_field", json!(1)).unwrap(), "leaf creation applies");
+        assert!(!db.set(&id, "no.such.path", json!(1)).unwrap(), "missing intermediate is a no-op");
+        assert!(!db.set(&id, "items.9", json!(1)).unwrap(), "out-of-bounds index is a no-op");
+    }
+
+    #[test]
+    fn remove_returns_applied_flag() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"a": 1})).unwrap();
+        assert!(db.remove(&id, "a").unwrap());
+        assert!(!db.remove(&id, "a").unwrap(), "removing a missing key is a no-op");
+        assert!(!db.remove(&id, "no.such.path").unwrap());
+    }
+
+    #[test]
+    fn array_push_returns_applied_flag() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"threads": [{"msgs": ["a"]}]})).unwrap();
+        assert!(db.array_push(&id, "tags", json!("a")).unwrap(), "array creation applies");
+        assert!(db.array_push(&id, "tags", json!("b")).unwrap());
+        assert!(
+            db.array_push(&id, "threads.0.msgs", json!("b")).unwrap(),
+            "push into a nested array applies"
+        );
+        assert!(!db.array_push(&id, "threads.9.msgs", json!("x")).unwrap(), "out-of-bounds index is a no-op");
+        assert!(!db.array_push(&id, "tags.0", json!(2)).unwrap(), "push onto a scalar element is a no-op");
+    }
+
+    #[test]
+    fn no_op_writes_no_journal_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("noop_journal.jsonl");
+
+        let id = {
+            let db = Database::open(&path)
+                .unwrap()
+                .with_persistence(Persistence::Immediate);
+            let id = db.insert(json!({"title": "t"})).unwrap();
+            assert!(!db.set(&id, "no.such.path", json!(1)).unwrap());
+            assert!(!db.remove(&id, "ghost.field").unwrap());
+            assert!(!db.array_push(&id, "items.9", json!(1)).unwrap());
+            id
+        };
+
+        let journal = std::fs::read_to_string(&path).unwrap();
+        let op_lines: Vec<&str> = journal.lines().filter(|l| l.contains("\"_op\"")).collect();
+        assert_eq!(
+            op_lines.len(),
+            0,
+            "no-op ops must not touch the journal, got {}: {}",
+            op_lines.len(),
+            journal
+        );
+        // The insert itself did land: exactly one non-meta line.
+        let doc_lines: Vec<&str> = journal.lines().filter(|l| !l.contains("_meta")).collect();
+        assert_eq!(doc_lines.len(), 1, "the insert must be journaled: {}", journal);
+        assert!(doc_lines[0].contains(&id));
+    }
+
+    // ─── Trash Purge Race (B3) ────────────────────────────────────
+
+    #[test]
+    fn purge_during_deletes_never_loses_a_fresh_trash_record() {
+        // A delete that returned Ok promised a restorable record. With a 1h
+        // TTL every record written here is fresh, so the only way one can
+        // vanish is the purgers' read-all→rewrite racing the append. Three
+        // racers: the deleter, a foreground purger, and the TTL thread
+        // (5 ms interval). Afterwards every delete must still restore.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("trash_race.jsonl");
+        let db = std::sync::Arc::new(
+            Database::open(&path)
+                .unwrap()
+                .with_trash_mode(TrashMode::TTL(Duration::from_secs(3600)))
+                .with_trash_ttl(Duration::from_secs(3600), Duration::from_millis(5)),
+        );
+
+        const N: usize = 300;
+        let ids: std::sync::Arc<Mutex<Vec<String>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+
+        // The trash file's first creation is a check-then-init race
+        // (append_doc_trash); the trash lock serializes every real
+        // participant, but the test's unlocked seed does not take it.
+        // Create the file synchronously first, so the racers only ever
+        // append. This delete is fresh too — it joins the check below.
+        let first = db.insert(json!({"i": -1})).unwrap();
+        db.delete(&first).unwrap();
+        ids.lock().push(first);
+
+        let deleter = {
+            let db = std::sync::Arc::clone(&db);
+            let ids = std::sync::Arc::clone(&ids);
+            std::thread::spawn(move || {
+                for i in 0..N {
+                    let id = db.insert(json!({"i": i})).unwrap();
+                    db.delete(&id).unwrap();
+                    ids.lock().push(id);
+                }
+            })
+        };
+        let purger = {
+            let db = std::sync::Arc::clone(&db);
+            let ids = std::sync::Arc::clone(&ids);
+            std::thread::spawn(move || {
+                // A purge only rewrites the trash file when something
+                // actually expired — with fresh-only trash the racy
+                // read→rewrite window never opens. Seed a disposable
+                // ancient record before every sweep so each purge does
+                // real rewrite work while the deleter appends.
+                let seed = json!({"_id": "purge_churn_seed", "_deleted": 1u64});
+                while ids.lock().len() < N {
+                    // Seed under the trash lock like every real writer: a
+                    // trash line is written as multiple syscalls, so an
+                    // UNSERIALIZED appender could interleave mid-line with
+                    // delete's append and corrupt it — line tearing, not
+                    // the B3 race this test hunts.
+                    let seeded = {
+                        let _g = db.trash_lock.lock();
+                        storage::append_doc_trash(&db.trash_doc_path(), &seed)
+                    };
+                    if seeded.is_err() {
+                        continue;
+                    }
+                    db.purge_trash().unwrap();
+                }
+            })
+        };
+        deleter.join().unwrap();
+        purger.join().unwrap();
+
+        let lost = ids.lock().len();
+        assert_eq!(lost, N + 1, "deleter must finish all deletes (plus the pre-seed)");
+        for id in ids.lock().iter() {
+            db.restore(id)
+                .unwrap_or_else(|e| panic!("fresh trash record for {id} lost: {e}"));
+        }
+    }
+
+    // ─── Concurrency of the maintenance locks (G2) ────────────
+    //
+    // Why this is not a race-reproduction test: gc's mark phase holds the
+    // docs read lock for its whole scan (consistent snapshot), and the
+    // end-state of the illegal interleave ("doc references a trashed
+    // file") is indistinguishable from the legal ordering ("gc completed,
+    // then the doc referenced an already-trashed file"). The writer lock
+    // makes sweeps serializable against writers — correct by construction,
+    // not provable by a black-box hammer. What CAN be falsified: the
+    // combined lock graph (writer, trash_lock, gc sweep, purge, delta
+    // writers) deadlocking or corrupting under concurrent load.
+
+    #[test]
+    fn gc_purge_and_writers_run_concurrently_without_corruption() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("gc_locks.jsonl");
+        let db = std::sync::Arc::new(
+            Database::open(&path)
+                .unwrap()
+                .with_persistence(Persistence::Immediate),
+        );
+        let bucket = db.bucket("images");
+
+        // Widen the sweeper's mark phase.
+        for i in 0..200 {
+            db.insert(json!({"filler": i, "blob": "x".repeat(50)})).unwrap();
+        }
+
+        // Anchor docs: each file stays referenced for the whole test, so
+        // hammer-doc deletion (refcount still ≥ 1 via the anchor) can
+        // never orphan the file — the only files that vanish here would
+        // be trashed illegally.
+        let anchors: Vec<String> = (0..10)
+            .map(|i| {
+                let meta = bucket
+                    .store(&format!("g{i}.png"), format!("anchor-{i}").as_bytes(), "image/png")
+                    .unwrap();
+                let r = meta._file.to_string_compact();
+                db.insert(json!({"anchor": true, "img": r})).unwrap();
+                r
+            })
+            .collect();
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut loop_handles = Vec::new();
+
+        // Sweeper and purger loop until stopped. A deadlock in the lock
+        // graph shows up as this test hanging on join.
+        {
+            let db = std::sync::Arc::clone(&db);
+            let stop = std::sync::Arc::clone(&stop);
+            loop_handles.push(std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    db.gc_buckets().unwrap();
+                }
+            }));
+        }
+        {
+            let db = std::sync::Arc::clone(&db);
+            let stop = std::sync::Arc::clone(&stop);
+            loop_handles.push(std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    db.purge_trash().unwrap();
+                }
+            }));
+        }
+
+        // Writer hammer: a bounded number of inserts + delta ops + deletes,
+        // referencing the anchored files round-robin. Joined FIRST — the
+        // loop threads above are stopped only after the hammer finishes.
+        const HAMMER: usize = 300;
+        let ids: std::sync::Arc<Mutex<Vec<String>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut hammer_handles = Vec::new();
+        {
+            let db = std::sync::Arc::clone(&db);
+            let ids = std::sync::Arc::clone(&ids);
+            let anchors = anchors.clone();
+            hammer_handles.push(std::thread::spawn(move || {
+                for n in 0..HAMMER {
+                    let id = db
+                        .insert(json!({"hammer": n, "img": anchors[n % anchors.len()]}))
+                        .unwrap();
+                    db.set(&id, "hammer", json!(n + 1)).unwrap();
+                    ids.lock().push(id);
+                }
+            }));
+        }
+        {
+            let db = std::sync::Arc::clone(&db);
+            let ids = std::sync::Arc::clone(&ids);
+            hammer_handles.push(std::thread::spawn(move || {
+                loop {
+                    let popped = ids.lock().pop();
+                    match popped {
+                        Some(id) => {
+                            db.delete(&id).unwrap();
+                        }
+                        None => break,
+                    }
+                }
+            }));
+        }
+
+        for h in hammer_handles {
+            h.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for h in loop_handles {
+            h.join().unwrap();
+        }
+
+        // Anchored files survived every sweep.
+        for r in &anchors {
+            let fr = FileRef::from_compact(r).unwrap();
+            assert!(
+                db.bucket(&fr.bucket).exists(&fr),
+                "anchored (permanently referenced) file {r} was trashed — illegal sweep"
+            );
+        }
+
+        // Every live document's references resolve.
+        for doc in db.iter() {
+            let mut refs = HashSet::new();
+            Database::extract_file_refs(&doc, &mut refs);
+            for r in refs {
+                let fr = FileRef::from_compact(&r)
+                    .unwrap_or_else(|| panic!("unparseable ref {r} in {doc}"));
+                assert!(
+                    db.bucket(&fr.bucket).exists(&fr),
+                    "dangling reference {r} in live doc — corruption under concurrency"
+                );
+            }
+        }
     }
 
     #[test]

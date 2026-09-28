@@ -62,9 +62,9 @@ Powered by **napi-rs**. The `napi/` crate wraps the Rust `Database` type and exp
 | Database-as-a-Folder | Complete |
 | File buckets with SHA-256 dedup | Complete |
 | `array_push` delta (Rust core) | Complete |
-| Delta updates in Node.js backend | Complete (`arrayPush`, `set`, `remove` wired and used by consumers) |
+| Delta updates in Node.js backend | Complete (`arrayPush`, `set`, `remove` wired and used by consumers; ops return an `applied` flag — `Ok(false)`/`false` = no-op, writes nothing, D1 2026-09-28) |
 | `release_file` + `gc_buckets` (Rust + NAPI) | Complete |
-| TTL-based trash purging | Complete (`with_trash_ttl` + background thread; napi via `trash_ttl` option) |
+| TTL-based trash purging | Complete (`with_trash_ttl` + background thread; napi via `trash_ttl` option; purge serialized against delete's trash append via `trash_lock`, B3 2026-09-28) |
 | Failure discipline | Complete — no bare `let _ =` on a `Result`; preconditions return `Err`, ancillary cleanup is reported (`src/report.rs`); a document is never reported deleted when its trash record could not be written |
 | Journal-first write ordering | Complete — every mutating op appends before any in-memory/index/ref state moves; a failed append changes nothing (fault-injected tests) |
 | `meta.json` bucket policies | Complete — `kind`, `onDocumentDelete`, `ttl_seconds`, `reserved_ttl_seconds` enforced at open; malformed policy fails loudly; schema validation still unenforced |

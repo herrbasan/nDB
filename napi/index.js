@@ -201,11 +201,13 @@ class Database {
   /**
    * Append a value to an array field.
    * @param {string} id - Document ID.
-   * @param {string} field - Top-level array field name.
+   * @param {string} field - Array field name (dot-separated path allowed).
    * @param {*} value - Value to append.
+   * @returns {boolean} true when the push landed; false when the path did
+   *   not resolve (no-op — nothing changed, nothing journaled).
    */
   arrayPush(id, field, value) {
-    this._native.arrayPush(id, field, JSON.stringify(value));
+    return this._native.arrayPush(id, field, JSON.stringify(value));
   }
 
   /**
@@ -213,18 +215,23 @@ class Database {
    * @param {string} id - Document ID.
    * @param {string} path - Dot-separated path (e.g. "messages.3.text").
    * @param {*} value - Value to set.
+   * @returns {boolean} true when the assignment landed (including a
+   *   same-value re-assignment); false when the path did not resolve
+   *   (no-op — nothing changed, nothing journaled).
    */
   set(id, path, value) {
-    this._native.set(id, path, JSON.stringify(value));
+    return this._native.set(id, path, JSON.stringify(value));
   }
 
   /**
    * Remove a field or array element at a dot-separated path.
    * @param {string} id - Document ID.
    * @param {string} path - Dot-separated path (e.g. "messages.3" or "settings.theme").
+   * @returns {boolean} true when something was removed; false when the path
+   *   did not resolve (no-op — nothing changed, nothing journaled).
    */
   remove(id, path) {
-    this._native.remove(id, path);
+    return this._native.remove(id, path);
   }
 
   /**

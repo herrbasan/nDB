@@ -142,22 +142,25 @@ Replace a document. The `_id` field is preserved.
 ```js
 db.update(id, { name: 'Updated Name', age: 32 });
 ```
-### `arrayPush(id, field, value) -> void`
+### `arrayPush(id, field, value) -> boolean`
 
 Append a single element to a top-level array field. This creates a highly optimized delta write to the JSON Lines file rather than rewriting the entire document, which is critical for large documents like conversations.
+
+Returns `true` when the push landed, `false` when the path did not resolve — a no-op: nothing changed, nothing was journaled. `false` is not an error.
 
 ```js
 db.arrayPush(id, 'messages', { role: 'user', content: 'Hello' });
 ```
 
-### `set(id, path, value) -> void`
+### `set(id, path, value) -> boolean`
 
 Set a value at a dot-separated path within a document. Creates a tiny delta patch instead of rewriting the entire document.
 
 - Path uses `.` to separate segments (e.g. `'messages.3.content'`)
 - Numeric segments address array elements by index
 - Creates new fields if the leaf key doesn't exist
-- Unresolvable paths are silently skipped
+- Returns `true` when the assignment landed — including a same-value re-assignment, which is an applied write, not a no-op
+- Returns `false` when the path doesn't resolve (missing intermediate, out-of-bounds index): nothing changed, nothing journaled. `false` is not an error.
 
 ```js
 // Top-level field
@@ -176,12 +179,13 @@ db.set(id, 'tags', ['a', 'b']);
 db.set(id, 'metadata', null);
 ```
 
-### `remove(id, path) -> void`
+### `remove(id, path) -> boolean`
 
 Remove a field or array element at a dot-separated path. Creates a tiny delta patch instead of rewriting the entire document.
 
 - For object fields: the key is removed
 - For array elements: the element is removed and remaining elements shift
+- Returns `true` when something was removed, `false` when the path didn't resolve (idempotent remove of a missing key): nothing changed, nothing journaled. `false` is not an error.
 
 ```js
 // Remove top-level field
@@ -271,6 +275,8 @@ const allDocs = db.iter();
 ### `query(ast) → object[]`
 
 Execute a JSON AST query. See [Query Language Reference](./query-language.md) for full syntax.
+
+**Throws on invalid ASTs** (G4): an unknown operator (`$eqq`), malformed combinator, or non-object root rejects — it never silently degrades to matching every document. Same validation on `queryWith` and the HTTP `/query` route.
 
 ```js
 // Simple equality

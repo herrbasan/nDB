@@ -135,6 +135,55 @@ fn exclude_filters_results() {
     assert_eq!(found, vec!["tortoise"], "city quotes the fable — excluded");
 }
 
+/// G5: a phrase exclude must only exclude docs where the phrase appears
+/// contiguously. Its index candidates are the token conjunction — docs with
+/// the tokens scattered must survive the exclude.
+#[test]
+fn phrase_exclude_only_excludes_contiguous_phrases() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::open(dir.path().join("phrase_ex.jsonl")).unwrap();
+    db.insert(json!({"title": "contiguous", "content": "The quick fox jumps high over rocks."})).unwrap();
+    db.insert(json!({"title": "scattered", "content": "The quick cat naps; later a fox and a dog meet."})).unwrap();
+    db.insert(json!({"title": "no-tokens", "content": "Nothing relevant at all."})).unwrap();
+    db.create_text_index("content").unwrap();
+
+    let found = titles(
+        &db,
+        TextSearch::and(vec![
+            TextQuery::Term("the".into()),
+            TextQuery::Exclude(Box::new(TextQuery::Phrase("quick fox".into()))),
+        ]),
+    );
+    assert_eq!(
+        found,
+        vec!["scattered"],
+        "scattered tokens are not the phrase — must survive; contiguous phrase excluded"
+    );
+}
+
+/// G5, case-sensitive variant: a term exclude's index candidates are
+/// case-insensitive; only the exact-case occurrence may exclude.
+#[test]
+fn case_sensitive_exclude_only_excludes_exact_case() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::open(dir.path().join("case_ex.jsonl")).unwrap();
+    db.insert(json!({"title": "cap", "content": "River runs Paul swift"})).unwrap();
+    db.insert(json!({"title": "low", "content": "River runs paul slow today"})).unwrap();
+    db.create_text_index("content").unwrap();
+
+    let mut s = TextSearch::and(vec![
+        TextQuery::Term("River".into()),
+        TextQuery::Exclude(Box::new(TextQuery::Term("paul".into()))),
+    ]);
+    s.case_sensitive = true;
+    let found = titles(&db, s);
+    assert_eq!(
+        found,
+        vec!["cap"],
+        "lower-case paul must not trigger a case-sensitive exclude"
+    );
+}
+
 /// Whole-token matching: "race" must not match "racetrack" or "graces".
 #[test]
 fn term_whole_token_not_substring() {
