@@ -12,12 +12,14 @@ nDB is an **in-memory document database** with JSON Lines persistence, layered q
 > - `_trash/` (soft-deleted documents and files)
 > - `meta.json` (schema/bucket metadata — written by the CLI/migration, **not yet enforced** by the core)
 > 
-> This removes the need for upper-layer management wrappers (like the deprecated nGDB). nDB natively handles **Delta patch operations** (e.g. `array_push`) for large objects and **bucket garbage collection**. Schema enforcement and nURI link-type validation remain unimplemented — the core does not read `meta.json` yet.
+> This removes the need for upper-layer management wrappers (like the deprecated nGDB). nDB natively handles **Delta patch operations** (e.g. `array_push`) for large objects and **bucket garbage collection**. Schema enforcement and nURI link-type validation remain unimplemented — the core reads `meta.json`'s `buckets` policy block (kind, lifecycle, TTLs) but ignores the `schemas` block.
 
-## What's New in v1.2.0 (Non-Breaking)
-- **Background Trash TTL**: Added the ability to define a TTL (Time-To-Live) for trashed files and documents, with a non-blocking background thread that automatically cleans up expired trash.
-- **Garbage Collection API**: Added new `gcBuckets()` (Node.js) / `gc_buckets()` (Rust) APIs to scan file buckets and automatically trash unreferenced files.
-- **Opt-in Compatibility**: These additions are completely backward-compatible. Users can opt in to the background GC via `trash_ttl` and `trash_purge_interval` options in `Database.open()`.
+## What's New in v1.4.0 (Non-Breaking)
+- **Item buckets** — a second bucket kind (`kind: "items"` in `meta.json`) for app-managed assets: the engine hands out a folder per item, your code streams the bytes (any size — no buffers, no ceilings), and commits one facts record. Reserve/commit/trash/restore, reserved-TTL sweeps, and `verify` integrity with streaming SHA-256.
+- **`meta.json` bucket policies** — `onDocumentDelete` (`restrict`/`trash`), per-bucket `ttl_seconds`, read at open. Malformed policy fails loudly; absence means the pre-policy behavior.
+- **Journal-first write ordering** — every mutating operation appends to the journal before any state moves; a failed write changes nothing and is retryable.
+- **Failure discipline** — operations that used to silently succeed while failing now return errors; `close()` on the public wrapper; no process aborts on bad input.
+- **Release package** — prebuilt Windows x64 binaries + SHA-256 sidecars on the GitHub release, and `napi/vendor.js` to fetch-and-verify them without a Rust toolchain.
 
 ## Features
 

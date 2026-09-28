@@ -43,14 +43,15 @@ Every document lives in a `HashMap<String, Value>` at runtime, providing O(1) lo
 ```
 `Database::open("my-app/data.jsonl")` → in-memory store backed by `my-app/data.jsonl`, with buckets in `my-app/_files/` and trash in `my-app/_trash/`.
 
-**Deployment (submodule workflow).** Consumers embed nDB as a git submodule. Per machine, after pulling:
+**Deployment (submodule workflow).** Consumers embed nDB as a git submodule. On Windows x64 no build step is needed — the committed `napi/*.win32-x64-msvc.node` prebuilt is what `index.js` loads. For a checkout without the binary (or to repair one), `node napi/vendor.js` fetches the artifact for the package's version from the GitHub release and verifies it against the release's SHA-256 sidecar before it enters the load path. Only when neither applies — an unsupported platform — is the Rust toolchain needed:
 
 ```
-node setup.js        # builds the CLI (ndb, incl. `ndb serve`) → bin/ndb[.exe]
-node napi/setup.js   # builds the Node bindings → napi/*.node
+node napi/vendor.js   # ensure the Node binding (prebuilt or fetched+verified)
+node napi/setup.js    # or build the Node bindings from source → napi/*.node
+node setup.js         # build the CLI (ndb, incl. `ndb serve`) → bin/ndb[.exe]
 ```
 
-`bin/` and `target/` are per-machine artifacts (gitignored). The committed `napi/*.win32-x64-msvc.node` files are prebuilts for Windows x64; other platforms build via `napi/setup.js`.
+`bin/` and `target/` are per-machine artifacts (gitignored). Release binaries (`ndb-node.*.node`, `ndb[.exe]`, plus `.sha256` sidecars) are attached to the GitHub release for each version tag.
 
 ---
 
