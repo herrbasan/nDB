@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "ndb"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "criterion",
  "fastrand",
@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "ndb-node"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "napi",
  "napi-derive",
