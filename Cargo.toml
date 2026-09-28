@@ -40,3 +40,7 @@ path = "benches/search_perf.rs"
 [[example]]
 name = "doc_perf"
 path = "benches/doc_perf.rs"
+
+[[example]]
+name = "boundary_rust"
+path = "benches/boundary_rust.rs"
