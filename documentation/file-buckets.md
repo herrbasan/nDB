@@ -1,25 +1,52 @@
 # nDB File Buckets
 
-> Binary file storage with SHA-256 content-hash deduplication.
+> Binary file storage alongside your documents — in two kinds.
 
 ---
 
-## Overview
+## Two Kinds of Buckets
 
-File Buckets provide named storage for binary data alongside your documents. Files are stored by their SHA-256 content hash, meaning identical content is stored only once (deduplication).
+Every bucket is one of two kinds, declared per bucket in `meta.json`. **They are two keying strategies, not a hierarchy** — and they mix freely within one database:
+
+| | `hash` (default) | `items` |
+|---|---|---|
+| identity | the content (SHA-256) | the item (`itm_…` id → folder) |
+| dedup / refcounting | yes — the point | no — an item owns its folder |
+| byte motion | `store` / `get` (whole buffers) | the app streams; nDB never holds a buffer |
+| layout | `_files/<bucket>/<hash8>.<ext>` | `_files/<bucket>/<itemId>/` + `items.jsonl` |
+| deletion | `releaseFile` / `gc_buckets` | folder → `_trash/`, whole |
+| extra files per item | none | variants, description file — opaque payload, never parsed |
+| built for | shared blobs (chat attachments, avatars) | app-managed assets (media pools) — any size |
+
+- **Hash buckets** store each file once under its content hash. Identical content deduplicates; files are reference-counted from documents and garbage-collected when orphaned. The engine moves the bytes — `store` takes a buffer, `get` returns one.
+- **Item buckets** group an item's files into one folder the application streams into itself. The engine hands out the folder path and keeps the records; it is never in the ingest path, so there is no buffer and no size ceiling. Choose this when a file *belongs* to something — an asset with variants and a description — rather than being shared content.
+
+Undeclared buckets are `"hash"`, so existing databases upgrade without activating anything.
 
 ```
 mydb/
-├── data.jsonl                   # Document store (passed to Database::open)
-└── _files/                       # All file buckets (created implicitly, sibling of data.jsonl)
-    ├── avatars/                  # Bucket "avatars"
-    │   ├── a1b2c3d4e5f6.png      # Stored by hash prefix
-    │   └── g7h8i9j0k1l2.jpg
-    └── attachments/              # Bucket "attachments"
-        └── m3n4o5p6q7r8.pdf
+├── data.jsonl                  # Document store (passed to Database::open)
+├── meta.json                   # Declares kind (and policies) per bucket
+└── _files/                     # All buckets, both kinds (created implicitly)
+    ├── avatars/                # kind: "hash"
+    │   └── a1b2c3d4.png        # Content-keyed blob
+    └── media/                  # kind: "items"
+        ├── items.jsonl         # Engine-owned record journal
+        └── itm_V1StGXR8Z5jdHi6B/   # One folder per item
+            ├── original.mp4    # Original (facts.name)
+            ├── original_720.webp   # Variant — opaque payload
+            └── asset.json      # Caller's description file
 ```
 
+Trash mirrors the split: `_trash/files/<bucket>/` holds hash blobs by filename and item folders whole.
+
 ---
+
+## Hash Buckets (`kind: "hash"`, the default)
+
+Hash buckets provide named storage for binary data alongside your documents. Files are stored by their SHA-256 content hash, meaning identical content is stored only once (deduplication).
+
+The sections from here to *FileMeta* — creating, storing, retrieving, deleting, listing, references — describe the hash kind. The item kind has its own section: *Item Buckets* further down.
 
 ## Creating a Bucket
 
@@ -33,7 +60,7 @@ The bucket name becomes a subdirectory under `_files/`. Valid names: alphanumeri
 
 ### Bucket policies (`meta.json`)
 
-Buckets may be *declared* in the database folder's `meta.json`, and the core enforces two policy keys at open (#10):
+Buckets may be *declared* in the database folder's `meta.json`, and the core enforces the policy block at open (#10):
 
 ```json
 {
@@ -57,16 +84,7 @@ Absence — no `meta.json`, no `buckets` block, no entry for the bucket — mean
 
 ## Item Buckets (`kind: "items"`)
 
-A second bucket kind for app-managed assets (#9). Where a hash bucket keys blobs by content, an item bucket keys **folders** by an engine-issued item id — and the application, not the engine, moves the bytes. nDB is never in the ingest path, so there is no buffer and no size ceiling on this kind.
-
-| | `hash` (default) | `items` |
-|---|---|---|
-| identity | the content (SHA-256) | the item (`itm_…` id → folder) |
-| dedup / refcounting | yes — the point | no — an item owns its folder |
-| byte motion | `store` / `get` (whole buffers) | the app streams; nDB never holds a buffer |
-| layout | `_files/<bucket>/<hash8>.<ext>` | `_files/<bucket>/<itemId>/` + `items.jsonl` |
-| deletion | `releaseFile` / `gc_buckets` | folder → `_trash/`, whole |
-| extra files per item | none | variants, description file — opaque payload, never parsed |
+The second kind from the table above (#9). Where a hash bucket keys blobs by content, an item bucket keys **folders** by an engine-issued item id — and the application, not the engine, moves the bytes. nDB is never in the ingest path, so there is no buffer and no size ceiling on this kind.
 
 ### Declaration
 
