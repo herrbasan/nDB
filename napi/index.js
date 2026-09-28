@@ -319,6 +319,28 @@ class Database {
   }
 
   /**
+   * Projected, paginated query — the compact-list shape. Filters, sorts
+   * and paginates on the Rust side; returns ONLY the named fields (plus
+   * `_id`) and the pre-pagination `total`. One boundary crossing per page;
+   * unprojected fields never cross. Omit `fields` for full documents.
+   * @param {object} ast - Query AST.
+   * @param {object} [options] - limit / offset / sortBy / sortDir.
+   * @param {string[]} [fields] - Field names to return.
+   * @returns {{total: number, results: object[]}}
+   */
+  async queryPage(ast, options, fields) {
+    const opts = options || {};
+    return JSON.parse(await this._native.queryPage(
+      JSON.stringify(ast),
+      opts.limit,
+      opts.offset,
+      opts.sortBy,
+      opts.sortDir,
+      fields
+    ));
+  }
+
+  /**
    * Create a hash index on a field.
    * @param {string} field - Field name.
    */

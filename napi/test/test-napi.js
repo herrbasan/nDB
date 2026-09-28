@@ -462,6 +462,41 @@ test('queryWith with offset', async () => {
   assertEqual(results[0].name, 'B', 'First should be B (offset 1)');
 });
 
+test('queryPage returns projected fields and pre-pagination total', async () => {
+  const db = Database.openInMemory();
+  for (let i = 0; i < 30; i++) {
+    db.insert({
+      name: `file-${i}`,
+      kind: i % 2 ? 'image' : 'video',
+      m_date: i,
+      body: 'x'.repeat(1000)
+    });
+  }
+
+  const page = await db.queryPage(
+    { kind: { $eq: 'image' } },
+    { sortBy: 'm_date', sortDir: 'desc', limit: 5, offset: 0 },
+    ['name', 'kind', 'm_date']
+  );
+  assertEqual(page.total, 15, 'total is the full match count, not the page size');
+  assertEqual(page.results.length, 5, 'page honors limit');
+  assertEqual(page.results[0].m_date, 29, 'sorted desc');
+  for (const doc of page.results) {
+    assert(doc._id, '_id always included');
+    assert(doc.body === undefined, 'unprojected fields must not cross the boundary');
+  }
+
+  // fields omitted → full documents
+  const full = await db.queryPage({ kind: { $eq: 'video' } }, { limit: 2 });
+  assertEqual(full.total, 15);
+  assert(typeof full.results[0].body === 'string', 'no fields → full docs');
+
+  // G4 consistency: invalid AST rejects
+  let threw = false;
+  try { await db.queryPage({ kind: { $eqq: 'x' } }, {}, ['name']); } catch (e) { threw = true; }
+  assert(threw, 'queryPage must validate the AST');
+});
+
 test('queryWith with desc sort', async () => {
   const db = Database.openInMemory();
   db.insert({ name: 'A', score: 10 });

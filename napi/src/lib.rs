@@ -68,6 +68,34 @@ impl Task for QueryWithTask {
     }
 }
 
+pub struct QueryPageTask {
+    db: Arc<RustDatabase>,
+    ast: serde_json::Value,
+    opts: QueryOptions,
+    fields: Option<Vec<String>>,
+}
+
+#[napi]
+impl Task for QueryPageTask {
+    type Output = (usize, Vec<serde_json::Value>);
+    type JsValue = String;
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.db
+            .query_projected(
+                self.ast.clone(),
+                self.opts.clone(),
+                self.fields.as_deref(),
+                None,
+            )
+            .map_err(|e| Error::from_reason(format!("Query failed: {}", e)))
+    }
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        let (total, results) = output;
+        serde_json::to_string(&serde_json::json!({ "total": total, "results": results }))
+            .map_err(|e| Error::from_reason(format!("Serialization failed: {}", e)))
+    }
+}
+
 pub struct ExportTask {
     db: Arc<RustDatabase>,
     dest: std::path::PathBuf,
@@ -469,6 +497,53 @@ impl Database {
             db: self.inner()?,
             ast: ast_value,
             opts,
+        }))
+    }
+
+    /// Projected, paginated query — the compact-list shape: filter, sort
+    /// and offset/limit all run on the Rust side; only the named fields
+    /// (plus `_id`) cross the boundary, together with the pre-pagination
+    /// `total`. Omit `fields` for full documents.
+    ///
+    /// ```js
+    /// const { total, results } = await db.queryPage(
+    ///   { kind: { $eq: 'image' } },
+    ///   { sortBy: 'm_date', sortDir: 'desc', limit: 50, offset: 0 },
+    ///   ['name', 'c_date', 'm_date', 'fsize', 'thumbnail']
+    /// );
+    /// ```
+    #[napi]
+    pub fn query_page(
+        &self,
+        ast: String,
+        limit: Option<u32>,
+        offset: Option<u32>,
+        sort_by: Option<String>,
+        sort_dir: Option<String>,
+        fields: Option<Vec<String>>,
+    ) -> Result<AsyncTask<QueryPageTask>> {
+        let ast_value: serde_json::Value = serde_json::from_str(&ast)
+            .map_err(|e| Error::from_reason(format!("Invalid JSON AST: {}", e)))?;
+
+        let dir = sort_dir
+            .as_deref()
+            .map(|d| match d {
+                "desc" | "DESC" => SortDir::Desc,
+                _ => SortDir::Asc,
+            })
+            .unwrap_or(SortDir::Asc);
+
+        let opts = QueryOptions {
+            limit: limit.map(|l| l as usize),
+            offset: offset.map(|o| o as usize),
+            sort_by: sort_by.map(|f| (f, dir)),
+        };
+
+        Ok(AsyncTask::new(QueryPageTask {
+            db: self.inner()?,
+            ast: ast_value,
+            opts,
+            fields,
         }))
     }
 

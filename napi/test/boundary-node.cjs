@@ -36,6 +36,22 @@ async function main() {
   console.log(`query_500hits     ${((
     (performance.now() - t) * 1000) / n).toFixed(1).padStart(10)} µs/op`);
 
+  // ── same 500 hits, PROJECTED to 3 small fields (queryPage) ────────
+  t = performance.now();
+  n = 50;
+  for (let i = 0; i < n; i++) {
+    const page = await db.queryPage(
+      { status: { $eq: 'active' } },
+      { sortBy: 'i', sortDir: 'asc', limit: 500 },
+      ['i', 'status', 'title']
+    );
+    if (page.total !== 500 || page.results.length !== 500) {
+      throw new Error(`expected 500/500, got ${page.total}/${page.results.length}`);
+    }
+  }
+  console.log(`queryPage_500hits ${((
+    (performance.now() - t) * 1000) / n).toFixed(1).padStart(10)} µs/op`);
+
   // ── get one doc (~600 B per op) ──────────────────────────────────
   const probe = await db.query({ i: { $eq: 0 } });
   const firstActive = probe[0]._id;
