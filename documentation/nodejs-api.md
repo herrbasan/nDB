@@ -509,7 +509,7 @@ console.log(`Garbage collection trashed ${trashedCount} files.`);
 
 ## Item Buckets (`kind: "items"`)
 
-Buckets declared `{ "kind": "items" }` in `meta.json` manage **item folders** instead of content-hashed blobs — for app-managed assets like a media pool. The engine hands out a folder path and keeps the records; **your code streams the bytes** (any size — nDB never holds a buffer). Full semantics: [file-buckets.md](file-buckets.md#item-buckets-kind-items).
+Buckets declared `{ "kind": "items" }` in `meta.json` manage **item folders** instead of content-hashed blobs — for app-managed assets like a media pool. The engine hands out a folder path and keeps the records; **your code streams the bytes** (any size — nDB never holds a buffer). Full semantics and the worked ingest/serve pattern: [file-buckets.md](file-buckets.md#item-buckets-kind-items).
 
 ```js
 // meta.json: { "buckets": { "media": { "kind": "items" } } }

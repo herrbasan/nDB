@@ -84,6 +84,69 @@ Absence of `kind` means `"hash"` — existing databases activate nothing. Record
 4. **`deleteItem(itemId)`** — record tombstoned, folder moved to `_trash/files/<bucket>/<itemId>/` whole. **`restoreItem(itemId)`** reverses it.
 5. **Reserved sweep** — reserved items older than `reserved_ttl_seconds` (default 30 min) are tombstoned and trashed by `sweepReservedItems()` and by the TTL background thread. An abandoned reservation is never an undeletable empty folder.
 
+### The ingest pattern (worked example)
+
+The engine is never in the byte path — reserve hands you a folder, you stream, you commit what you measured. End to end, Node.js:
+
+```js
+const { createWriteStream, createReadStream } = require('fs');
+const { createHash } = require('crypto');
+const { pipeline } = require('stream/promises');
+const path = require('path');
+
+// ── Ingest: an upload of any size (the spec's consumer takes 4 GiB) ──
+
+// 1. Reserve — the engine creates the folder and hands out the path.
+const { itemId, path: folder } = db.createItem('media');
+
+try {
+  // 2. Stream the upload to disk yourself, hashing and metering as you
+  //    go. crypto.Hash is a Transform: bytes pass through unchanged and
+  //    the digest accumulates — the hash costs you nothing extra.
+  const hash = createHash('sha256');
+  let size = 0;
+  const meter = new (require('stream').Transform)({
+    transform(chunk, _enc, cb) { size += chunk.length; cb(null, chunk); }
+  });
+  await pipeline(uploadStream, meter, hash, createWriteStream(path.join(folder, upload.filename)));
+
+  //    Variants and the description file live beside the original —
+  //    opaque payload the engine moves with the folder and never parses.
+  await makeVariants(folder);                              // your code
+  writeFileSync(path.join(folder, 'asset.json'), JSON.stringify(assetMeta));
+
+  // 3. Commit — one write carrying the facts measured while streaming.
+  db.commitItem('media', itemId, {
+    name: upload.filename,       // required
+    size,                        // required
+    sha256: hash.digest('hex'),  // required
+    mime: upload.mimetype,       // optional
+    ...assetMeta                 // anything else passes through
+  });
+} catch (err) {
+  // Aborted upload: never commit. An abandoned reservation is swept by
+  // reserved_ttl_seconds — or delete it explicitly right now.
+  db.deleteItem('media', itemId);
+  throw err;
+}
+
+// ── Serve: reads are filesystem-direct too ──
+
+const item = db.readItem('media', itemId);
+res.setHeader('content-type', item.facts.mime);
+res.setHeader('content-length', item.facts.size);
+createReadStream(path.join(item.path, item.facts.name)).pipe(res);
+
+// ── Housekeeping ──
+
+db.deleteItem('media', itemId);          // folder → _trash/, whole, recoverable
+db.restoreItem('media', itemId);         // ...and back
+db.sweepReservedItems('media');          // abandoned reservations (also: TTL thread)
+const anomalies = db.verifyItemBuckets(); // [] means every original matches its facts
+```
+
+The three things to internalize: **the path is engine-issued** (never hand-assemble it), **the hash is caller-computed** (you touched every byte anyway), and **an uncommitted item is not a failure** — it is a reserved item, and the sweep is its cleanup.
+
 ### Integrity (`verify`)
 
 `ndb verify` and `verifyItemBuckets()` check, per items bucket: every **live** item's original (`facts.name`) exists and matches its committed `size`/`sha256` (hashed streaming — originals are never read whole); every **reserved** item has its folder; every folder has a live record, else it is flagged an orphan (sweepable).
