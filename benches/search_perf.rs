@@ -88,6 +88,26 @@ fn main() {
         .unwrap();
     println!("OR query: {} hits in {:?}", hits.len(), t4.elapsed());
 
+    // Phrase exclude — the G5 path: candidates for the exclude are the
+    // token conjunction (huge in this corpus); v1.5.0 verifies each against
+    // raw text before diffing. Hit counts differ between versions by design:
+    // v1.4.0 over-excludes (conjunction), v1.5.0 excludes only contiguous.
+    let t4b = Instant::now();
+    let hits = db
+        .text_search(
+            "content",
+            &TextSearch::and(vec![
+                TextQuery::Term("forest".into()),
+                TextQuery::Exclude(Box::new(TextQuery::Phrase("the hare was tired".into()))),
+            ]),
+        )
+        .unwrap();
+    println!(
+        "term + phrase-exclude: {} hits in {:?}  (v1.4.0 over-excludes: fewer hits, faster; v1.5.0 correct)",
+        hits.len(),
+        t4b.elapsed()
+    );
+
     // Write-while-indexed cost (array_push-like set on content)
     let id = db
         .text_search("content", &TextSearch::and(vec![TextQuery::Term("forest".into())]))
