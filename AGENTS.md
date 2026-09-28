@@ -25,7 +25,7 @@ nDB is an **embeddable in-memory document database** built in Rust with native N
 
 - **Single-writer, multi-reader** concurrency. One thread writes at a time; many threads can read simultaneously.
 - **Append-only JSON Lines** persistence. Every write appends a line. On load, the file is replayed: last write wins, tombstones mark deletions, delta patches are applied in order.
-- **Database-as-a-Folder.** One directory per database: `data.jsonl` (documents — the file passed to `open()`), `_files/` (binary storage, created implicitly), `_trash/` (soft-deleted items), and `meta.json` (schema/config — written by the CLI/migration, not yet read by the core).
+- **Database-as-a-Folder.** One directory per database: `data.jsonl` (documents — the file passed to `open()`), `_files/` (binary storage, created implicitly), `_trash/` (soft-deleted items), and `meta.json` (bucket declarations/policies — written by the CLI/migration, **read by the core at open**: `kind`, `onDocumentDelete`, `ttl_seconds`, `reserved_ttl_seconds`; the `schemas` block is still ignored).
 - **Zero dependencies beyond the Rust standard library plus `serde`, `serde_json`, `parking_lot`, `fastrand`, and `thiserror`.** No external crypto, no external DB engines. SHA-256 for file deduplication is hand-rolled.
 
 ## Query Layers
@@ -72,6 +72,20 @@ Powered by **napi-rs**. The `napi/` crate wraps the Rust `Database` type and exp
 | Schema validation from `meta.json` | Not implemented (`meta.json` schemas block ignored) |
 | nURI `link` type enforcement | Not implemented (file refs detected heuristically by string match, not by schema) |
 | Bucket migration script for legacy data | Not bundled here (the consumer's `migrate-ndb-to-folder.js` was used in production) |
+
+## Release Path (established 2026-09-28, v1.4.0)
+
+**The git tag is the version truth.** Cutting a release:
+
+1. Bump all four manifests in one commit: `Cargo.toml`, `napi/Cargo.toml`, `napi/package.json`, root `package.json`.
+2. Rebuild both binaries and deploy them by copy — **`npm run build` compiles but does not deploy**; the copy is the deploy:
+   - `cargo build --release -p ndb-node` → copy `target/release/ndb_node.dll` over `napi/ndb-node.win32-x64-msvc.node`
+   - `cargo build --release --bin ndb` → copy `target/release/ndb.exe` to `bin/ndb.exe` (bin/ is gitignored; the CLI ships via the release, not the repo)
+3. Oracles before tagging: full `cargo test` (all phases, unmodified) + `npm test` in `napi/` **against the fresh binary** (66+ tests + shape guard + harness self-check).
+4. Commit the bump *with* the rebuilt `napi/*.node` — the committed prebuilt is the zero-setup path for win32-x64 consumers; a stale committed binary is the #6 trap (panic locations that don't map to source).
+5. `git tag -a vX.Y.Z`, push, then `gh release create vX.Y.Z` with `ndb-node.win32-x64-msvc.node`, `ndb.exe`, and a `.sha256` sidecar per artifact (`<hash>  <name>`, lowercase hex).
+
+**Consumer side:** `node napi/vendor.js` — no-op when the committed prebuilt exists; otherwise downloads the artifact for its own `package.json` version from the GitHub release and verifies it against the sidecar *before* it enters the load path (temp file, verify, rename; a failed verification keeps nothing). Unsupported platform/arch fails loudly with the build-from-source path (`napi/setup.js` / `setup.js`, Rust toolchain required). Release matrix is **Windows x64 only** for now; add platforms as matrix entries in `vendor.js` + release assets, not by cross-compiling locally.
 
 ## What nDB Is Not
 
