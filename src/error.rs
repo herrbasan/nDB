@@ -50,6 +50,18 @@ pub enum Error {
     /// Bucket policy from meta.json forbids the operation.
     #[error("bucket policy violation: {reason}")]
     PolicyViolation { reason: String },
+
+    /// A sync cursor points before the oldest replayable sequence.
+    #[error("cursor expired: requested seq {requested_seq}, oldest available {min_available_seq} (last {last_seq})")]
+    CursorExpired {
+        requested_seq: u64,
+        min_available_seq: u64,
+        last_seq: u64,
+    },
+
+    /// A sync cursor points past the last committed sequence.
+    #[error("cursor ahead of journal: requested seq {requested_seq}, last {last_seq}")]
+    CursorAhead { requested_seq: u64, last_seq: u64 },
 }
 
 impl Error {

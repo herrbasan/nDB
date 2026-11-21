@@ -239,11 +239,12 @@ fn handle_init(args: &[String]) {
         process::exit(EXIT_GENERAL_ERROR);
     }
 
-    // Write empty _meta header for data.jsonl (library-compatible doc store name)
-    let data_jsonl = format!("{{\"_meta\":{{\"version\":1,\"created\":\"{}\"}}}}\n",
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
-
-    if let Err(e) = fs::write(path.join("data.jsonl"), data_jsonl) {
+    // Write the empty journal with a lineage header: a new database gets a fresh
+    // epoch, nothing committed, full history.
+    if let Err(e) = ndb::storage::init_file(
+        &path.join("data.jsonl"),
+        &ndb::storage::SourceLineage::fresh(),
+    ) {
         eprintln!("Failed to write data.jsonl: {}", e);
         process::exit(EXIT_GENERAL_ERROR);
     }
@@ -641,7 +642,11 @@ fn handle_merge(args: &[String]) {
     // Write data.jsonl
     let target_db = dest_path.join("data.jsonl");
     let active: Vec<&serde_json::Value> = resolved_docs.values().collect();
-    if let Err(e) = ndb::storage::rewrite_atomic(&target_db, &active) {
+    if let Err(e) = ndb::storage::rewrite_atomic_with_meta(
+        &target_db,
+        &active,
+        &ndb::storage::SourceLineage::fresh(),
+    ) {
         eprintln!("Failed to write merged data.jsonl: {}", e);
         process::exit(EXIT_GENERAL_ERROR);
     }

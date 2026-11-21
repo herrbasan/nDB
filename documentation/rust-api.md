@@ -512,8 +512,8 @@ Check if an index exists for a field.
 
 Rewrite the JSONL file to contain only active documents. Archive deleted documents to trash.
 
-- No-op for in-memory databases
 - Atomic: uses temp file + rename
+- Never resets `seq`: `source_epoch_uuid` and `last_seq` survive, `min_available_seq` advances to `last_seq + 1`, and the in-memory change log is cleared
 - Safe to call periodically
 
 ```rust
@@ -536,6 +536,67 @@ List IDs of all soft-deleted documents.
 ### `trash_dir() -> PathBuf`
 
 Get the path to the trash directory.
+
+---
+
+## Sync Feed
+
+Durable lineage and change replay. The journal is the truth; these calls expose
+it atomically under the writer lock.
+
+### Types
+
+```rust
+pub struct SourceLineage {
+    pub source_epoch_uuid: String,   // RFC 4122 UUIDv4, survives compact/export
+    pub last_seq: u64,               // highest committed sequence
+    pub min_available_seq: u64,      // oldest seq `changes_since` can replay
+}
+
+pub enum ChangeKind {
+    Upsert(Value),   // full post-mutation document
+    Delete,
+}
+
+pub struct ChangeEvent { pub seq: u64, pub id: String, pub kind: ChangeKind }
+pub struct ChangeBatch { pub lineage: SourceLineage, pub events: Vec<ChangeEvent> }
+pub struct Snapshot   { pub lineage: SourceLineage, pub docs: Vec<(String, Value)> }
+```
+
+### `lineage() -> SourceLineage`
+
+Current epoch and seq watermarks. In-memory databases carry a lineage too.
+
+### `snapshot_at() -> Snapshot`
+
+A consistent `(lineage, docs)` pair — both read under the writer lock, so no
+commit can land between the watermark and the document set. Documents are
+sorted by id.
+
+### `changes_since(since_seq: u64) -> Result<ChangeBatch>`
+
+Every event with `seq > since_seq`, in strictly ascending order.
+
+| Condition | Result |
+|---|---|
+| `since_seq > last_seq` | `Err(Error::CursorAhead { requested_seq, last_seq })` — the cursor never existed here |
+| `since_seq == last_seq` | `Ok(empty batch)` |
+| `since_seq + 1 < min_available_seq` | `Err(Error::CursorExpired { requested_seq, min_available_seq, last_seq })` — compaction rewrote those events away; resync from a snapshot |
+
+```rust
+let snap = db.snapshot_at();
+// ... ship snap.docs to the client ...
+for event in db.changes_since(snap.lineage.last_seq)?.events {
+    match event.kind {
+        ChangeKind::Upsert(doc) => client.insert(event.id, doc),
+        ChangeKind::Delete => client.remove(&event.id),
+    }
+}
+```
+
+`seq` is engine-owned: it is written to the journal as `_seq` and stripped
+before any document is stored or returned, so `get`/`query`/`snapshot_at`/
+`Upsert` payloads never contain it. A no-op write does not consume a `seq`.
 
 ---
 
@@ -590,6 +651,9 @@ All operations return `ndb::Result<T>` which is `std::result::Result<T, ndb::Err
 | `DatabaseLocked` | Concurrent access conflict | Already locked |
 | `IndexError` | Index operation failed | Drop nonexistent index |
 | `BucketError` | File bucket error | File not in bucket |
+| `PolicyViolation` | `meta.json` bucket policy forbids it | Deleting a doc whose files are `restrict` |
+| `CursorExpired` | Sync cursor predates the oldest replayable seq | `changes_since` across a compaction |
+| `CursorAhead` | Sync cursor is past the last committed seq | `changes_since(last_seq + 1)` |
 
 ```rust
 match db.get(&id) {

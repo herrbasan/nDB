@@ -83,31 +83,49 @@ Multiple threads can read simultaneously. Only one thread can write at a time. W
 The database file is a sequence of JSON objects, one per line:
 
 ```
-{"_meta":{"version":1,"created":1711553200}}
-{"_id":"V1StGXR8Z5jdHi6B","name":"Alice","age":30}
-{"_id":"k8Tm2pQw4xNvRj7L","name":"Bob","age":25}
-{"_id":"V1StGXR8Z5jdHi6B","name":"Alice Smith","age":31}
-{"_id":"V1StGXR8Z5jdHi6B","_op":"set","path":"age","value":32}
-{"_id":"V1StGXR8Z5jdHi6B","_op":"remove","path":"name"}
-{"_id":"k8Tm2pQw4xNvRj7L","_deleted":1711553300}
+{"_meta":{"version":1,"created":1711553200,"source_epoch_uuid":"9f1c0b2e-4a51-4c62-9f5e-2b6a7d8c0e13","last_seq":0,"min_available_seq":1}}
+{"_id":"V1StGXR8Z5jdHi6B","name":"Alice","age":30,"_seq":1}
+{"_id":"k8Tm2pQw4xNvRj7L","name":"Bob","age":25,"_seq":2}
+{"_id":"V1StGXR8Z5jdHi6B","name":"Alice Smith","age":31,"_seq":3}
+{"_id":"V1StGXR8Z5jdHi6B","_op":"set","path":"age","value":32,"_seq":4}
+{"_id":"V1StGXR8Z5jdHi6B","_op":"remove","path":"name","_seq":5}
+{"_id":"k8Tm2pQw4xNvRj7L","_deleted":1711553300,"_seq":6}
 ```
 
 ### Rules
 
-1. **Line 1** is always the `_meta` header with version and creation timestamp.
+1. **Line 1** is always the `_meta` header with version, creation timestamp, and the journal lineage (`source_epoch_uuid`, `last_seq`, `min_available_seq`). Files written before lineage tracking parse unchanged — the three fields default, and the epoch is derived deterministically from `created`.
 2. Each subsequent line is a complete JSON object.
 3. **Last write wins**: if multiple lines have the same `_id`, the last one is the current version.
 4. **Tombstones**: a line with `_deleted` marks a document as deleted.
 5. **Delta patches**: lines with `_op` are patches applied on top of the base document during replay.
-6. **Append-only**: writes only append to the end of the file.
+6. **Sequence**: every committed mutation carries `_seq`, its commit number. It is engine-owned and stripped before a document reaches memory — no read API ever returns it. A line *without* `_seq` is base state (a compacted file, or a pre-lineage journal).
+7. **Append-only**: writes only append to the end of the file.
 
 ### Crash Recovery
 
-On load, `read_all()` parses each line individually. Malformed or truncated lines (from power loss during write) are **skipped with a warning** rather than causing a fatal error. This means:
+On load, `read_all_with_meta()` parses each line individually. Malformed or truncated lines (from power loss during write) are **skipped with a warning** rather than causing a fatal error. This means:
 
 - All data written *before* the crash is preserved.
 - Only the incomplete last write is lost.
+- `last_seq` is the highest `_seq` actually present, so the next commit reuses the number the torn line never got.
 - The database opens successfully after a crash.
+
+---
+
+## Sync Feed
+
+The journal is the durable truth; the feed exposes it under the writer lock.
+
+| Call | Guarantee |
+|---|---|
+| `lineage()` | epoch UUID, `last_seq`, `min_available_seq` |
+| `snapshot_at()` | `(lineage, docs)` read under the writer lock — no commit can slip between the watermark and the document set; docs sorted by id |
+| `changes_since(seq)` | every event with `seq > request`, ascending; `CursorAhead` past `last_seq`, `CursorExpired` when a compaction rewrote them away |
+
+Each event is `{seq, id, kind}` where `kind` is `Upsert(full post-mutation doc)` or `Delete`. A client replays `snapshot_at()` then `changes_since(watermark)` and reaches exactly the live state.
+
+`seq` is assigned inside the writer lock, after the journal append succeeds — a failed append moves neither `seq` nor the feed. A no-op (`set`/`remove`/`array_push` returning `Ok(false)`) is not a commit: no line, no seq, no event. `compact()` preserves the epoch and `last_seq`, advances `min_available_seq` to `last_seq + 1`, and clears the in-memory log; `export_snapshot()` does the same for the copied file.
 
 ---
 
@@ -160,13 +178,15 @@ Compaction rewrites the file to contain only active documents:
 1. Acquire writer lock
 2. Close file handle
 3. Read all active documents from HashMap
-4. Write to a temporary file
+4. Write to a temporary file, carrying the original `_meta` lineage
 5. Atomic rename (temp → real file)
-6. Archive deleted documents to `_trash/docs/`
+6. Archive deleted documents to `_trash/docs/` (already written by `delete()`)
 
 ```rust
 db.compact()?;  // Rewrites file, archives trash
 ```
+
+The rewrite never resets `seq`: `source_epoch_uuid` and `last_seq` are preserved, `min_available_seq` advances to `last_seq + 1`, and the in-memory change log is cleared — everything the rewrite baked into base state is no longer replayable, and a cursor that predates it gets `Error::CursorExpired`.
 
 ---
 

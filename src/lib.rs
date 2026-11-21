@@ -38,6 +38,7 @@ pub use bucket::{FileBucket, FileMeta, FileRef};
 pub use error::{Error, Result};
 pub use item::{ItemBucket, ItemRecord, ItemState};
 pub use search::{TextMode, TextQuery, TextSearch};
+pub use storage::{ChangeBatch, ChangeEvent, ChangeKind, Snapshot, SourceLineage};
 
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
@@ -565,6 +566,60 @@ fn walk_and_remove(current: &mut Value, segments: &[&str], depth: usize) -> bool
 
 // ─── Database ───────────────────────────────────────────────────────
 
+/// Apply one journal entry to replayed state and return the change it
+/// represents. `None` means the entry changed nothing — a patch whose target
+/// document does not exist yet, an unknown op, or an unresolvable path.
+fn replay_journal_entry(
+    docs: &mut HashMap<String, Value>,
+    deleted: &mut HashSet<String>,
+    entry: &Value,
+) -> Option<(String, ChangeKind)> {
+    let id = entry.get("_id").and_then(|v| v.as_str())?.to_string();
+
+    if entry.get("_deleted").is_some() {
+        deleted.insert(id.clone());
+        docs.remove(&id);
+        return Some((id, ChangeKind::Delete));
+    }
+
+    if let Some(op) = entry.get("_op").and_then(|v| v.as_str()) {
+        let applied = {
+            let doc = docs.get_mut(&id)?;
+            match op {
+                // Accept "path" (new, dot-notation) or "field" (legacy, top-level)
+                "array_push" => entry
+                    .get("path")
+                    .or_else(|| entry.get("field"))
+                    .and_then(|v| v.as_str())
+                    .zip(entry.get("value"))
+                    .map_or(false, |(path, value)| {
+                        apply_path_push(doc, path, value.clone())
+                    }),
+                "set" => entry
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .zip(entry.get("value"))
+                    .map_or(false, |(path, value)| {
+                        apply_path_set(doc, path, value.clone())
+                    }),
+                "remove" => entry
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map_or(false, |path| apply_path_remove(doc, path)),
+                _ => false,
+            }
+        };
+        if !applied {
+            return None;
+        }
+        let after = docs.get(&id)?.clone();
+        return Some((id, ChangeKind::Upsert(after)));
+    }
+
+    deleted.remove(&id);
+    docs.insert(id.clone(), entry.clone());
+    Some((id, ChangeKind::Upsert(entry.clone())))
+}
 
 /// What happens to a document's files when the document is deleted,
 /// declared per bucket in `meta.json` (#10).
@@ -741,73 +796,71 @@ pub struct Database {
     bucket_policies: HashMap<String, BucketPolicy>,
     /// Item buckets declared `kind: "items"` in `meta.json` (#9).
     item_buckets: HashMap<String, std::sync::Arc<ItemBucket>>,
+    /// Journal identity and replay window. Written only under `writer`.
+    lineage: RwLock<SourceLineage>,
+    /// Committed change events, oldest first. Cleared by compaction, which is
+    /// what makes everything before the new `min_available_seq` unreplayable.
+    change_log: RwLock<Vec<ChangeEvent>>,
 }
 
 impl Database {
     /// Open or create a database at the given path.
     ///
-    /// If the file exists, loads all documents into memory.
-    /// If not, creates a new file with _meta header.
+    /// If the file exists, loads all documents into memory and rebuilds the
+    /// change feed from the journal: lines carrying `_seq` become events,
+    /// base-state lines of a compacted file do not, and a pre-lineage journal
+    /// replays every line as a commit (its epoch is derived from `_meta.created`
+    /// so the same uncompacted file keeps the same identity across boots).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let base_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
         // Ensure file exists
         if !path.exists() {
-            storage::init_file(&path)?;
+            storage::init_file(&path, &SourceLineage::fresh())?;
         }
 
-        // Load all documents from file
-        let raw_docs = storage::read_all(&path)?;
+        let (meta, raw_docs) = storage::read_all_with_meta(&path)?;
+
+        let legacy = meta
+            .as_ref()
+            .map_or(true, |m| m.source_epoch_uuid.is_none());
+        let source_epoch_uuid = match meta.as_ref().and_then(|m| m.source_epoch_uuid.clone()) {
+            Some(uuid) => uuid,
+            None => storage::legacy_epoch_uuid(meta.as_ref().map_or("", |m| m.created.as_str())),
+        };
+        let mut last_seq = meta.as_ref().map_or(0, |m| m.last_seq);
+        let min_available_seq = meta.as_ref().map_or(1, |m| m.min_available_seq);
 
         // Build in-memory state: last write wins
         let mut docs: HashMap<String, Value> = HashMap::new();
         let mut deleted = HashSet::new();
+        let mut change_log: Vec<ChangeEvent> = Vec::new();
 
-        for doc in raw_docs {
-            if let Some(id) = doc.get("_id").and_then(|v| v.as_str()) {
-                if doc.get("_deleted").is_some() {
-                    // Tombstone entry
-                    deleted.insert(id.to_string());
-                    docs.remove(id);
-                } else if let Some(op) = doc.get("_op").and_then(|v| v.as_str()) {
-                    match op {
-                        "array_push" => {
-                            // Accept "path" (new, dot-notation) or "field" (legacy, top-level)
-                            let target = doc
-                                .get("path")
-                                .or_else(|| doc.get("field"))
-                                .and_then(|v| v.as_str());
-                            if let Some(path) = target {
-                                if let Some(value) = doc.get("value") {
-                                    if let Some(existing) = docs.get_mut(id) {
-                                        apply_path_push(existing, path, value.clone());
-                                    }
-                                }
-                            }
-                        }
-                        "set" => {
-                            if let Some(path) = doc.get("path").and_then(|v| v.as_str()) {
-                                if let Some(value) = doc.get("value") {
-                                    if let Some(existing) = docs.get_mut(id) {
-                                        apply_path_set(existing, path, value.clone());
-                                    }
-                                }
-                            }
-                        }
-                        "remove" => {
-                            if let Some(path) = doc.get("path").and_then(|v| v.as_str()) {
-                                if let Some(existing) = docs.get_mut(id) {
-                                    apply_path_remove(existing, path);
-                                }
-                            }
-                        }
-                        _ => {}
+        for mut entry in raw_docs {
+            let seq = entry
+                .as_object_mut()
+                .and_then(|obj| obj.remove(storage::SEQ_FIELD))
+                .and_then(|v| v.as_u64());
+            let change = replay_journal_entry(&mut docs, &mut deleted, &entry);
+            match seq {
+                Some(seq) => {
+                    last_seq = last_seq.max(seq);
+                    if let Some((id, kind)) = change {
+                        change_log.push(ChangeEvent { seq, id, kind });
                     }
-                } else {
-                    deleted.remove(id);
-                    docs.insert(id.to_string(), doc);
                 }
+                None if legacy => {
+                    if let Some((id, kind)) = change {
+                        last_seq += 1;
+                        change_log.push(ChangeEvent {
+                            seq: last_seq,
+                            id,
+                            kind,
+                        });
+                    }
+                }
+                None => {}
             }
         }
 
@@ -862,10 +915,20 @@ impl Database {
             file_handle: Mutex::new(None),
             bucket_policies,
             item_buckets,
+            lineage: RwLock::new(SourceLineage {
+                source_epoch_uuid,
+                last_seq,
+                min_available_seq,
+            }),
+            change_log: RwLock::new(change_log),
         })
     }
 
     /// Open a purely in-memory database (no disk file).
+    ///
+    /// Carries a full lineage like an on-disk one: every mutation bumps `seq`
+    /// and is recorded, so `lineage`/`snapshot_at`/`changes_since` behave
+    /// identically.
     pub fn open_in_memory() -> Result<Self> {
         Ok(Database {
             path: PathBuf::new(),
@@ -886,6 +949,8 @@ impl Database {
             file_handle: Mutex::new(None),
             bucket_policies: HashMap::new(),
             item_buckets: HashMap::new(),
+            lineage: RwLock::new(SourceLineage::fresh()),
+            change_log: RwLock::new(Vec::new()),
         })
     }
 
@@ -1087,6 +1152,68 @@ impl Database {
         Ok(handle)
     }
 
+    /// Journal one committed mutation: attach `_seq`, append the line, then
+    /// advance the lineage and record the change event.
+    ///
+    /// Caller holds `writer`, which is what makes `last_seq + 1` unique.
+    /// `journal` is the entry written to disk (full document, patch or
+    /// tombstone) and is left without `_seq`. `event_doc` is the document's
+    /// post-mutation state for an upsert, `None` for a delete.
+    ///
+    /// A failed append moves nothing: `seq`, the lineage and the change log
+    /// stay exactly where they were, so the caller can retry whole.
+    fn commit_mutation(
+        &self,
+        id: &str,
+        journal: &mut Value,
+        event_doc: Option<Value>,
+    ) -> Result<u64> {
+        let seq = self.lineage.read().last_seq + 1;
+        {
+            journal
+                .as_object_mut()
+                .ok_or_else(|| Error::invalid_arg("journal entry must be a JSON object"))?
+                .insert(storage::SEQ_FIELD.to_string(), Value::from(seq));
+        }
+        let line = serde_json::to_string(&*journal)?;
+        journal
+            .as_object_mut()
+            .expect("object checked above")
+            .remove(storage::SEQ_FIELD);
+
+        if !self.is_in_memory() {
+            let mut handle = self.get_file_handle()?;
+            if let Some(ref mut file) = *handle {
+                match self.persistence {
+                    Persistence::Immediate => {
+                        storage::append_line_sync(file, &self.path, &line)?;
+                    }
+                    _ => {
+                        storage::append_line(file, &self.path, &line)?;
+                    }
+                }
+            }
+        }
+
+        self.lineage.write().last_seq = seq;
+        self.change_log.write().push(ChangeEvent {
+            seq,
+            id: id.to_string(),
+            kind: match event_doc {
+                Some(mut doc) => {
+                    // Engine-owned: a caller-supplied `_seq` must not ride
+                    // along in the event while the store strips it.
+                    if let Some(obj) = doc.as_object_mut() {
+                        obj.remove(storage::SEQ_FIELD);
+                    }
+                    ChangeKind::Upsert(doc)
+                }
+                None => ChangeKind::Delete,
+            },
+        });
+        Ok(seq)
+    }
+
     // ─── Layer 1: Core Operations ──────────────────────────────────
 
     /// Insert a document. Generates a NanoID `_id` and returns it.
@@ -1106,21 +1233,8 @@ impl Database {
             .ok_or_else(|| Error::invalid_arg("document must be a JSON object"))?
             .insert("_id".to_string(), Value::String(id.clone()));
 
-        // Append to file
-        if !self.is_in_memory() {
-            let line = serde_json::to_string(&doc)?;
-            let mut handle = self.get_file_handle()?;
-            if let Some(ref mut file) = *handle {
-                match self.persistence {
-                    Persistence::Immediate => {
-                        storage::append_line_sync(file, &self.path, &line)?;
-                    }
-                    _ => {
-                        storage::append_line(file, &self.path, &line)?;
-                    }
-                }
-            }
-        }
+        let event_doc = doc.clone();
+        self.commit_mutation(&id, &mut doc, Some(event_doc))?;
 
         // Update indexes
         let mut indexes = self.indexes.write();
@@ -1159,20 +1273,8 @@ impl Database {
             .ok_or_else(|| Error::invalid_arg("document must be a JSON object"))?
             .insert("_id".to_string(), Value::String(id.clone()));
 
-        if !self.is_in_memory() {
-            let line = serde_json::to_string(&doc)?;
-            let mut handle = self.get_file_handle()?;
-            if let Some(ref mut file) = *handle {
-                match self.persistence {
-                    Persistence::Immediate => {
-                        storage::append_line_sync(file, &self.path, &line)?;
-                    }
-                    _ => {
-                        storage::append_line(file, &self.path, &line)?;
-                    }
-                }
-            }
-        }
+        let event_doc = doc.clone();
+        self.commit_mutation(&id, &mut doc, Some(event_doc))?;
 
         let mut indexes = self.indexes.write();
         for (field, index) in indexes.iter_mut() {
@@ -1368,20 +1470,8 @@ impl Database {
             .insert("_id".to_string(), Value::String(id.to_string()));
 
         // Journal first: until the append succeeds, nothing else may move.
-        if !self.is_in_memory() {
-            let line = serde_json::to_string(&new_doc)?;
-            let mut handle = self.get_file_handle()?;
-            if let Some(ref mut file) = *handle {
-                match self.persistence {
-                    Persistence::Immediate => {
-                        storage::append_line_sync(file, &self.path, &line)?;
-                    }
-                    _ => {
-                        storage::append_line(file, &self.path, &line)?;
-                    }
-                }
-            }
-        }
+        let event_doc = new_doc.clone();
+        self.commit_mutation(id, &mut new_doc, Some(event_doc))?;
 
         // Commit in-memory state: the write is durable, the rest is
         // infallible bookkeeping or reported cleanup.
@@ -1437,26 +1527,14 @@ impl Database {
         }
 
         // Journal first.
-        if !self.is_in_memory() {
-            let patch = serde_json::json!({
-                "_id": id,
-                "_op": "array_push",
-                "path": field,
-                "value": value
-            });
-            let line = serde_json::to_string(&patch)?;
-            let mut handle = self.get_file_handle()?;
-            if let Some(ref mut file) = *handle {
-                match self.persistence {
-                    Persistence::Immediate => {
-                        storage::append_line_sync(file, &self.path, &line)?;
-                    }
-                    _ => {
-                        storage::append_line(file, &self.path, &line)?;
-                    }
-                }
-            }
-        }
+        let mut patch = serde_json::json!({
+            "_id": id,
+            "_op": "array_push",
+            "path": field,
+            "value": value
+        });
+        let event_doc = new_doc.clone();
+        self.commit_mutation(id, &mut patch, Some(event_doc))?;
 
         // Commit: store the new state, then sync indexes and ref counters.
         self.docs.write().insert(id.to_string(), new_doc.clone());
@@ -1494,26 +1572,14 @@ impl Database {
         }
 
         // Journal first (#7).
-        if !self.is_in_memory() {
-            let patch = serde_json::json!({
-                "_id": id,
-                "_op": "set",
-                "path": path,
-                "value": value
-            });
-            let line = serde_json::to_string(&patch)?;
-            let mut handle = self.get_file_handle()?;
-            if let Some(ref mut file) = *handle {
-                match self.persistence {
-                    Persistence::Immediate => {
-                        storage::append_line_sync(file, &self.path, &line)?;
-                    }
-                    _ => {
-                        storage::append_line(file, &self.path, &line)?;
-                    }
-                }
-            }
-        }
+        let mut patch = serde_json::json!({
+            "_id": id,
+            "_op": "set",
+            "path": path,
+            "value": value
+        });
+        let event_doc = new_doc.clone();
+        self.commit_mutation(id, &mut patch, Some(event_doc))?;
 
         // Commit: store the new state, then sync indexes and ref counters.
         self.docs.write().insert(id.to_string(), new_doc.clone());
@@ -1550,25 +1616,13 @@ impl Database {
         }
 
         // Journal first (#7).
-        if !self.is_in_memory() {
-            let patch = serde_json::json!({
-                "_id": id,
-                "_op": "remove",
-                "path": path
-            });
-            let line = serde_json::to_string(&patch)?;
-            let mut handle = self.get_file_handle()?;
-            if let Some(ref mut file) = *handle {
-                match self.persistence {
-                    Persistence::Immediate => {
-                        storage::append_line_sync(file, &self.path, &line)?;
-                    }
-                    _ => {
-                        storage::append_line(file, &self.path, &line)?;
-                    }
-                }
-            }
-        }
+        let mut patch = serde_json::json!({
+            "_id": id,
+            "_op": "remove",
+            "path": path
+        });
+        let event_doc = new_doc.clone();
+        self.commit_mutation(id, &mut patch, Some(event_doc))?;
 
         // Commit: store the new state, then sync indexes and ref counters.
         self.docs.write().insert(id.to_string(), new_doc.clone());
@@ -1665,27 +1719,16 @@ impl Database {
         // still live while its files have already moved to trash is a dangling
         // reference. Reaching here means the restorable copy is already on
         // disk, so a failure now cannot strand an un-restorable delete.
-        if !self.is_in_memory() {
+        {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let tombstone = serde_json::json!({
+            let mut tombstone = serde_json::json!({
                 "_id": id,
                 "_deleted": now
             });
-            let line = serde_json::to_string(&tombstone)?;
-            let mut handle = self.get_file_handle()?;
-            if let Some(ref mut file) = *handle {
-                match self.persistence {
-                    Persistence::Immediate => {
-                        storage::append_line_sync(file, &self.path, &line)?;
-                    }
-                    _ => {
-                        storage::append_line(file, &self.path, &line)?;
-                    }
-                }
-            }
+            self.commit_mutation(id, &mut tombstone, None)?;
         }
 
         // Now retire the ref counts and move the orphans aside. A file that
@@ -2026,28 +2069,108 @@ impl Database {
     // ─── Compaction & Trash ────────────────────────────────────────
 
     /// Compact the database: rewrite active docs to a single file and discard any tombstones.
+    ///
+    /// The journal identity and `last_seq` survive — `seq` is never reset — and
+    /// `min_available_seq` advances to `last_seq + 1`: everything before it was
+    /// rewritten as base state and can no longer be replayed as events.
     pub fn compact(&self) -> Result<()> {
         let _guard = self.writer.lock();
 
-        if self.is_in_memory() {
-            return Ok(());
+        let lineage = self.lineage.read().clone();
+        let next_min = lineage.last_seq.saturating_add(1);
+
+        if !self.is_in_memory() {
+            // Close file handle before rewrite
+            {
+                let mut handle = self.file_handle.lock();
+                *handle = None;
+            }
+
+            let docs = self.docs.read();
+            let active: Vec<&Value> = docs.values().collect();
+
+            // Rewrite active docs. Tombstones in the old data.jsonl are permanently dropped,
+            // which is safe because `delete()` already archived the full documents into
+            // the persistent `_trash/docs/{dbname}.jsonl` file.
+            storage::rewrite_atomic_with_meta(
+                &self.path,
+                &active,
+                &SourceLineage {
+                    source_epoch_uuid: lineage.source_epoch_uuid,
+                    last_seq: lineage.last_seq,
+                    min_available_seq: next_min,
+                },
+            )?;
         }
 
-        // Close file handle before rewrite
-        {
-            let mut handle = self.file_handle.lock();
-            *handle = None;
-        }
-
-        let docs = self.docs.read();
-        let active: Vec<&Value> = docs.values().collect();
-
-        // Rewrite active docs. Tombstones in the old data.jsonl are permanently dropped, 
-        // which is safe because `delete()` already archived the full documents into 
-        // the persistent `_trash/docs/{dbname}.jsonl` file.
-        storage::rewrite_atomic(&self.path, &active)?;
+        // Only after the rewrite is durable: history before the new watermark
+        // is gone either way, so say so once the base state exists.
+        self.lineage.write().min_available_seq = next_min;
+        self.change_log.write().clear();
 
         Ok(())
+    }
+
+    // ─── Sync Feed ─────────────────────────────────────────────────
+
+    /// Current journal identity and seq watermarks.
+    pub fn lineage(&self) -> SourceLineage {
+        self.lineage.read().clone()
+    }
+
+    /// A consistent `(lineage, docs)` pair: both are read under the writer
+    /// lock, so no commit can land between the watermark and the document set.
+    /// Documents are sorted by id.
+    pub fn snapshot_at(&self) -> Snapshot {
+        let _guard = self.writer.lock();
+        let lineage = self.lineage.read().clone();
+        let docs = self.docs.read();
+        let mut out: Vec<(String, Value)> = docs
+            .iter()
+            .map(|(id, doc)| (id.clone(), doc.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Snapshot { lineage, docs: out }
+    }
+
+    /// Every committed change with `seq > since_seq`, ascending.
+    ///
+    /// `CursorAhead` means the caller holds a watermark this journal never
+    /// issued (a backup from a different lineage). `CursorExpired` means the
+    /// events after `since_seq` were rewritten away by a compaction and the
+    /// caller must resync from a fresh snapshot.
+    pub fn changes_since(&self, since_seq: u64) -> Result<ChangeBatch> {
+        let _guard = self.writer.lock();
+        let lineage = self.lineage.read().clone();
+
+        if since_seq > lineage.last_seq {
+            return Err(Error::CursorAhead {
+                requested_seq: since_seq,
+                last_seq: lineage.last_seq,
+            });
+        }
+        if since_seq == lineage.last_seq {
+            return Ok(ChangeBatch {
+                lineage,
+                events: Vec::new(),
+            });
+        }
+        if since_seq.saturating_add(1) < lineage.min_available_seq {
+            return Err(Error::CursorExpired {
+                requested_seq: since_seq,
+                min_available_seq: lineage.min_available_seq,
+                last_seq: lineage.last_seq,
+            });
+        }
+
+        let events: Vec<ChangeEvent> = self
+            .change_log
+            .read()
+            .iter()
+            .filter(|event| event.seq > since_seq)
+            .cloned()
+            .collect();
+        Ok(ChangeBatch { lineage, events })
     }
 
     /// Purge documents from the persistent trash file and files from the file trash 
@@ -2150,13 +2273,23 @@ impl Database {
         let docs = self.docs.read();
         let active: Vec<&Value> = docs.values().collect();
         
-        // 1. Write the clean JSON line docs
+        // 1. Write the clean JSON line docs — the epoch and seq watermark carry
+        //    over; only the replay window resets to what this snapshot holds.
         let target_db = target.join(
             self.path
                 .file_name()
                 .ok_or_else(|| Error::invalid_arg("database path has no file name"))?,
         );
-        storage::rewrite_atomic(&target_db, &active)?;
+        let lineage = self.lineage.read().clone();
+        storage::rewrite_atomic_with_meta(
+            &target_db,
+            &active,
+            &SourceLineage {
+                source_epoch_uuid: lineage.source_epoch_uuid,
+                min_available_seq: lineage.last_seq.saturating_add(1),
+                last_seq: lineage.last_seq,
+            },
+        )?;
         
         // 2. Copy the meta.json across
         let meta_src = self.base_dir.join("meta.json");
@@ -2259,23 +2392,13 @@ impl Database {
             obj.remove("_trashed_files");
         }
 
-        let doc = trash_doc;
+        let mut doc = trash_doc;
 
         // Journal first (G1): the restored document is appended before any
         // file, counter, or in-memory state moves, so a failed append leaves
         // everything exactly as it was and the restore is retryable.
-        let line = serde_json::to_string(&doc)?;
-        let mut handle = self.get_file_handle()?;
-        if let Some(ref mut file) = *handle {
-            match self.persistence {
-                Persistence::Immediate => {
-                    storage::append_line_sync(file, &self.path, &line)?;
-                }
-                _ => {
-                    storage::append_line(file, &self.path, &line)?;
-                }
-            }
-        }
+        let event_doc = doc.clone();
+        self.commit_mutation(id, &mut doc, Some(event_doc))?;
 
         // Return any implicitly trashed files — after the journal holds the
         // restored document. The document comes back either way; a file that

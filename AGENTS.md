@@ -25,6 +25,7 @@ nDB is an **embeddable in-memory document database** built in Rust with native N
 
 - **Single-writer, multi-reader** concurrency. One thread writes at a time; many threads can read simultaneously.
 - **Append-only JSON Lines** persistence. Every write appends a line. On load, the file is replayed: last write wins, tombstones mark deletions, delta patches are applied in order.
+- **Durable lineage + change feed.** `_meta` carries `source_epoch_uuid`, `last_seq`, `min_available_seq`; every committed line carries its `_seq`. `lineage()`, `snapshot_at()` and `changes_since(seq)` expose the journal as a replayable feed under the writer lock. `_seq` is engine-owned and stripped before any document reaches memory, so no read API returns it. `seq` never resets — not on compaction, not on restart.
 - **Database-as-a-Folder.** One directory per database: `data.jsonl` (documents — the file passed to `open()`), `_files/` (binary storage, created implicitly), `_trash/` (soft-deleted items), and `meta.json` (bucket declarations/policies — written by the CLI/migration, **read by the core at open**: `kind`, `onDocumentDelete`, `ttl_seconds`, `reserved_ttl_seconds`; the `schemas` block is still ignored).
 - **Zero dependencies beyond the Rust standard library plus `serde`, `serde_json`, `parking_lot`, `fastrand`, and `thiserror`.** No external crypto, no external DB engines. SHA-256 for file deduplication is hand-rolled.
 
@@ -48,6 +49,22 @@ For massive documents (e.g., 3 MB conversation objects), replacing the entire do
 
 On load, patches are replayed in memory. On compaction, patches are baked into a fresh base document.
 
+## Sync Feed
+
+`Database` exposes the journal as a replayable feed. One commit = one event, in journal order, assigned inside the writer lock after the append succeeds (a failed append moves neither `seq` nor the feed).
+
+| Call | Contract |
+|---|---|
+| `lineage()` | `SourceLineage { source_epoch_uuid, last_seq, min_available_seq }` |
+| `snapshot_at()` | `(lineage, docs)` under the writer lock; docs sorted by id |
+| `changes_since(seq)` | `ChangeBatch` of events with `seq > request`, ascending; `CursorAhead` past `last_seq`, `CursorExpired` when compaction rewrote them away |
+
+- `ChangeKind` is `Upsert(full post-mutation doc)` or `Delete` — the feed carries whole documents, never the patch line.
+- A no-op (`set`/`remove`/`array_push` → `Ok(false)`) is not a commit: no line, no `seq`, no event.
+- `compact()` and `export_snapshot()` preserve `source_epoch_uuid` and `last_seq`, set `min_available_seq = last_seq + 1`, and leave the rewritten docs as base state (no `_seq`).
+- A file without `source_epoch_uuid` is pre-lineage: its epoch is derived deterministically from `_meta.created` (same file → same identity), and every base line replays as a commit.
+- In-memory databases carry a full lineage and feed; only the disk append is skipped.
+
 ## Node.js Bindings
 
 Powered by **napi-rs**. The `napi/` crate wraps the Rust `Database` type and exposes all operations to JavaScript. Async tasks handle `query`, `queryWith`, `compact`, and `exportSnapshot`. File bucket operations (`storeFile`, `getFile`, `deleteFile`, `releaseFile`, `gcBuckets`) are exposed directly.
@@ -67,6 +84,7 @@ Powered by **napi-rs**. The `napi/` crate wraps the Rust `Database` type and exp
 | TTL-based trash purging | Complete (`with_trash_ttl` + background thread; napi via `trash_ttl` option; purge serialized against delete's trash append via `trash_lock`, B3 2026-09-28) |
 | Failure discipline | Complete — no bare `let _ =` on a `Result`; preconditions return `Err`, ancillary cleanup is reported (`src/report.rs`); a document is never reported deleted when its trash record could not be written |
 | Journal-first write ordering | Complete — every mutating op appends before any in-memory/index/ref state moves; a failed append changes nothing (fault-injected tests) |
+| Durable lineage + sync feed | Complete — `_meta` lineage (`source_epoch_uuid`/`last_seq`/`min_available_seq`), `_seq` on every committed line, `lineage()`/`snapshot_at()`/`changes_since()`, replay-on-open incl. legacy + compacted journals; `tests/phase0_sync_feed_tests.rs` |
 | `meta.json` bucket policies | Complete — `kind`, `onDocumentDelete`, `ttl_seconds`, `reserved_ttl_seconds` enforced at open; malformed policy fails loudly; schema validation still unenforced |
 | Item buckets (`kind: "items"`) | Complete — item folders + `items.jsonl` journal, reserve/commit/trash/restore, reserved sweep, `verify` integrity; napi + CLI wired |
 | Schema validation from `meta.json` | Not implemented (`meta.json` schemas block ignored) |
@@ -97,6 +115,8 @@ Powered by **napi-rs**. The `napi/` crate wraps the Rust `Database` type and exp
 ## Key Concepts for Agents
 
 - **`_id`** — 16-character base62 NanoID, optionally prefixed (`conv_V1StGXR8Z5jdHi6B`). Generated client-side, collision-checked against the in-memory set.
+- **`_seq`** — engine-owned commit sequence on a journal line. Stripped before the document is stored, so no read API returns it.
+- **`SourceLineage`** — `source_epoch_uuid` + `last_seq` + `min_available_seq`: what a sync client resumes from and when it must resync.
 - **Tombstone** — A JSONL line with `_deleted` timestamp. Marks a document as deleted without removing history.
 - **Compaction** — Rewrites the JSONL file to contain only active documents, archiving tombstones to `_trash/docs/`.
 - **FileRef** — The `bucket:hash.ext` compact string that links documents to binary files in buckets.
