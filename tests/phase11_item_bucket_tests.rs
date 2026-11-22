@@ -207,7 +207,13 @@ fn ttl_sweep_races_commits_without_corruption() {
     let mut swept_before_commit = 0;
     for n in 0..200 {
         let (item_id, folder) = db.create_item("media").unwrap();
-        fs::write(folder.join("photo.png"), b"hello world").unwrap();
+        // With a 0-second reservation TTL the sweep may tombstone *and*
+        // remove the reservation between create and write; that is the same
+        // legitimate serialized outcome as a NotFound commit below.
+        if fs::write(folder.join("photo.png"), b"hello world").is_err() {
+            swept_before_commit += 1;
+            continue;
+        }
         match db.commit_item("media", &item_id, hello_facts()) {
             Ok(()) => committed.push(item_id),
             // Legitimate serialized outcome: the sweep tombstoned the
@@ -219,7 +225,7 @@ fn ttl_sweep_races_commits_without_corruption() {
     }
     assert!(
         !committed.is_empty(),
-        "hammer must produce committed items (got only sweeps)"
+        "hammer must produce committed items (got only sweeps; {swept_before_commit} swept)"
     );
 
     // Every Ok commit is live with intact facts.

@@ -24,7 +24,7 @@ nDB is an **embeddable in-memory document database** built in Rust with native N
 ## Core Design
 
 - **Single-writer, multi-reader** concurrency. One thread writes at a time; many threads can read simultaneously.
-- **Append-only JSON Lines** persistence. Every write appends a line. On load, the file is replayed: last write wins, tombstones mark deletions, delta patches are applied in order.
+- **Append-only JSON Lines** persistence. Every write appends a line — payload + `\n` in one buffered `write_all`. On load the journal is streamed line by line; last write wins, tombstones mark deletions, delta patches are applied in order. A torn *final* line is truncated at the last good byte offset (with a warning); **mid-journal corruption fails loudly** (`Error::Corruption` naming the line) and is recovered with `ndb repair <path>`, which quarantines the file to `<file>.corrupt.<ts>.bak` and truncates at the last good line.
 - **Durable lineage + change feed.** `_meta` carries `source_epoch_uuid`, `last_seq`, `min_available_seq`; every committed line carries its `_seq`. `lineage()`, `snapshot_at()` and `changes_since(seq)` expose the journal as a replayable feed under the writer lock. `_seq` is engine-owned and stripped before any document reaches memory, so no read API returns it. `seq` never resets — not on compaction, not on restart.
 - **Database-as-a-Folder.** One directory per database: `data.jsonl` (documents — the file passed to `open()`), `_files/` (binary storage, created implicitly), `_trash/` (soft-deleted items), and `meta.json` (bucket declarations/policies — written by the CLI/migration, **read by the core at open**: `kind`, `onDocumentDelete`, `ttl_seconds`, `reserved_ttl_seconds`; the `schemas` block is still ignored).
 - **Zero dependencies beyond the Rust standard library plus `serde`, `serde_json`, `parking_lot`, `fastrand`, and `thiserror`.** No external crypto, no external DB engines. SHA-256 for file deduplication is hand-rolled.
@@ -37,7 +37,7 @@ nDB is an **embeddable in-memory document database** built in Rust with native N
 
 ## File Buckets
 
-Named binary storage with **SHA-256 content-hash deduplication**. Identical files are stored once. Files are referenced by compact `bucket:hash.ext` strings (nURI format). Soft-delete moves files to `_trash/files/` rather than removing them. Garbage collection (`gc_buckets`) sweeps unreferenced files to trash. Targeted release (`release_file`) checks all in-memory documents before trashing a specific file.
+Named binary storage with **SHA-256 content-hash deduplication**. Identical files are stored once, under the **full 64-char hash** (legacy 8-char ids stay readable); a dedup hit is verified (size + re-hash) so a damaged blob is reported, never returned. Files are referenced by compact `bucket:hash.ext` strings (nURI) or any of `/api/buckets/{b}/{f}`, `/file/{b}/{f}`, `/files/{b}/{f}`, `/v2/dbs/{db}/files/{b}/{f}` — all count as live references. Soft-delete moves files to `_trash/files/` rather than removing them. Garbage collection (`gc_buckets`) sweeps unreferenced files to trash and serializes with `store_file` on the writer lock. Targeted release (`release_file`) checks live **and restorable (trash) documents** before trashing a specific file.
 
 ## Atomic Delta Updates
 
@@ -65,6 +65,20 @@ On load, patches are replayed in memory. On compaction, patches are baked into a
 - A file without `source_epoch_uuid` is pre-lineage: its epoch is derived deterministically from `_meta.created` (same file → same identity), and every base line replays as a commit.
 - In-memory databases carry a full lineage and feed; only the disk append is skipped.
 
+## HTTP Service (`ndb serve`)
+
+Resident daemon (`src/server.rs`) — hand-rolled HTTP/1.1 on `std::net`, no async runtime. One process can now own **many databases**: `DbRegistry` maps name → `Arc<Database>`, with a canonical-path set preventing the same journal from being mounted twice, an optional `root_dir` for creation, and a service-wide persistence mode.
+
+- Mount sources: positional `<path>` (legacy, mounted as `default`), repeatable `--db <name>=<path>`, `--dir <root>` (auto-mounts child folders holding `data.jsonl` or `meta.json`), and `--config <file.json>` (`bind/port/token/persistence/scheduled_ms/dir/max_limit/default_limit/dbs`; unknown fields rejected).
+- Startup refuses: no source at all, an unopenable DB, a duplicate name or canonical path, an invalid DB name (`[a-zA-Z0-9._-]+`, not `.`/`..`), a missing `--dir`.
+- `GET /health`, `GET|POST /v2/dbs`, and per-DB `/v2/dbs/{name}/{stats,lineage,doc,docs/mget,query,find,facets,search,index,compact,flush,changes,snapshot,files/...}`. `POST /v2/dbs` accepts only `{name, persistence?}` (never a path) and is `403 create_disabled` without `--dir`.
+- Legacy single-DB routes (`/stats`, `/doc`, `/query`, `/file/...`) keep working against `default`; `/v2/` errors are `{ok:false, error, message}`.
+- **Transport:** `TCP_NODELAY` on every accepted connection; one `write_all` per response frame (head+body for ≤64 KB), binary bodies move into the socket without a clone; `Content-Length` always exact and `Connection: keep-alive` / `close` always truthful.
+- **Keep-alive:** one `BufReader` persists across requests on a socket; the loop ends on `Connection: close`, HTTP/1.0 without keep-alive, clean EOF, a 5 s idle timeout between requests (30 s for a live request), or a shutdown flag.
+- **Worker pool:** `config.threads` workers (0 = logical cores, min 4) pull from a bounded queue (`max_connections` deep). A full queue answers `503` — bursts never spawn unbounded OS threads.
+- **Graceful shutdown (M3):** Ctrl-C / SIGINT (Windows `SetConsoleCtrlHandler`, Unix `signal`) sets `server::request_process_shutdown()`. The accept loop stops, the queue closes, workers drain, and every mounted database is `flush()`ed before the process exits 0. A second Ctrl-C falls through to OS termination.
+- Contract and route list: `docs/ndb-serve-design.md`.
+
 ## Node.js Bindings
 
 Powered by **napi-rs**. The `napi/` crate wraps the Rust `Database` type and exposes all operations to JavaScript. Async tasks handle `query`, `queryWith`, `compact`, and `exportSnapshot`. File bucket operations (`storeFile`, `getFile`, `deleteFile`, `releaseFile`, `gcBuckets`) are exposed directly.
@@ -75,7 +89,7 @@ Powered by **napi-rs**. The `napi/` crate wraps the Rust `Database` type and exp
 |---|---|
 | Core CRUD + persistence | Complete |
 | 3-layer query API | Complete |
-| Hash + BTree indexes | Complete |
+| Hash + BTree indexes | Complete — typed `OrderedValue` keys (numeric order, dot paths, array element keys), index-only narrowing on `find`/`find_range` |
 | Database-as-a-Folder | Complete |
 | File buckets with SHA-256 dedup | Complete |
 | `array_push` delta (Rust core) | Complete |
@@ -84,9 +98,12 @@ Powered by **napi-rs**. The `napi/` crate wraps the Rust `Database` type and exp
 | TTL-based trash purging | Complete (`with_trash_ttl` + background thread; napi via `trash_ttl` option; purge serialized against delete's trash append via `trash_lock`, B3 2026-09-28) |
 | Failure discipline | Complete — no bare `let _ =` on a `Result`; preconditions return `Err`, ancillary cleanup is reported (`src/report.rs`); a document is never reported deleted when its trash record could not be written |
 | Journal-first write ordering | Complete — every mutating op appends before any in-memory/index/ref state moves; a failed append changes nothing (fault-injected tests) |
+| Durability hardening (Phase 1b slice 1) | Complete — torn-tail truncation + mid-journal corruption refusal + `ndb repair`, per-DB OS writer lock, transactional `apply_ops` with per-doc `doc_seq`/`If-Match` (`409 conflict`), bucket ref normalization + GC/store serialization + full-SHA-256 dedup verification, durable doc-trash `sync_all`, parent-dir fsync after renames, real `Scheduled` flusher, Windows reserved/case-folded DB names, mget cap, pinned snapshot pagination; `tests/phase14_durability_hardening_tests.rs` |
+| Hot-path performance (Phase 1b slice 2) | Complete — O(1) `insert` (no per-write id-set clone), real query planner (`$eq`/`$in` → hash/BTree, ranges merged into one BTree interval, smallest-first intersection), index-backed `find_range`, `Arc<Value>` store + change log (one document instance per write), O(1) `/stats`, `TCP_NODELAY` + single-frame responses + bounded worker pool + HTTP keep-alive + Ctrl-C drain/flush, `autobenches = false` (zero Cargo warnings); `tests/phase15_perf_and_planner_tests.rs` |
 | Durable lineage + sync feed | Complete — `_meta` lineage (`source_epoch_uuid`/`last_seq`/`min_available_seq`), `_seq` on every committed line, `lineage()`/`snapshot_at()`/`changes_since()`, replay-on-open incl. legacy + compacted journals; `tests/phase0_sync_feed_tests.rs` |
 | `meta.json` bucket policies | Complete — `kind`, `onDocumentDelete`, `ttl_seconds`, `reserved_ttl_seconds` enforced at open; malformed policy fails loudly; schema validation still unenforced |
 | Item buckets (`kind: "items"`) | Complete — item folders + `items.jsonl` journal, reserve/commit/trash/restore, reserved sweep, `verify` integrity; napi + CLI wired |
+| Multi-DB HTTP service (`ndb serve`) | Complete (step 1) — `DbRegistry` mounts arbitrary DB paths by name, `--db`/`--dir`/`--config`, `/health` + `/v2/dbs` + per-DB CRUD/query/sync/bucket routes; `tests/phase13_multi_db_serve_tests.rs` |
 | Schema validation from `meta.json` | Not implemented (`meta.json` schemas block ignored) |
 | nURI `link` type enforcement | Not implemented (file refs detected heuristically by string match, not by schema) |
 | Bucket migration script for legacy data | Not bundled here (the consumer's `migrate-ndb-to-folder.js` was used in production) |
@@ -107,7 +124,7 @@ Powered by **napi-rs**. The `napi/` crate wraps the Rust `Database` type and exp
 
 ## What nDB Is Not
 
-- Not a network database. It has no built-in client-server protocol.
+- Not a general-purpose network database. `ndb serve` is a single-process, in-memory HTTP daemon for a handful of trusted LAN clients — not a clustered or multi-tenant server.
 - Not a relational database. No joins, no SQL.
 - Not designed for terabyte-scale datasets. Everything lives in memory; persistence is for durability, not paging.
 - Not a replacement for PostgreSQL or MongoDB in multi-user server deployments.

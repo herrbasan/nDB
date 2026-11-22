@@ -311,13 +311,14 @@ fn truncated_tail_is_skipped_and_seq_matches_last_commit() {
         assert_eq!(db.lineage().last_seq, 2);
     }
 
-    // Torn write: a line that would have carried seq 3 never completed.
+    // Torn write: a line that would have carried seq 3 never completed. It is
+    // the FINAL line, so it is a crash artifact and is truncated away; the
+    // records before it are untouched.
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(&path)
         .unwrap();
     write!(file, "{}", r#"{"_id":"ghost","_seq":3,"v":9"#).unwrap();
-    write!(file, "\n{}", "not json at all\n").unwrap();
     drop(file);
 
     let db = Database::open(&path).unwrap();
@@ -326,13 +327,19 @@ fn truncated_tail_is_skipped_and_seq_matches_last_commit() {
     assert!(db.get("ghost").is_err());
     assert_eq!(db.changes_since(0).unwrap().events.len(), 2);
 
-    // The next commit takes the seq the torn line never got.
+    // The next commit takes the seq the torn line never got, and it survives
+    // a second reopen — the truncated tail cannot swallow it.
     let next = db.insert(json!({"v": 3})).unwrap();
     assert_eq!(db.lineage().last_seq, 3);
     let batch = db.changes_since(2).unwrap();
     assert_eq!(batch.events.len(), 1);
     assert_eq!(batch.events[0].seq, 3);
     assert_eq!(batch.events[0].id, next);
+    drop(db);
+
+    let reopened = Database::open(&path).unwrap();
+    assert_eq!(reopened.len(), 2);
+    assert!(reopened.get(&next).is_ok());
 }
 
 #[test]

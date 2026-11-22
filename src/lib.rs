@@ -46,9 +46,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use id::{generate_unique, generate_unique_with_prefix};
+use id::{generate_checked, generate_checked_with_prefix};
 
 // ─── Persistence Modes ──────────────────────────────────────────────
 
@@ -57,7 +58,8 @@ use id::{generate_unique, generate_unique_with_prefix};
 pub enum Persistence {
     /// Flush on explicit call or shutdown. Fastest, last flush only.
     Lazy,
-    /// Flush every N seconds. Balanced.
+    /// Fsync on a background timer at this interval. Balanced: a crash can
+    /// lose at most one interval of writes, and the flush really runs (H2).
     Scheduled(Duration),
     /// fsync after every write. Slowest, every write safe.
     Immediate,
@@ -105,18 +107,144 @@ pub struct QueryOptions {
     pub sort_by: Option<(String, SortDir)>,
 }
 
+// ─── Transactional Patches ──────────────────────────────────────────
+
+/// One mutation inside a transactional [`Database::apply_ops`] batch.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PatchOp {
+    /// Assign `value` at a dot-separated path.
+    Set { path: String, value: Value },
+    /// Remove the field or array element at a dot-separated path.
+    Remove { path: String },
+    /// Append `value` to the array at a dot-separated path.
+    ArrayPush { path: String, value: Value },
+}
+
+/// Outcome of an applied batch.
+#[derive(Debug, Clone)]
+pub struct ApplyOpsResult {
+    /// One entry per op. Always `true`: an op that does not resolve aborts the
+    /// whole batch instead of producing a `false`.
+    pub applied: Vec<bool>,
+    /// Commit sequence of the single journal record.
+    pub seq: u64,
+    /// The document's post-mutation state.
+    pub doc: Value,
+}
+
 // ─── Index Types ────────────────────────────────────────────────────
+
+// ─── Ordered Index Keys ─────────────────────────────────────────────
+
+/// Total order over JSON values, shared by [`value_cmp`], the BTree index and
+/// every range query. One ordering means an indexed range returns exactly the
+/// set a linear scan returns — numbers compare numerically (`9 < 10`,
+/// `-5 < 2`), never as their decimal text, and arrays/objects sort after every
+/// scalar by canonical JSON.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum OrderedValue {
+    Null,
+    Bool(bool),
+    Number(OrderedF64),
+    String(String),
+    /// Arrays and objects: compared by their canonical JSON text.
+    Composite(String),
+}
+
+/// `f64` with a total order (and a matching `Hash`), so `-0.0 < 0.0` and
+/// every Number key is usable in both a `HashMap` and a `BTreeMap`.
+#[derive(Clone, Copy, Debug)]
+struct OrderedF64(f64);
+
+impl PartialEq for OrderedF64 {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total_cmp(&other.0) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for OrderedF64 {}
+
+impl PartialOrd for OrderedF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+impl std::hash::Hash for OrderedF64 {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state);
+    }
+}
+
+fn ordered_value(value: &Value) -> OrderedValue {
+    match value {
+        Value::Null => OrderedValue::Null,
+        Value::Bool(b) => OrderedValue::Bool(*b),
+        Value::Number(n) => OrderedValue::Number(OrderedF64(
+            n.as_f64()
+                .expect("serde_json number is not representable as f64"),
+        )),
+        Value::String(s) => OrderedValue::String(s.clone()),
+        other => OrderedValue::Composite(other.to_string()),
+    }
+}
+
+/// The keys one indexed field value contributes.
+///
+/// An array contributes its whole value **and** each element, exactly the way
+/// [`evaluate_condition`] reads it (`$eq` on the whole value, `$in`/range
+/// against elements). Without the element keys an index lookup would miss
+/// documents a linear scan matches — the planner relies on this being a
+/// superset of `query_matches`.
+fn index_keys(value: &Value) -> Vec<OrderedValue> {
+    match value {
+        Value::Array(items) if !items.is_empty() => {
+            let mut keys = Vec::with_capacity(items.len() + 1);
+            keys.push(ordered_value(value));
+            keys.extend(items.iter().map(ordered_value));
+            keys
+        }
+        _ => vec![ordered_value(value)],
+    }
+}
+
+/// One end of an indexed range scan.
+#[derive(Clone, Copy)]
+enum KeyBound<'a> {
+    Unbounded,
+    Included(&'a Value),
+    Excluded(&'a Value),
+}
+
+impl KeyBound<'_> {
+    fn ordered(self) -> std::ops::Bound<OrderedValue> {
+        match self {
+            KeyBound::Unbounded => std::ops::Bound::Unbounded,
+            KeyBound::Included(v) => std::ops::Bound::Included(ordered_value(v)),
+            KeyBound::Excluded(v) => std::ops::Bound::Excluded(ordered_value(v)),
+        }
+    }
+}
 
 /// Trait for secondary indexes.
 trait Index: Send + Sync {
     fn insert(&mut self, value: &Value, id: &str);
     fn remove(&mut self, value: &Value, id: &str);
     fn get(&self, value: &Value) -> Vec<String>;
+    /// Ordered range over the key space. `None` when the index has no order
+    /// (hash) — the planner must not treat a hash index as range-capable.
+    fn range(&self, min: KeyBound<'_>, max: KeyBound<'_>) -> Option<Vec<String>>;
 }
 
 /// Hash index for O(1) equality lookups.
 struct HashIndex {
-    map: HashMap<String, HashSet<String>>,
+    map: HashMap<OrderedValue, HashSet<String>>,
 }
 
 impl HashIndex {
@@ -125,44 +253,49 @@ impl HashIndex {
             map: HashMap::new(),
         }
     }
-
-    fn value_key(v: &Value) -> String {
-        // Canonical string representation for HashMap key
-        match v {
-            Value::Null => "null".to_string(),
-            Value::Bool(b) => b.to_string(),
-            Value::Number(n) => n.to_string(),
-            Value::String(s) => s.clone(),
-            _ => v.to_string(), // arrays/objects use JSON string
-        }
-    }
 }
 
 impl Index for HashIndex {
     fn insert(&mut self, value: &Value, id: &str) {
-        let key = Self::value_key(value);
-        self.map.entry(key).or_default().insert(id.to_string());
+        for key in index_keys(value) {
+            self.map.entry(key).or_default().insert(id.to_string());
+        }
     }
 
     fn remove(&mut self, value: &Value, id: &str) {
-        let key = Self::value_key(value);
-        if let Some(set) = self.map.get_mut(&key) {
-            set.remove(id);
-            if set.is_empty() {
-                self.map.remove(&key);
+        for key in index_keys(value) {
+            if let Some(set) = self.map.get_mut(&key) {
+                set.remove(id);
+                if set.is_empty() {
+                    self.map.remove(&key);
+                }
             }
         }
     }
 
     fn get(&self, value: &Value) -> Vec<String> {
-        let key = Self::value_key(value);
-        self.map.get(&key).map(|s| s.iter().cloned().collect()).unwrap_or_default()
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: HashSet<&String> = HashSet::new();
+        for key in index_keys(value) {
+            if let Some(set) = self.map.get(&key) {
+                for id in set {
+                    if seen.insert(id) {
+                        out.push(id.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn range(&self, _min: KeyBound<'_>, _max: KeyBound<'_>) -> Option<Vec<String>> {
+        None
     }
 }
 
-/// BTree index for O(log n) lookups + range queries.
+/// BTree index for O(log n) lookups + exact ordered range scans.
 struct BTreeIndex {
-    map: BTreeMap<String, HashSet<String>>,
+    map: BTreeMap<OrderedValue, HashSet<String>>,
 }
 
 impl BTreeIndex {
@@ -171,44 +304,52 @@ impl BTreeIndex {
             map: BTreeMap::new(),
         }
     }
-
-    fn value_key(v: &Value) -> String {
-        // Pad numbers for correct BTree ordering
-        match v {
-            Value::Number(n) => {
-                if let Some(f) = n.as_f64() {
-                    format!("{:020.10}", f)
-                } else {
-                    n.to_string()
-                }
-            }
-            Value::String(s) => s.clone(),
-            Value::Null => "\x00".to_string(),
-            Value::Bool(b) => (if *b { "\x02" } else { "\x01" }).to_string(),
-            _ => v.to_string(),
-        }
-    }
 }
 
 impl Index for BTreeIndex {
     fn insert(&mut self, value: &Value, id: &str) {
-        let key = Self::value_key(value);
-        self.map.entry(key).or_default().insert(id.to_string());
+        for key in index_keys(value) {
+            self.map.entry(key).or_default().insert(id.to_string());
+        }
     }
 
     fn remove(&mut self, value: &Value, id: &str) {
-        let key = Self::value_key(value);
-        if let Some(set) = self.map.get_mut(&key) {
-            set.remove(id);
-            if set.is_empty() {
-                self.map.remove(&key);
+        for key in index_keys(value) {
+            if let Some(set) = self.map.get_mut(&key) {
+                set.remove(id);
+                if set.is_empty() {
+                    self.map.remove(&key);
+                }
             }
         }
     }
 
     fn get(&self, value: &Value) -> Vec<String> {
-        let key = Self::value_key(value);
-        self.map.get(&key).map(|s| s.iter().cloned().collect()).unwrap_or_default()
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: HashSet<&String> = HashSet::new();
+        for key in index_keys(value) {
+            if let Some(set) = self.map.get(&key) {
+                for id in set {
+                    if seen.insert(id) {
+                        out.push(id.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn range(&self, min: KeyBound<'_>, max: KeyBound<'_>) -> Option<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: HashSet<&String> = HashSet::new();
+        for (_, ids) in self.map.range((min.ordered(), max.ordered())) {
+            for id in ids {
+                if seen.insert(id) {
+                    out.push(id.clone());
+                }
+            }
+        }
+        Some(out)
     }
 }
 
@@ -409,17 +550,71 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 }
 
 /// Compare two JSON values for ordering.
+///
+/// Uses the same total order the BTree index is keyed by, so a range scan and
+/// a linear scan agree on every pair — including mixed types, where the order
+/// is Null < Bool < Number < String < array/object.
 fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
-    match (a, b) {
-        (Value::Number(an), Value::Number(bn)) => {
-            let af = an.as_f64().unwrap_or(0.0);
-            let bf = bn.as_f64().unwrap_or(0.0);
-            af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (Value::String(as_), Value::String(bs)) => as_.cmp(bs),
-        (Value::Bool(ab), Value::Bool(bb)) => ab.cmp(bb),
-        _ => std::cmp::Ordering::Equal,
+    ordered_value(a).cmp(&ordered_value(b))
+}
+
+/// Tightest lower bound: the greatest value wins; on a tie the exclusive bound
+/// wins (it admits less).
+fn stronger_lower(current: Option<(Value, bool)>, value: &Value, inclusive: bool) -> Option<(Value, bool)> {
+    match current {
+        None => Some((value.clone(), inclusive)),
+        Some((bound, bound_inclusive)) => match value_cmp(&bound, value) {
+            std::cmp::Ordering::Less => Some((value.clone(), inclusive)),
+            std::cmp::Ordering::Equal if bound_inclusive && !inclusive => {
+                Some((value.clone(), inclusive))
+            }
+            _ => Some((bound, bound_inclusive)),
+        },
     }
+}
+
+/// Tightest upper bound: the smallest value wins; on a tie the exclusive bound
+/// wins.
+fn stronger_upper(current: Option<(Value, bool)>, value: &Value, inclusive: bool) -> Option<(Value, bool)> {
+    match current {
+        None => Some((value.clone(), inclusive)),
+        Some((bound, bound_inclusive)) => match value_cmp(&bound, value) {
+            std::cmp::Ordering::Greater => Some((value.clone(), inclusive)),
+            std::cmp::Ordering::Equal if bound_inclusive && !inclusive => {
+                Some((value.clone(), inclusive))
+            }
+            _ => Some((bound, bound_inclusive)),
+        },
+    }
+}
+
+/// Intersect candidate id sets smallest-first, short-circuiting the moment an
+/// empty one appears. `None` means nothing to intersect — no index applies.
+fn intersect_sets(sets: Vec<HashSet<String>>) -> Option<HashSet<String>> {
+    if sets.is_empty() {
+        return None;
+    }
+    if sets.iter().any(|set| set.is_empty()) {
+        return Some(HashSet::new());
+    }
+    let mut sets = sets;
+    sets.sort_by_key(|set| set.len());
+    let mut iter = sets.into_iter();
+    let mut acc = iter.next().expect("sets is non-empty");
+    for other in iter {
+        if acc.len() > other.len() {
+            // Always drive the intersection from the smaller side.
+            let mut next = other;
+            next.retain(|id| acc.contains(id));
+            acc = next;
+        } else {
+            acc.retain(|id| other.contains(id));
+        }
+        if acc.is_empty() {
+            break;
+        }
+    }
+    Some(acc)
 }
 
 // ─── Path-based Mutation Helpers ─────────────────────────────────────
@@ -749,6 +944,216 @@ fn load_bucket_policies(base_dir: &Path) -> Result<HashMap<String, BucketPolicy>
     Ok(policies)
 }
 
+/// An OS-enforced exclusive lock on one database.
+///
+/// Held for the whole `Database` lifetime; released by `Drop` or by the OS when
+/// the process dies, so a crashed process never leaves a permanently locked
+/// database. A second mount of the same journal fails fast instead of letting
+/// two writers interleave into one file (C2).
+struct DbLock {
+    /// Closing this handle releases the lock. The file is deliberately never
+    /// unlinked: deleting it after unlocking would let a third opener create a
+    /// fresh inode and lock a file the second opener does not have.
+    _file: fs::File,
+}
+
+impl DbLock {
+    fn acquire(db_path: &Path) -> Result<Self> {
+        let lock_path = Self::lock_path(db_path);
+        if let Some(parent) = lock_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)
+                    .map_err(Error::io_err(parent, "create lock directory"))?;
+            }
+        }
+
+        let file = Self::open_exclusive(&lock_path)
+            .map_err(|e| Self::map_open_error(db_path, &lock_path, e))?;
+
+        // Informational only — the handle, not the contents, is the lock.
+        let _ = file.set_len(0);
+        let mut file = file;
+        let _ = writeln!(file, "pid={} at={}", std::process::id(), now_secs());
+
+        Ok(DbLock { _file: file })
+    }
+
+    /// `<file>.lock` for a flat journal, `.lock` for a database folder's
+    /// `data.jsonl` (the folder is the database, so the folder owns the lock).
+    fn lock_path(db_path: &Path) -> PathBuf {
+        let name = db_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "data.jsonl".to_string());
+        if name == "data.jsonl" {
+            db_path.with_file_name(".lock")
+        } else {
+            db_path.with_file_name(format!("{name}.lock"))
+        }
+    }
+
+    #[cfg(windows)]
+    fn open_exclusive(lock_path: &Path) -> std::io::Result<fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ: readers may look, but nobody else may open for
+        // write, delete or rename while this handle lives.
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(lock_path)
+    }
+
+    #[cfg(unix)]
+    fn open_exclusive(lock_path: &Path) -> std::io::Result<fs::File> {
+        use std::os::unix::io::AsRawFd;
+        extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        const LOCK_EX: i32 = 2;
+        const LOCK_NB: i32 = 4;
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(lock_path)?;
+        // SAFETY: `fd` is owned by `file` for the duration of the call.
+        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(file)
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    fn open_exclusive(lock_path: &Path) -> std::io::Result<fs::File> {
+        // No portable primitive without a crate: the file exists so operators
+        // see one, but exclusivity is best-effort on this platform.
+        report::warning(
+            "database lock",
+            format!("{}: no OS lock primitive on this platform", lock_path.display()),
+        );
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(lock_path)
+    }
+
+    #[cfg(windows)]
+    fn map_open_error(db_path: &Path, lock_path: &Path, e: std::io::Error) -> Error {
+        // 32 = ERROR_SHARING_VIOLATION, 33 = ERROR_LOCK_VIOLATION: the other
+        // holder opened the file with FILE_SHARE_READ only.
+        match e.raw_os_error() {
+            Some(32) | Some(33) => Error::DatabaseLocked {
+                path: db_path.to_path_buf(),
+            },
+            _ if e.kind() == std::io::ErrorKind::PermissionDenied => Error::DatabaseLocked {
+                path: db_path.to_path_buf(),
+            },
+            _ => Error::io_err(lock_path, "open database lock file")(e),
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn map_open_error(db_path: &Path, lock_path: &Path, e: std::io::Error) -> Error {
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            Error::DatabaseLocked {
+                path: db_path.to_path_buf(),
+            }
+        } else if let Some(code) = e.raw_os_error() {
+            // EWOULDBLOCK/EAGAIN
+            if code == 11 || code == 35 {
+                return Error::DatabaseLocked {
+                    path: db_path.to_path_buf(),
+                };
+            }
+            Error::io_err(lock_path, "open database lock file")(e)
+        } else {
+            Error::io_err(lock_path, "open database lock file")(e)
+        }
+    }
+}
+
+impl Drop for DbLock {
+    fn drop(&mut self) {
+        // Nothing to do: closing `_file` is the release. The file stays on
+        // disk on purpose (see the struct comment).
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// The database's OS writer lock, held without loading the database.
+///
+/// Maintenance that rewrites the journal in place (`ndb repair`) must take it:
+/// truncating a journal under a live writer would destroy exactly the data the
+/// lock exists to protect. Dropping the guard releases the lock.
+pub struct MaintenanceLock {
+    _lock: DbLock,
+}
+
+impl MaintenanceLock {
+    /// Take the lock for `journal_path` (`…/data.jsonl` or a flat `.jsonl`).
+    pub fn acquire(journal_path: impl AsRef<Path>) -> Result<Self> {
+        Ok(MaintenanceLock {
+            _lock: DbLock::acquire(journal_path.as_ref())?,
+        })
+    }
+}
+
+/// One committed change as kept in RAM: the document is *shared*, not copied —
+/// the store and the change log point at the same `Arc<Value>`, so a write
+/// materializes one document, not four.
+#[derive(Debug, Clone)]
+struct LoggedChange {
+    seq: u64,
+    id: String,
+    kind: LoggedKind,
+}
+
+#[derive(Debug, Clone)]
+enum LoggedKind {
+    Upsert(std::sync::Arc<Value>),
+    Delete,
+}
+
+fn logged_kind(kind: ChangeKind) -> LoggedKind {
+    match kind {
+        ChangeKind::Upsert(doc) => LoggedKind::Upsert(std::sync::Arc::new(doc)),
+        ChangeKind::Delete => LoggedKind::Delete,
+    }
+}
+
+/// A journal line: the entry's own fields plus the authoritative `_seq`,
+/// serialized straight from the borrowed document — stamping the sequence
+/// costs no copy. A caller-supplied `_seq` is dropped (the engine owns it).
+struct JournalRecord<'a> {
+    object: &'a serde_json::Map<String, Value>,
+    seq: u64,
+}
+
+impl serde::Serialize for JournalRecord<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.object.len() + 1))?;
+        for (key, value) in self.object {
+            if key == storage::SEQ_FIELD {
+                continue;
+            }
+            map.serialize_entry(key, value)?;
+        }
+        map.serialize_entry(storage::SEQ_FIELD, &self.seq)?;
+        map.end()
+    }
+}
+
 /// The main nDB database.
 ///
 /// In-memory document store backed by JSON Lines persistence.
@@ -758,15 +1163,18 @@ pub struct Database {
     path: PathBuf,
     /// Base directory for the database (contains active/, _trash/, _files/).
     base_dir: PathBuf,
-    /// In-memory document store: _id → document.
-    docs: RwLock<HashMap<String, Value>>,
+    /// In-memory document store: _id → document. Documents are shared with
+    /// the change log (`Arc`), so nothing here deep-clones on a write.
+    docs: RwLock<HashMap<String, std::sync::Arc<Value>>>,
     /// Set of deleted document IDs (tombstones).
     deleted: RwLock<HashSet<String>>,
     /// In-memory file reference counter: nURI string → count.
     file_refs: RwLock<HashMap<String, usize>>,
-    /// Secondary indexes (opt-in).
-    indexes: RwLock<HashMap<String, Box<dyn Index>>>,
-    /// Full-text indexes (opt-in): field → inverted index.
+    /// Hash indexes (opt-in, O(1) equality / `$in` lookups).
+    hash_indexes: RwLock<HashMap<String, HashIndex>>,
+    /// BTree indexes (opt-in, O(log n) equality + exact range scans). A field
+    /// may carry both kinds; the planner prefers whichever fits the operator.
+    btree_indexes: RwLock<HashMap<String, BTreeIndex>>,    /// Full-text indexes (opt-in): field → inverted index.
     text_indexes: RwLock<HashMap<String, search::TextIndex>>,
     /// Single-writer mutex. Arc-shared with the TTL thread so its
     /// reserved-item sweep serializes against writers exactly like the
@@ -800,7 +1208,19 @@ pub struct Database {
     lineage: RwLock<SourceLineage>,
     /// Committed change events, oldest first. Cleared by compaction, which is
     /// what makes everything before the new `min_available_seq` unreplayable.
-    change_log: RwLock<Vec<ChangeEvent>>,
+    change_log: RwLock<Vec<LoggedChange>>,
+    /// Commit seq of each live document — the per-document optimistic
+    /// concurrency token. Kept per document (not from the global `last_seq`) so
+    /// concurrent edits to other documents never produce a false conflict.
+    doc_seq: RwLock<HashMap<String, u64>>,
+    /// OS-exclusive writer lock; `None` for an in-memory database.
+    _lock: Option<DbLock>,
+    /// Set when an append has not been fsynced yet (Scheduled/Lazy).
+    dirty: std::sync::Arc<AtomicBool>,
+    /// Cancellation channel for the Scheduled flush thread.
+    flush_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// Scheduled flush thread handle.
+    flush_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Database {
@@ -814,6 +1234,14 @@ impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let base_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+
+        // The lock comes first: two processes must never both get as far as
+        // creating/appending to the same journal.
+        if !base_dir.as_os_str().is_empty() {
+            fs::create_dir_all(&base_dir)
+                .map_err(Error::io_err(&base_dir, "create database directory"))?;
+        }
+        let lock = DbLock::acquire(&path)?;
 
         // Ensure file exists
         if !path.exists() {
@@ -835,7 +1263,8 @@ impl Database {
         // Build in-memory state: last write wins
         let mut docs: HashMap<String, Value> = HashMap::new();
         let mut deleted = HashSet::new();
-        let mut change_log: Vec<ChangeEvent> = Vec::new();
+        let mut change_log: Vec<LoggedChange> = Vec::new();
+        let mut doc_seq: HashMap<String, u64> = HashMap::new();
 
         for mut entry in raw_docs {
             let seq = entry
@@ -847,16 +1276,36 @@ impl Database {
                 Some(seq) => {
                     last_seq = last_seq.max(seq);
                     if let Some((id, kind)) = change {
-                        change_log.push(ChangeEvent { seq, id, kind });
+                        match kind {
+                            ChangeKind::Upsert(_) => {
+                                doc_seq.insert(id.clone(), seq);
+                            }
+                            ChangeKind::Delete => {
+                                doc_seq.remove(&id);
+                            }
+                        }
+                        change_log.push(LoggedChange {
+                            seq,
+                            id,
+                            kind: logged_kind(kind),
+                        });
                     }
                 }
                 None if legacy => {
                     if let Some((id, kind)) = change {
                         last_seq += 1;
-                        change_log.push(ChangeEvent {
+                        match kind {
+                            ChangeKind::Upsert(_) => {
+                                doc_seq.insert(id.clone(), last_seq);
+                            }
+                            ChangeKind::Delete => {
+                                doc_seq.remove(&id);
+                            }
+                        }
+                        change_log.push(LoggedChange {
                             seq: last_seq,
                             id,
-                            kind,
+                            kind: logged_kind(kind),
                         });
                     }
                 }
@@ -899,10 +1348,15 @@ impl Database {
         Ok(Database {
             path,
             base_dir,
-            docs: RwLock::new(docs),
+            docs: RwLock::new(
+                docs.into_iter()
+                    .map(|(id, doc)| (id, std::sync::Arc::new(doc)))
+                    .collect(),
+            ),
             deleted: RwLock::new(deleted),
             file_refs: RwLock::new(file_refs),
-            indexes: RwLock::new(HashMap::new()),
+            hash_indexes: RwLock::new(HashMap::new()),
+            btree_indexes: RwLock::new(HashMap::new()),
             text_indexes: RwLock::new(HashMap::new()),
             writer: std::sync::Arc::new(Mutex::new(())),
             trash_lock: std::sync::Arc::new(Mutex::new(())),
@@ -921,6 +1375,11 @@ impl Database {
                 min_available_seq,
             }),
             change_log: RwLock::new(change_log),
+            doc_seq: RwLock::new(doc_seq),
+            _lock: Some(lock),
+            dirty: std::sync::Arc::new(AtomicBool::new(false)),
+            flush_tx: Mutex::new(None),
+            flush_thread: Mutex::new(None),
         })
     }
 
@@ -936,7 +1395,8 @@ impl Database {
             docs: RwLock::new(HashMap::new()),
             deleted: RwLock::new(HashSet::new()),
             file_refs: RwLock::new(HashMap::new()),
-            indexes: RwLock::new(HashMap::new()),
+            hash_indexes: RwLock::new(HashMap::new()),
+            btree_indexes: RwLock::new(HashMap::new()),
             text_indexes: RwLock::new(HashMap::new()),
             writer: std::sync::Arc::new(Mutex::new(())),
             trash_lock: std::sync::Arc::new(Mutex::new(())),
@@ -951,12 +1411,22 @@ impl Database {
             item_buckets: HashMap::new(),
             lineage: RwLock::new(SourceLineage::fresh()),
             change_log: RwLock::new(Vec::new()),
+            doc_seq: RwLock::new(HashMap::new()),
+            _lock: None,
+            dirty: std::sync::Arc::new(AtomicBool::new(false)),
+            flush_tx: Mutex::new(None),
+            flush_thread: Mutex::new(None),
         })
     }
 
     /// Set persistence mode. Returns self for chaining.
+    ///
+    /// `Scheduled(d)` starts a real background flusher: every `d` it fsyncs the
+    /// journal if anything was written since the last flush (H2). It is not a
+    /// `Lazy` alias.
     pub fn with_persistence(mut self, mode: Persistence) -> Self {
         self.persistence = mode;
+        self.start_flush_thread();
         self
     }
 
@@ -974,9 +1444,47 @@ impl Database {
         self
     }
 
-    /// Internal helper to start the TTL background thread using a cancellation channel.
-    fn start_ttl_thread(&mut self) {
+    /// Start the real background flusher for `Persistence::Scheduled`.
+    fn start_flush_thread(&mut self) {
+        let interval = match self.persistence {
+            Persistence::Scheduled(d) => d,
+            _ => return,
+        };
         if self.is_in_memory() {
+            return;
+        }
+        let interval = if interval.is_zero() {
+            report::warning(
+                "scheduled persistence",
+                "interval must be greater than zero; using 100ms",
+            );
+            Duration::from_millis(100)
+        } else {
+            interval
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.flush_tx.lock() = Some(tx);
+        let dirty = std::sync::Arc::clone(&self.dirty);
+        let path = self.path.clone();
+        let handle = std::thread::spawn(move || loop {
+            match rx.recv_timeout(interval) {
+                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if dirty.swap(false, Ordering::SeqCst) {
+                        if let Err(e) = fsync_journal(&path) {
+                            dirty.store(true, Ordering::SeqCst);
+                            report::detached("scheduled flush: fsync journal", e);
+                        }
+                    }
+                }
+            }
+        });
+        *self.flush_thread.lock() = Some(handle);
+    }
+
+    /// Internal helper to start the TTL background thread using a cancellation channel.
+    fn start_ttl_thread(&mut self) {        if self.is_in_memory() {
             return;
         }
         
@@ -1152,34 +1660,29 @@ impl Database {
         Ok(handle)
     }
 
-    /// Journal one committed mutation: attach `_seq`, append the line, then
+    /// Journal one committed mutation: append the line carrying `_seq`, then
     /// advance the lineage and record the change event.
     ///
     /// Caller holds `writer`, which is what makes `last_seq + 1` unique.
     /// `journal` is the entry written to disk (full document, patch or
-    /// tombstone) and is left without `_seq`. `event_doc` is the document's
-    /// post-mutation state for an upsert, `None` for a delete.
+    /// tombstone) and is never mutated — `_seq` is spliced into the serialized
+    /// line, so no document copy is made to stamp it. `event` is the
+    /// document's post-mutation state for an upsert (shared with the store and
+    /// the change log), `None` for a delete.
     ///
     /// A failed append moves nothing: `seq`, the lineage and the change log
     /// stay exactly where they were, so the caller can retry whole.
     fn commit_mutation(
         &self,
         id: &str,
-        journal: &mut Value,
-        event_doc: Option<Value>,
+        journal: &Value,
+        event: Option<std::sync::Arc<Value>>,
     ) -> Result<u64> {
         let seq = self.lineage.read().last_seq + 1;
-        {
-            journal
-                .as_object_mut()
-                .ok_or_else(|| Error::invalid_arg("journal entry must be a JSON object"))?
-                .insert(storage::SEQ_FIELD.to_string(), Value::from(seq));
-        }
-        let line = serde_json::to_string(&*journal)?;
-        journal
-            .as_object_mut()
-            .expect("object checked above")
-            .remove(storage::SEQ_FIELD);
+        let object = journal
+            .as_object()
+            .ok_or_else(|| Error::invalid_arg("journal entry must be a JSON object"))?;
+        let line = serde_json::to_string(&JournalRecord { object, seq })?;
 
         if !self.is_in_memory() {
             let mut handle = self.get_file_handle()?;
@@ -1190,25 +1693,29 @@ impl Database {
                     }
                     _ => {
                         storage::append_line(file, &self.path, &line)?;
+                        self.dirty.store(true, Ordering::SeqCst);
                     }
                 }
             }
         }
 
         self.lineage.write().last_seq = seq;
-        self.change_log.write().push(ChangeEvent {
+        {
+            let mut doc_seq = self.doc_seq.write();
+            if event.is_some() {
+                doc_seq.insert(id.to_string(), seq);
+            } else {
+                doc_seq.remove(id);
+            }
+        }
+        self.change_log.write().push(LoggedChange {
             seq,
             id: id.to_string(),
-            kind: match event_doc {
-                Some(mut doc) => {
-                    // Engine-owned: a caller-supplied `_seq` must not ride
-                    // along in the event while the store strips it.
-                    if let Some(obj) = doc.as_object_mut() {
-                        obj.remove(storage::SEQ_FIELD);
-                    }
-                    ChangeKind::Upsert(doc)
-                }
-                None => ChangeKind::Delete,
+            kind: match event {
+                // Engine-owned: a caller-supplied `_seq` never reaches the
+                // store or the event — `JournalRecord` skips it on the way out.
+                Some(doc) => LoggedKind::Upsert(doc),
+                None => LoggedKind::Delete,
             },
         });
         Ok(seq)
@@ -1217,41 +1724,36 @@ impl Database {
     // ─── Layer 1: Core Operations ──────────────────────────────────
 
     /// Insert a document. Generates a NanoID `_id` and returns it.
-    /// O(1) operation: HashMap insert + file append.
+    /// O(1) operation: one collision check + HashMap insert + file append.
     pub fn insert(&self, mut doc: Value) -> Result<String> {
         let _guard = self.writer.lock();
 
-        let docs_reader = self.docs.read();
-        let existing: HashSet<String> = docs_reader.keys().cloned().collect();
-        drop(docs_reader);
-
-        let id = generate_unique(&existing);
+        // O(1) per attempt: no key enumeration. The check covers live *and*
+        // tombstoned ids, so a re-insert can never resurrect a deleted id.
+        let id = generate_checked(|candidate| {
+            self.docs.read().contains_key(candidate)
+                || self.deleted.read().contains(candidate)
+        });
         // Caller-supplied shape: never panic on it. A JSON scalar (a
         // stringified string, null, a number, an array) is valid JSON but not
         // a document, and the caller must hear that rather than lose a process.
-        doc.as_object_mut()
-            .ok_or_else(|| Error::invalid_arg("document must be a JSON object"))?
-            .insert("_id".to_string(), Value::String(id.clone()));
+        let object = doc
+            .as_object_mut()
+            .ok_or_else(|| Error::invalid_arg("document must be a JSON object"))?;
+        object.insert("_id".to_string(), Value::String(id.clone()));
+        object.remove(storage::SEQ_FIELD);
 
-        let event_doc = doc.clone();
-        self.commit_mutation(&id, &mut doc, Some(event_doc))?;
+        // One document instance, shared by the store, the change log and the
+        // journal line — the write path copies nothing.
+        let stored = std::sync::Arc::new(doc);
+        self.commit_mutation(&id, &stored, Some(std::sync::Arc::clone(&stored)))?;
 
-        // Update indexes
-        let mut indexes = self.indexes.write();
-        for (field, index) in indexes.iter_mut() {
-            if let Some(val) = doc.get(field) {
-                index.insert(val, &id);
-            }
-        }
-        drop(indexes);
-
-        self.increment_file_refs(&doc);
+        self.index_insert_doc(&id, &stored);
+        self.increment_file_refs(&stored);
 
         // Update in-memory store
-        let mut docs = self.docs.write();
         self.deleted.write().remove(&id);
-        docs.insert(id.clone(), doc);
-        drop(docs);
+        self.docs.write().insert(id.clone(), stored);
 
         // Full-text indexes (after the doc is in the store)
         self.retext_doc(&id, &Value::Null);
@@ -1263,33 +1765,25 @@ impl Database {
     pub fn insert_with_prefix(&self, prefix: &str, mut doc: Value) -> Result<String> {
         let _guard = self.writer.lock();
 
-        let docs_reader = self.docs.read();
-        let existing: HashSet<String> = docs_reader.keys().cloned().collect();
-        drop(docs_reader);
-
-        let id = generate_unique_with_prefix(prefix, &existing);
+        let id = generate_checked_with_prefix(prefix, |candidate| {
+            self.docs.read().contains_key(candidate)
+                || self.deleted.read().contains(candidate)
+        });
         // See `insert`: a non-object is caller error, surfaced not aborted on.
-        doc.as_object_mut()
-            .ok_or_else(|| Error::invalid_arg("document must be a JSON object"))?
-            .insert("_id".to_string(), Value::String(id.clone()));
+        let object = doc
+            .as_object_mut()
+            .ok_or_else(|| Error::invalid_arg("document must be a JSON object"))?;
+        object.insert("_id".to_string(), Value::String(id.clone()));
+        object.remove(storage::SEQ_FIELD);
 
-        let event_doc = doc.clone();
-        self.commit_mutation(&id, &mut doc, Some(event_doc))?;
+        let stored = std::sync::Arc::new(doc);
+        self.commit_mutation(&id, &stored, Some(std::sync::Arc::clone(&stored)))?;
 
-        let mut indexes = self.indexes.write();
-        for (field, index) in indexes.iter_mut() {
-            if let Some(val) = doc.get(field) {
-                index.insert(val, &id);
-            }
-        }
-        drop(indexes);
+        self.index_insert_doc(&id, &stored);
+        self.increment_file_refs(&stored);
 
-        self.increment_file_refs(&doc);
-
-        let mut docs = self.docs.write();
         self.deleted.write().remove(&id);
-        docs.insert(id.clone(), doc);
-        drop(docs);
+        self.docs.write().insert(id.clone(), stored);
 
         // Full-text indexes (after the doc is in the store)
         self.retext_doc(&id, &Value::Null);
@@ -1297,12 +1791,73 @@ impl Database {
         Ok(id)
     }
 
-    /// Get a document by ID. O(1) HashMap lookup.
+    /// Get a document by ID. O(1) HashMap lookup (one clone to hand out an
+    /// owned value — the store itself is never copied).
     pub fn get(&self, id: &str) -> Result<Value> {
         let docs = self.docs.read();
         docs.get(id)
-            .cloned()
+            .map(|doc| (**doc).clone())
             .ok_or_else(|| Error::not_found(id))
+    }
+
+    /// Add one document to every index. Caller holds the writer lock.
+    fn index_insert_doc(&self, id: &str, doc: &Value) {
+        {
+            let mut hash = self.hash_indexes.write();
+            for (field, index) in hash.iter_mut() {
+                if let Some(val) = field_get(doc, field) {
+                    index.insert(val, id);
+                }
+            }
+        }
+        let mut btree = self.btree_indexes.write();
+        for (field, index) in btree.iter_mut() {
+            if let Some(val) = field_get(doc, field) {
+                index.insert(val, id);
+            }
+        }
+    }
+
+    /// Remove one document from every index. Caller holds the writer lock.
+    fn index_remove_doc(&self, id: &str, doc: &Value) {
+        {
+            let mut hash = self.hash_indexes.write();
+            for (field, index) in hash.iter_mut() {
+                if let Some(val) = field_get(doc, field) {
+                    index.remove(val, id);
+                }
+            }
+        }
+        let mut btree = self.btree_indexes.write();
+        for (field, index) in btree.iter_mut() {
+            if let Some(val) = field_get(doc, field) {
+                index.remove(val, id);
+            }
+        }
+    }
+
+    /// Move one document's index entries from its old value to its new one.
+    fn index_update_doc(&self, id: &str, old_doc: &Value, new_doc: &Value) {
+        {
+            let mut hash = self.hash_indexes.write();
+            for (field, index) in hash.iter_mut() {
+                if let Some(old_val) = field_get(old_doc, field) {
+                    index.remove(old_val, id);
+                }
+                if let Some(new_val) = field_get(new_doc, field) {
+                    index.insert(new_val, id);
+                }
+            }
+        }
+        let mut btree = self.btree_indexes.write();
+        for (field, index) in btree.iter_mut() {
+            if let Some(old_val) = field_get(old_doc, field) {
+                index.remove(old_val, id);
+            }
+            if let Some(new_val) = field_get(new_doc, field) {
+                index.insert(new_val, id);
+            }
+        }
     }
 
     /// Sync secondary indexes after a document commit (delta ops:
@@ -1310,21 +1865,11 @@ impl Database {
     /// inserts the new ones. Caller must hold the writer lock, pass the
     /// doc's pre-commit snapshot, and commit the new doc to the store first.
     fn reindex_doc(&self, id: &str, old_doc: &Value) {
-        let mut indexes = self.indexes.write();
-        {
-            let docs = self.docs.read();
-            if let Some(new_doc) = docs.get(id) {
-                for (field, index) in indexes.iter_mut() {
-                    if let Some(old_val) = old_doc.get(field) {
-                        index.remove(old_val, id);
-                    }
-                    if let Some(new_val) = new_doc.get(field) {
-                        index.insert(new_val, id);
-                    }
-                }
-            }
+        let new_doc = self.docs.read().get(id).map(std::sync::Arc::clone);
+        match new_doc {
+            Some(new_doc) => self.index_update_doc(id, old_doc, &new_doc),
+            None => self.index_remove_doc(id, old_doc),
         }
-        drop(indexes);
 
         // Full-text indexes: re-tokenize the field text.
         self.retext_doc(id, old_doc);
@@ -1337,7 +1882,7 @@ impl Database {
         if text_indexes.is_empty() {
             return;
         }
-        let new_doc = self.docs.read().get(id).cloned();
+        let new_doc = self.docs.read().get(id).map(std::sync::Arc::clone);
         for (field, tindex) in text_indexes.iter_mut() {
             if old_doc.get(field).is_some()
                 || new_doc.as_ref().map(|d| d.get(field).is_some()).unwrap_or(false)
@@ -1452,48 +1997,60 @@ impl Database {
     /// failed append therefore leaves every observable state exactly as it
     /// was and the caller may retry; everything after the append is
     /// infallible bookkeeping or reported cleanup.
-    pub fn update(&self, id: &str, mut new_doc: Value) -> Result<()> {
+    pub fn update(&self, id: &str, new_doc: Value) -> Result<()> {
+        self.update_if(id, new_doc, None)
+    }
+
+    /// Update a document, optionally asserting its current seq.
+    ///
+    /// `if_seq` is the optimistic-concurrency token: `Some(n)` refuses with
+    /// `Error::Conflict` (carrying the current document) unless the document
+    /// is still at seq `n`. Checks and commit happen under one writer lock.
+    pub fn update_if(&self, id: &str, mut new_doc: Value, if_seq: Option<u64>) -> Result<()> {
         let _guard = self.writer.lock();
 
         let old_doc = {
             let docs = self.docs.read();
             match docs.get(id) {
-                Some(doc) => doc.clone(),
+                Some(doc) => std::sync::Arc::clone(doc),
                 None => return Err(Error::not_found(id)),
             }
         };
 
+        if let Some(expected) = if_seq {
+            let current_seq = self.doc_seq.read().get(id).copied().unwrap_or(0);
+            if expected != current_seq {
+                return Err(Error::Conflict {
+                    current_seq,
+                    doc: (*old_doc).clone(),
+                });
+            }
+        }
+
         // Set _id on new doc. Same caller-shape rule as `insert`.
-        new_doc
+        let object = new_doc
             .as_object_mut()
-            .ok_or_else(|| Error::invalid_arg("document must be a JSON object"))?
-            .insert("_id".to_string(), Value::String(id.to_string()));
+            .ok_or_else(|| Error::invalid_arg("document must be a JSON object"))?;
+        object.insert("_id".to_string(), Value::String(id.to_string()));
+        object.remove(storage::SEQ_FIELD);
 
         // Journal first: until the append succeeds, nothing else may move.
-        let event_doc = new_doc.clone();
-        self.commit_mutation(id, &mut new_doc, Some(event_doc))?;
+        let stored = std::sync::Arc::new(new_doc);
+        self.commit_mutation(id, &stored, Some(std::sync::Arc::clone(&stored)))?;
 
         // Commit in-memory state: the write is durable, the rest is
         // infallible bookkeeping or reported cleanup.
-        {
-            let mut indexes = self.indexes.write();
-            for (field, index) in indexes.iter_mut() {
-                if let Some(old_val) = old_doc.get(field) {
-                    index.remove(old_val, id);
-                }
-                if let Some(val) = new_doc.get(field) {
-                    index.insert(val, id);
-                }
-            }
-        }
-        self.docs.write().insert(id.to_string(), new_doc.clone());
+        self.index_update_doc(id, &old_doc, &stored);
+        self.docs
+            .write()
+            .insert(id.to_string(), std::sync::Arc::clone(&stored));
 
         // Full-text indexes (old_doc is the pre-update snapshot)
         self.retext_doc(id, &old_doc);
 
         // Ref-count delta and orphan cleanup, last: a file that fails to
         // move is under-cleaning — named, reported, swept by gc later.
-        self.handle_ref_delta_and_trash(&old_doc, &new_doc);
+        self.handle_ref_delta_and_trash(&old_doc, &stored);
 
         Ok(())
     }
@@ -1512,14 +2069,14 @@ impl Database {
         let old_doc = {
             let docs = self.docs.read();
             match docs.get(id) {
-                Some(doc) => doc.clone(),
+                Some(doc) => std::sync::Arc::clone(doc),
                 None => return Err(Error::not_found(id)),
             }
         };
 
         // Apply the path op to a snapshot: the stored document does not
         // move until the journal holds the patch (#7).
-        let mut new_doc = old_doc.clone();
+        let mut new_doc = (*old_doc).clone();
         if !apply_path_push(&mut new_doc, field, value.clone()) {
             // Unresolvable path: nothing mutated, so journal-first ordering
             // imposes nothing — return before the journal append (D1).
@@ -1527,21 +2084,35 @@ impl Database {
         }
 
         // Journal first.
-        let mut patch = serde_json::json!({
+        let patch = serde_json::json!({
             "_id": id,
             "_op": "array_push",
             "path": field,
             "value": value
         });
-        let event_doc = new_doc.clone();
-        self.commit_mutation(id, &mut patch, Some(event_doc))?;
-
-        // Commit: store the new state, then sync indexes and ref counters.
-        self.docs.write().insert(id.to_string(), new_doc.clone());
-        self.reindex_doc(id, &old_doc);
-        self.handle_ref_delta_and_trash(&old_doc, &new_doc);
+        self.commit_doc_state(id, &old_doc, new_doc, &patch)?;
 
         Ok(true)
+    }
+
+    /// Journal a delta op, store its result, then sync indexes and ref
+    /// counters. Journal-first ordering: nothing observable moves until the
+    /// append succeeded (#7).
+    fn commit_doc_state(
+        &self,
+        id: &str,
+        old_doc: &Value,
+        new_doc: Value,
+        journal: &Value,
+    ) -> Result<std::sync::Arc<Value>> {
+        let stored = std::sync::Arc::new(new_doc);
+        self.commit_mutation(id, journal, Some(std::sync::Arc::clone(&stored)))?;
+        self.docs
+            .write()
+            .insert(id.to_string(), std::sync::Arc::clone(&stored));
+        self.reindex_doc(id, old_doc);
+        self.handle_ref_delta_and_trash(old_doc, &stored);
+        Ok(stored)
     }
 
     /// Set a value at a dot-separated path within a document. O(1) file write.
@@ -1559,12 +2130,12 @@ impl Database {
         let old_doc = {
             let docs = self.docs.read();
             match docs.get(id) {
-                Some(doc) => doc.clone(),
+                Some(doc) => std::sync::Arc::clone(doc),
                 None => return Err(Error::not_found(id)),
             }
         };
 
-        let mut new_doc = old_doc.clone();
+        let mut new_doc = (*old_doc).clone();
         if !apply_path_set(&mut new_doc, path, value.clone()) {
             // Unresolvable path: nothing mutated, so journal-first ordering
             // imposes nothing — return before the journal append (D1).
@@ -1572,19 +2143,13 @@ impl Database {
         }
 
         // Journal first (#7).
-        let mut patch = serde_json::json!({
+        let patch = serde_json::json!({
             "_id": id,
             "_op": "set",
             "path": path,
             "value": value
         });
-        let event_doc = new_doc.clone();
-        self.commit_mutation(id, &mut patch, Some(event_doc))?;
-
-        // Commit: store the new state, then sync indexes and ref counters.
-        self.docs.write().insert(id.to_string(), new_doc.clone());
-        self.reindex_doc(id, &old_doc);
-        self.handle_ref_delta_and_trash(&old_doc, &new_doc);
+        self.commit_doc_state(id, &old_doc, new_doc, &patch)?;
 
         Ok(true)
     }
@@ -1603,12 +2168,12 @@ impl Database {
         let old_doc = {
             let docs = self.docs.read();
             match docs.get(id) {
-                Some(doc) => doc.clone(),
+                Some(doc) => std::sync::Arc::clone(doc),
                 None => return Err(Error::not_found(id)),
             }
         };
 
-        let mut new_doc = old_doc.clone();
+        let mut new_doc = (*old_doc).clone();
         if !apply_path_remove(&mut new_doc, path) {
             // Unresolvable path: nothing mutated, so journal-first ordering
             // imposes nothing — return before the journal append (D1).
@@ -1616,25 +2181,104 @@ impl Database {
         }
 
         // Journal first (#7).
-        let mut patch = serde_json::json!({
+        let patch = serde_json::json!({
             "_id": id,
             "_op": "remove",
             "path": path
         });
-        let event_doc = new_doc.clone();
-        self.commit_mutation(id, &mut patch, Some(event_doc))?;
-
-        // Commit: store the new state, then sync indexes and ref counters.
-        self.docs.write().insert(id.to_string(), new_doc.clone());
-        self.reindex_doc(id, &old_doc);
-        self.handle_ref_delta_and_trash(&old_doc, &new_doc);
+        self.commit_doc_state(id, &old_doc, new_doc, &patch)?;
 
         Ok(true)
     }
 
+    /// The commit seq of a live document, `None` when it does not exist.
+    pub fn doc_seq(&self, id: &str) -> Option<u64> {
+        self.doc_seq.read().get(id).copied()
+    }
+
+    /// Apply a batch of path operations as ONE atomic journal commit.
+    ///
+    /// All ops are applied to a staged copy under the writer lock; a single
+    /// journal record (the full post-mutation document, carrying `_seq`) is
+    /// appended, then the store, indexes and ref counters are updated once.
+    /// A batch is all-or-nothing: if any op does not resolve (missing
+    /// intermediate, out-of-bounds index, push onto a non-array) the call
+    /// returns `Error::InvalidArgument` naming the op and **nothing is
+    /// applied** — not to RAM, not to the journal (C3). This is deliberately
+    /// stricter than the single-op `set`/`remove`/`array_push`, which report
+    /// `Ok(false)` for a path that does not resolve.
+    pub fn apply_ops(
+        &self,
+        id: &str,
+        ops: &[PatchOp],
+        if_seq: Option<u64>,
+    ) -> Result<ApplyOpsResult> {
+        if ops.is_empty() {
+            return Err(Error::invalid_arg("patch must contain at least one op"));
+        }
+        let _guard = self.writer.lock();
+
+        let old_doc = {
+            let docs = self.docs.read();
+            match docs.get(id) {
+                Some(doc) => std::sync::Arc::clone(doc),
+                None => return Err(Error::not_found(id)),
+            }
+        };
+
+        if let Some(expected) = if_seq {
+            let current_seq = self.doc_seq.read().get(id).copied().unwrap_or(0);
+            if expected != current_seq {
+                return Err(Error::Conflict {
+                    current_seq,
+                    doc: (*old_doc).clone(),
+                });
+            }
+        }
+
+        let mut new_doc = (*old_doc).clone();
+        let mut applied = Vec::with_capacity(ops.len());
+        for (idx, op) in ops.iter().enumerate() {
+            let ok = match op {
+                PatchOp::Set { path, value } => apply_path_set(&mut new_doc, path, value.clone()),
+                PatchOp::Remove { path } => apply_path_remove(&mut new_doc, path),
+                PatchOp::ArrayPush { path, value } => {
+                    apply_path_push(&mut new_doc, path, value.clone())
+                }
+            };
+            if !ok {
+                return Err(Error::invalid_arg(format!(
+                    "op {idx} ({}) did not resolve; no changes were applied",
+                    match op {
+                        PatchOp::Set { path, .. } => format!("set '{path}'"),
+                        PatchOp::Remove { path } => format!("remove '{path}'"),
+                        PatchOp::ArrayPush { path, .. } => format!("array_push '{path}'"),
+                    }
+                )));
+            }
+            applied.push(true);
+        }
+
+        // One journal record: the full post-mutation state, exactly like an
+        // update — crash replay and `changes_since` need no patch engine.
+        let stored = std::sync::Arc::new(new_doc);
+        let seq = self.commit_mutation(id, &stored, Some(std::sync::Arc::clone(&stored)))?;
+
+        self.docs
+            .write()
+            .insert(id.to_string(), std::sync::Arc::clone(&stored));
+        self.reindex_doc(id, &old_doc);
+        self.handle_ref_delta_and_trash(&old_doc, &stored);
+
+        Ok(ApplyOpsResult {
+            applied,
+            seq,
+            doc: (*stored).clone(),
+        })
+    }
+
     /// Helper to get the path of the persistent trash file.
-    fn trash_doc_path(&self) -> PathBuf {
-        let filename = self.path.file_name().unwrap_or(std::ffi::OsStr::new("data.jsonl"));
+    fn trash_doc_path(&self) -> PathBuf {        let filename = self.path.file_name().unwrap_or(std::ffi::OsStr::new("data.jsonl"));
         self.base_dir.join("_trash").join("docs").join(filename)
     }
 
@@ -1646,7 +2290,7 @@ impl Database {
         let doc_to_trash = {
             let docs = self.docs.read();
             match docs.get(id) {
-                Some(doc) => doc.clone(),
+                Some(doc) => std::sync::Arc::clone(doc),
                 None => return Err(Error::not_found(id)),
             }
         };
@@ -1694,7 +2338,7 @@ impl Database {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let mut trash_doc = doc_to_trash.clone();
+            let mut trash_doc = (*doc_to_trash).clone();
             if let Some(obj) = trash_doc.as_object_mut() {
                 obj.insert("_deleted".to_string(), serde_json::json!(now));
                 if !orphaned_files.is_empty() {
@@ -1724,11 +2368,11 @@ impl Database {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let mut tombstone = serde_json::json!({
+            let tombstone = serde_json::json!({
                 "_id": id,
                 "_deleted": now
             });
-            self.commit_mutation(id, &mut tombstone, None)?;
+            self.commit_mutation(id, &tombstone, None)?;
         }
 
         // Now retire the ref counts and move the orphans aside. A file that
@@ -1757,18 +2401,7 @@ impl Database {
         }
 
         // Remove from indexes
-        let mut indexes = self.indexes.write();
-        {
-            let docs = self.docs.read();
-            if let Some(doc) = docs.get(id) {
-                for (field, index) in indexes.iter_mut() {
-                    if let Some(val) = doc.get(field) {
-                        index.remove(val, id);
-                    }
-                }
-            }
-        }
-        drop(indexes);
+        self.index_remove_doc(id, &doc_to_trash);
 
         // Remove from full-text indexes (doc is about to leave the store;
         // retext_doc would re-see it, so purge directly)
@@ -1792,10 +2425,10 @@ impl Database {
     }
 
     /// Iterator over all non-deleted documents.
-    /// Returns a Vec of cloned Values for thread safety.
+    /// Returns owned `Value`s (one clone per document) for thread safety.
     pub fn iter(&self) -> Vec<Value> {
         let docs = self.docs.read();
-        docs.values().cloned().collect()
+        docs.values().map(|doc| (**doc).clone()).collect()
     }
 
     /// Number of active (non-deleted) documents.
@@ -1816,19 +2449,24 @@ impl Database {
     // ─── Layer 2: Single Field Queries ─────────────────────────────
 
     /// Find all documents where `field` equals `value`.
-    /// Uses index if available, otherwise linear scan.
+    /// Uses an index if available, otherwise linear scan. The index only
+    /// narrows the candidates — every candidate is re-checked with the same
+    /// whole-value equality the scan uses, so both paths return the same set.
     pub fn find(&self, field: &str, value: &Value) -> Vec<Value> {
-        // Check for index
-        {
-            let indexes = self.indexes.read();
-            if let Some(index) = indexes.get(field) {
-                let ids = index.get(value);
-                let docs = self.docs.read();
-                return ids
-                    .iter()
-                    .filter_map(|id| docs.get(id).cloned())
-                    .collect();
-            }
+        if let Some(ids) = self.index_lookup(field, value) {
+            let docs = self.docs.read();
+            let mut ids: Vec<String> = ids.into_iter().collect();
+            ids.sort();
+            return ids
+                .into_iter()
+                .filter_map(|id| docs.get(&id).map(std::sync::Arc::clone))
+                .filter(|doc| {
+                    doc.get(field)
+                        .map(|v| values_equal(v, value))
+                        .unwrap_or(false)
+                })
+                .map(|doc| (*doc).clone())
+                .collect();
         }
 
         // Linear scan
@@ -1839,7 +2477,7 @@ impl Database {
                     .map(|v| values_equal(v, value))
                     .unwrap_or(false)
             })
-            .cloned()
+            .map(|doc| (**doc).clone())
             .collect()
     }
 
@@ -1855,25 +2493,231 @@ impl Database {
                     .map(|v| predicate(v))
                     .unwrap_or(false)
             })
-            .cloned()
+            .map(|doc| (**doc).clone())
             .collect()
     }
 
-    /// Find documents with field value in a range (requires BTree index).
-    /// Falls back to linear scan if no BTree index exists.
+    /// Find documents with field value in the closed range `[min, max]`.
+    ///
+    /// Uses the BTree index when one exists on `field` — `BTreeMap::range`
+    /// over the shared [`OrderedValue`] key order, which is exactly the
+    /// comparison a linear scan applies, so both paths are equal sets.
     pub fn find_range(&self, field: &str, min: &Value, max: &Value) -> Vec<Value> {
+        let in_range = |doc: &Value| {
+            doc.get(field)
+                .map(|v| {
+                    value_cmp(v, min) != std::cmp::Ordering::Less
+                        && value_cmp(v, max) != std::cmp::Ordering::Greater
+                })
+                .unwrap_or(false)
+        };
+
+        if let Some(ids) = self.index_range(field, KeyBound::Included(min), KeyBound::Included(max))
+        {
+            let docs = self.docs.read();
+            let mut ids: Vec<String> = ids.into_iter().collect();
+            ids.sort();
+            return ids
+                .into_iter()
+                .filter_map(|id| docs.get(&id).map(std::sync::Arc::clone))
+                .filter(|doc| in_range(doc))
+                .map(|doc| (*doc).clone())
+                .collect();
+        }
+
         let docs = self.docs.read();
         docs.values()
-            .filter(|doc| {
-                doc.get(field)
-                    .map(|v| {
-                        value_cmp(v, min) != std::cmp::Ordering::Less
-                            && value_cmp(v, max) != std::cmp::Ordering::Greater
-                    })
-                    .unwrap_or(false)
-            })
-            .cloned()
+            .filter(|doc| in_range(doc))
+            .map(|doc| (**doc).clone())
             .collect()
+    }
+
+    // ─── Query Planner ─────────────────────────────────────────────
+
+    /// Exact key lookup in whichever index covers `field`.
+    fn index_lookup(&self, field: &str, value: &Value) -> Option<HashSet<String>> {
+        {
+            let hash = self.hash_indexes.read();
+            if let Some(index) = hash.get(field) {
+                return Some(index.get(value).into_iter().collect());
+            }
+        }
+        let btree = self.btree_indexes.read();
+        btree
+            .get(field)
+            .map(|index| index.get(value).into_iter().collect())
+    }
+
+    /// Ordered range scan; `None` when `field` has no BTree index.
+    fn index_range(
+        &self,
+        field: &str,
+        min: KeyBound<'_>,
+        max: KeyBound<'_>,
+    ) -> Option<HashSet<String>> {
+        let btree = self.btree_indexes.read();
+        let index = btree.get(field)?;
+        index
+            .range(min, max)
+            .map(|ids| ids.into_iter().collect())
+    }
+
+    /// `$in` lookup: the union of exact lookups for each element.
+    fn index_in(&self, field: &str, operand: &Value) -> Option<HashSet<String>> {
+        let values = operand.as_array()?;
+        if values.is_empty() {
+            // `$in: []` matches nothing — an exact empty candidate set, so
+            // only report it when an index actually covers the field.
+            self.index_lookup(field, &Value::Null)?;
+            return Some(HashSet::new());
+        }
+        let mut out: HashSet<String> = HashSet::new();
+        let mut indexed = false;
+        for value in values {
+            if let Some(ids) = self.index_lookup(field, value) {
+                indexed = true;
+                out.extend(ids);
+            }
+        }
+        if indexed {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// Candidate ids for `ast`, or `None` when no conjunct is indexable.
+    ///
+    /// Every returned set is a **superset** of what `query_matches` would
+    /// accept, which is the only property the caller needs: candidates are
+    /// re-evaluated with `query_matches` before being returned. Combinators
+    /// are mirrored exactly — `query_matches` returns early on `$and`/`$or`/
+    /// `$not`, so sibling field keys of a combinator are not constraints and
+    /// are not planned.
+    fn plan_candidates(&self, ast: &Value) -> Option<HashSet<String>> {
+        match ast {
+            Value::Object(map) => {
+                if let Some(and_expr) = map.get("$and") {
+                    let children = and_expr.as_array()?;
+                    return self.intersect_plans(children.iter());
+                }
+                if map.contains_key("$or") || map.contains_key("$not") {
+                    return None;
+                }
+                let mut sets = Vec::new();
+                for (field, condition) in map {
+                    if let Some(set) = self.condition_candidates(field, condition) {
+                        sets.push(set);
+                    }
+                }
+                intersect_sets(sets)
+            }
+            Value::Array(conditions) => self.intersect_plans(conditions.iter()),
+            _ => None,
+        }
+    }
+
+    fn intersect_plans<'a, I>(&self, children: I) -> Option<HashSet<String>>
+    where
+        I: Iterator<Item = &'a Value>,
+    {
+        let mut sets = Vec::new();
+        for child in children {
+            if let Some(set) = self.plan_candidates(child) {
+                sets.push(set);
+            }
+        }
+        intersect_sets(sets)
+    }
+
+    /// Index candidates for one field condition.
+    ///
+    /// Every operator in the object is a necessary condition, so the
+    /// per-operator candidate sets are intersected (not unioned) — a tighter,
+    /// still-correct superset. Range bounds on the same field are merged into
+    /// a single BTree scan first: intersecting interval scans one by one would
+    /// materialize the widest set just to throw it away.
+    fn condition_candidates(&self, field: &str, condition: &Value) -> Option<HashSet<String>> {
+        let Value::Object(ops) = condition else {
+            // Implicit `$eq`.
+            return self.index_lookup(field, condition);
+        };
+        let mut sets = Vec::new();
+        // (bound value, inclusive) — kept owned so a chosen bound outlives the
+        // loop that found it.
+        let mut lower: Option<(Value, bool)> = None;
+        let mut upper: Option<(Value, bool)> = None;
+
+        for (op, operand) in ops {
+            match op.as_str() {
+                "$eq" => {
+                    if let Some(set) = self.index_lookup(field, operand) {
+                        sets.push(set);
+                    }
+                }
+                "$in" => {
+                    if let Some(set) = self.index_in(field, operand) {
+                        sets.push(set);
+                    }
+                }
+                "$gt" => lower = stronger_lower(lower, operand, false),
+                "$gte" => lower = stronger_lower(lower, operand, true),
+                "$lt" => upper = stronger_upper(upper, operand, false),
+                "$lte" => upper = stronger_upper(upper, operand, true),
+                // $ne / $nin / $exists do not narrow a candidate set.
+                _ => {}
+            }
+        }
+
+        if lower.is_some() || upper.is_some() {
+            let min = match &lower {
+                None => KeyBound::Unbounded,
+                Some((v, true)) => KeyBound::Included(v),
+                Some((v, false)) => KeyBound::Excluded(v),
+            };
+            let max = match &upper {
+                None => KeyBound::Unbounded,
+                Some((v, true)) => KeyBound::Included(v),
+                Some((v, false)) => KeyBound::Excluded(v),
+            };
+            if let Some(set) = self.index_range(field, min, max) {
+                sets.push(set);
+            }
+        }
+
+        intersect_sets(sets)
+    }
+
+    /// Every document matching `ast`, as shared references: matching itself
+    /// copies no document, and the returned handles keep the values alive
+    /// after the store lock is released.
+    fn collect_matches(
+        &self,
+        ast: &Value,
+        text_ids: Option<&HashSet<String>>,
+    ) -> Vec<std::sync::Arc<Value>> {
+        let text_ok = |id: &str| text_ids.map_or(true, |set| set.contains(id));
+        let candidates = self.plan_candidates(ast);
+        let docs = self.docs.read();
+
+        match candidates {
+            Some(ids) => {
+                let mut ids: Vec<&String> = ids.iter().collect();
+                ids.sort();
+                ids.into_iter()
+                    .filter_map(|id| docs.get(id).map(|doc| (id, doc)))
+                    .filter(|(id, doc)| {
+                        text_ok(id) && query_matches(doc.as_ref(), ast)
+                    })
+                    .map(|(_, doc)| std::sync::Arc::clone(doc))
+                    .collect()
+            }
+            None => docs
+                .iter()
+                .filter(|(id, doc)| text_ok(id) && query_matches(doc.as_ref(), ast))
+                .map(|(_, doc)| std::sync::Arc::clone(doc))
+                .collect(),
+        }
     }
 
     // ─── Layer 3: JSON AST Queries ─────────────────────────────────
@@ -1883,13 +2727,15 @@ impl Database {
     /// The AST is validated first (G4): an unknown operator or malformed
     /// combinator is `Err(InvalidArgument)` — on every path, not just HTTP.
     /// A typo must fail loud, never silently degrade to a full-DB scan.
+    ///
+    /// Indexable conjuncts narrow the scan first (the query planner); the
+    /// result is identical to a full scan either way.
     pub fn query(&self, ast: Value) -> Result<Vec<Value>> {
         validate_query_ast(&ast)?;
-        let docs = self.docs.read();
-        Ok(docs
-            .values()
-            .filter(|doc| query_matches(doc, &ast))
-            .cloned()
+        Ok(self
+            .collect_matches(&ast, None)
+            .into_iter()
+            .map(|doc| (*doc).clone())
             .collect())
     }
 
@@ -1926,10 +2772,11 @@ impl Database {
     }
 
     /// Execute a query returning only the projected fields, cloning the
-    /// minimum while holding the read lock: for each matching doc, only the
-    /// sort key and the projected fields are cloned. Sort/offset/limit run
-    /// after the lock is released, so writers are never blocked by
-    /// materialization of the result page. `_id` is always included.
+    /// minimum: matching collects shared handles only, so a non-matching
+    /// document allocates nothing and a projected result clones only the
+    /// requested fields. Sort/offset/limit run after the store lock is
+    /// released, so writers are never blocked by materialization of the
+    /// result page. `_id` is always included.
     ///
     /// Returns `(total, page)` where `total` is the pre-pagination match count.
     ///
@@ -1946,26 +2793,22 @@ impl Database {
     ) -> Result<(usize, Vec<Value>)> {
         validate_query_ast(&ast)?;
         let sort_field = opts.sort_by.as_ref().map(|(f, _)| f.clone());
-        let mut rows: Vec<(Value, Value)> = {
-            let docs = self.docs.read();
-            docs.iter()
-                .filter(|(id, doc)| {
-                    query_matches(doc, &ast)
-                        && text_ids.map_or(true, |set| set.contains(*id))
-                })
-                .map(|(_id, doc)| {
-                    let key = match &sort_field {
-                        Some(f) => field_get(doc, f).cloned().unwrap_or(Value::Null),
-                        None => Value::Null,
-                    };
-                    let proj = match fields {
-                        Some(fs) => project_doc(doc, fs),
-                        None => doc.clone(),
-                    };
-                    (key, proj)
-                })
-                .collect()
-        };
+        let matches = self.collect_matches(&ast, text_ids);
+
+        let mut rows: Vec<(Value, Value)> = matches
+            .iter()
+            .map(|doc| {
+                let key = match &sort_field {
+                    Some(f) => field_get(doc, f).cloned().unwrap_or(Value::Null),
+                    None => Value::Null,
+                };
+                let proj = match fields {
+                    Some(fs) => project_doc(doc, fs),
+                    None => (**doc).clone(),
+                };
+                (key, proj)
+            })
+            .collect();
 
         if let Some((_, dir)) = &opts.sort_by {
             rows.sort_by(|a, b| match dir {
@@ -2016,54 +2859,63 @@ impl Database {
 
     // ─── Index Management ──────────────────────────────────────────
 
-    /// Create a hash index on a field. Scans all documents once.
+    /// Create a hash index on a field (one scan of the store). Dot-notation
+    /// paths resolve exactly like `field_get`, so `meta.score` is indexable.
     pub fn create_index(&self, field: &str) -> Result<()> {
         let _guard = self.writer.lock();
 
         let mut index = HashIndex::new();
         let docs = self.docs.read();
         for (id, doc) in docs.iter() {
-            if let Some(val) = doc.get(field) {
+            if let Some(val) = field_get(doc, field) {
                 index.insert(val, id);
             }
         }
 
-        self.indexes
+        self.hash_indexes
             .write()
-            .insert(field.to_string(), Box::new(index));
+            .insert(field.to_string(), index);
         Ok(())
     }
 
-    /// Create a BTree index on a field (for range queries).
+    /// Create a BTree index on a field (ordered equality + range scans).
+    /// A field may carry a hash index and a BTree index at the same time.
     pub fn create_btree_index(&self, field: &str) -> Result<()> {
         let _guard = self.writer.lock();
 
         let mut index = BTreeIndex::new();
         let docs = self.docs.read();
         for (id, doc) in docs.iter() {
-            if let Some(val) = doc.get(field) {
+            if let Some(val) = field_get(doc, field) {
                 index.insert(val, id);
             }
         }
 
-        self.indexes
+        self.btree_indexes
             .write()
-            .insert(field.to_string(), Box::new(index));
+            .insert(field.to_string(), index);
         Ok(())
     }
 
-    /// Drop an index, freeing memory.
+    /// Drop every index on a field, freeing memory.
     pub fn drop_index(&self, field: &str) -> Result<()> {
-        let mut indexes = self.indexes.write();
-        indexes
-            .remove(field)
-            .ok_or_else(|| Error::index_error(field, "index not found"))?;
+        let hash = self.hash_indexes.write().remove(field).is_some();
+        let btree = self.btree_indexes.write().remove(field).is_some();
+        if !hash && !btree {
+            return Err(Error::index_error(field, "index not found"));
+        }
         Ok(())
     }
 
-    /// Check if an index exists for a field.
+    /// Check if any index exists for a field.
     pub fn has_index(&self, field: &str) -> bool {
-        self.indexes.read().contains_key(field)
+        self.hash_indexes.read().contains_key(field)
+            || self.btree_indexes.read().contains_key(field)
+    }
+
+    /// Check if a full-text index exists for a field.
+    pub fn has_text_index(&self, field: &str) -> bool {
+        self.text_indexes.read().contains_key(field)
     }
 
     // ─── Compaction & Trash ────────────────────────────────────────
@@ -2087,7 +2939,7 @@ impl Database {
             }
 
             let docs = self.docs.read();
-            let active: Vec<&Value> = docs.values().collect();
+            let active: Vec<&Value> = docs.values().map(|doc| doc.as_ref()).collect();
 
             // Rewrite active docs. Tombstones in the old data.jsonl are permanently dropped,
             // which is safe because `delete()` already archived the full documents into
@@ -2127,7 +2979,7 @@ impl Database {
         let docs = self.docs.read();
         let mut out: Vec<(String, Value)> = docs
             .iter()
-            .map(|(id, doc)| (id.clone(), doc.clone()))
+            .map(|(id, doc)| (id.clone(), (**doc).clone()))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Snapshot { lineage, docs: out }
@@ -2168,7 +3020,14 @@ impl Database {
             .read()
             .iter()
             .filter(|event| event.seq > since_seq)
-            .cloned()
+            .map(|event| ChangeEvent {
+                seq: event.seq,
+                id: event.id.clone(),
+                kind: match &event.kind {
+                    LoggedKind::Upsert(doc) => ChangeKind::Upsert((**doc).clone()),
+                    LoggedKind::Delete => ChangeKind::Delete,
+                },
+            })
             .collect();
         Ok(ChangeBatch { lineage, events })
     }
@@ -2271,7 +3130,7 @@ impl Database {
         fs::create_dir_all(target).map_err(Error::io_err(target, "create snapshot directory"))?;
 
         let docs = self.docs.read();
-        let active: Vec<&Value> = docs.values().collect();
+        let active: Vec<&Value> = docs.values().map(|doc| doc.as_ref()).collect();
         
         // 1. Write the clean JSON line docs — the epoch and seq watermark carry
         //    over; only the replay window resets to what this snapshot holds.
@@ -2392,13 +3251,13 @@ impl Database {
             obj.remove("_trashed_files");
         }
 
-        let mut doc = trash_doc;
+        let doc = trash_doc;
 
         // Journal first (G1): the restored document is appended before any
         // file, counter, or in-memory state moves, so a failed append leaves
         // everything exactly as it was and the restore is retryable.
-        let event_doc = doc.clone();
-        self.commit_mutation(id, &mut doc, Some(event_doc))?;
+        let stored = std::sync::Arc::new(doc);
+        self.commit_mutation(id, &stored, Some(std::sync::Arc::clone(&stored)))?;
 
         // Return any implicitly trashed files — after the journal holds the
         // restored document. The document comes back either way; a file that
@@ -2415,7 +3274,7 @@ impl Database {
 
         // Restore file reference counters
         let mut extracted_file_refs = HashSet::new();
-        Self::extract_file_refs(&doc, &mut extracted_file_refs);
+        Self::extract_file_refs(&stored, &mut extracted_file_refs);
         {
             let mut file_refs = self.file_refs.write();
             for r in extracted_file_refs {
@@ -2425,7 +3284,7 @@ impl Database {
 
         // Update in-memory state
         self.deleted.write().remove(id);
-        self.docs.write().insert(id.to_string(), doc);
+        self.docs.write().insert(id.to_string(), stored);
 
         Ok(())
     }
@@ -2439,12 +3298,22 @@ impl Database {
         }
 
         let mut handle = self.file_handle.lock();
-        if let Some(ref mut file) = *handle {
-            file.flush()
-                .map_err(Error::io_err(&self.path, "flush"))?;
-            file.sync_all()
-                .map_err(Error::io_err(&self.path, "fsync"))?;
+        match handle.as_mut() {
+            Some(file) => {
+                file.flush()
+                    .map_err(Error::io_err(&self.path, "flush"))?;
+                file.sync_all()
+                    .map_err(Error::io_err(&self.path, "fsync"))?;
+            }
+            // Nothing was appended yet: nothing to flush, and opening the
+            // journal just to fsync it would create work where there is none.
+            None if !self.dirty.load(Ordering::SeqCst) => return Ok(()),
+            None => {
+                drop(handle);
+                fsync_journal(&self.path)?;
+            }
         }
+        self.dirty.store(false, Ordering::SeqCst);
 
         Ok(())
     }
@@ -2459,6 +3328,23 @@ impl Database {
     /// Get or create a named file bucket for binary storage.
     pub fn bucket(&self, name: &str) -> FileBucket {
         FileBucket::new(name, &self.base_dir)
+    }
+
+    /// Store a file under its real name, deriving the MIME type from the
+    /// extension. The extension is preserved — `photo.png` stays a PNG.
+    ///
+    /// Serialized against `gc_buckets` by the writer lock (H3): an upload that
+    /// lands mid-sweep can no longer be trashed before its document exists.
+    pub fn store_file(&self, bucket: &str, data: &[u8], filename: &str) -> Result<FileMeta> {
+        let _guard = self.writer.lock();
+        let mime = bucket::mime_for_filename(filename);
+        self.bucket(bucket).store(filename, data, mime)
+    }
+
+    /// List the stored files (`hash.ext`) of a bucket. An absent bucket is an
+    /// empty list: nothing was ever stored there.
+    pub fn list_files(&self, bucket: &str) -> Result<Vec<String>> {
+        self.bucket(bucket).list()
     }
 
     // ─── Item buckets (#9) ──────────────────────────────────────────
@@ -2571,24 +3457,25 @@ impl Database {
         anomalies
     }
 
-    /// Check if a string occurs anywhere in a JSON value
-    fn value_contains_string(value: &Value, target: &str) -> bool {
-        match value {
-            Value::String(s) => s.contains(target),
-            Value::Array(a) => a.iter().any(|v| Self::value_contains_string(v, target)),
-            Value::Object(o) => o.values().any(|v| Self::value_contains_string(v, target)),
-            _ => false,
-        }
+    /// Targets a specific file reference string (e.g. `images:a1b2c3d4.png`)
+    /// and safely removes it from the bucket if nothing still needs it.
+    /// Returns true if it was safely deleted, false when it is referenced.
+    ///
+    /// "Referenced" means: held by a live document (in ANY accepted ref form —
+    /// compact, `/api/buckets/…`, `/file/…`, `/files/…`, `/v2/dbs/…/files/…`)
+    /// or by a restorable record in `_trash/docs/` (C4). A trashed document
+    /// may be restored, and restoring it returns its files — deleting one of
+    /// those would break the restore.
+    pub fn release_file(&self, file_ref_str: &str) -> Result<bool> {
+        self.release_file_with(file_ref_str, false)
     }
 
-    /// Targets a specific file reference string (e.g. `images:a1b2c3d4.png`)
-    /// and safely removes it from the bucket if no active document references it.
-    /// Returns true if it was safely deleted.
-    ///
-    /// Documents may store either the compact nURI or an API URL
-    /// (`/api/buckets/images/a1b2c3d4.png`). Both count as live references.
-    pub fn release_file(&self, file_ref_str: &str) -> Result<bool> {
-        // G2: the scan of active documents and the trash of the file must
+    /// Like [`Database::release_file`], but `force` deletes the file even when
+    /// a live or restorable document still references it (`?force=true`).
+    /// The caller is asserting it knows better; the dangling reference is then
+    /// the caller's, not the engine's.
+    pub fn release_file_with(&self, file_ref_str: &str, force: bool) -> Result<bool> {
+        // G2: the scan of live documents and the trash of the file must
         // not interleave with a writer — an insert referencing this file
         // landing mid-scan would leave a live document pointing at a
         // trashed file. Serialized against all writers via the same lock
@@ -2596,19 +3483,35 @@ impl Database {
         let _guard = self.writer.lock();
 
         let compact = Self::normalize_file_ref(file_ref_str)
-            .ok_or_else(|| Error::invalid_arg("Invalid file ref format, expected bucket:hash.ext or /api/buckets/..."))?;
+            .ok_or_else(|| Error::invalid_arg(
+                "Invalid file ref format, expected bucket:hash.ext, /api/buckets/…, /file/…, /files/… or /v2/dbs/<db>/files/…",
+            ))?;
         let file_ref = FileRef::from_compact(&compact)
             .ok_or_else(|| Error::invalid_arg("Invalid file ref format, expected bucket:hash.ext"))?;
-        let url_form = format!("/api/buckets/{}/{}", file_ref.bucket, file_ref.filename());
 
-        // Fast sweep of in-memory active documents
-        {
-            let docs = self.docs.read();
-            for val in docs.values() {
-                if Self::value_contains_string(val, &compact)
-                    || Self::value_contains_string(val, &url_form)
-                {
-                    // Another active document is using it, abort delete
+        if !force {
+            // Live documents: normalize every string, so every accepted HTTP
+            // form counts as a reference rather than only the exact spelling
+            // stored.
+            {
+                let docs = self.docs.read();
+                let mut live = HashSet::new();
+                for val in docs.values() {
+                    Self::extract_file_refs(val, &mut live);
+                }
+                if live.contains(&compact) {
+                    return Ok(false);
+                }
+            }
+
+            // Restorable deletions: a document in the doc trash can come back,
+            // and with it the files listed in its `_trashed_files`.
+            if !self.is_in_memory() {
+                let mut trashed = HashSet::new();
+                for doc in storage::read_trash(&self.trash_doc_path())? {
+                    Self::extract_file_refs(&doc, &mut trashed);
+                }
+                if trashed.contains(&compact) {
                     return Ok(false);
                 }
             }
@@ -2699,9 +3602,12 @@ impl Database {
     }
 
     /// Normalize any string that points at a bucket file into compact
-    /// `bucket:hash.ext` form. Accepts:
+    /// `bucket:hash.ext` form. Accepts every ref form an API may store:
     /// - compact nURI: `images:a1b2c3d4.png`
-    /// - API path/URL: `/api/buckets/images/a1b2c3d4.png` (optional host prefix, query)
+    /// - `/api/buckets/images/a1b2c3d4.png` (optional host prefix, query)
+    /// - `/file/images/a1b2c3d4.png` (legacy single-DB route)
+    /// - `/files/images/a1b2c3d4.png` (v2 route)
+    /// - `/v2/dbs/<db>/files/images/a1b2c3d4.png`
     fn normalize_file_ref(s: &str) -> Option<String> {
         // Compact form first
         if let Some(fr) = FileRef::from_compact(s) {
@@ -2713,25 +3619,34 @@ impl Database {
             }
         }
 
-        // /api/buckets/{bucket}/{id}.{ext} anywhere in the string
-        const MARKER: &str = "/api/buckets/";
-        if let Some(idx) = s.find(MARKER) {
-            let rest = &s[idx + MARKER.len()..];
-            let rest = rest.split(['?', '#']).next().unwrap_or(rest);
-            let mut parts = rest.splitn(2, '/');
-            let bucket = parts.next().unwrap_or("");
-            let file = parts.next().unwrap_or("");
-            if bucket.is_empty() || file.is_empty() {
-                return None;
-            }
-            let dot = file.rfind('.')?;
-            let id = &file[..dot];
-            let ext = &file[dot + 1..];
-            if id.len() >= 8 && !ext.is_empty() && !bucket.contains('/') {
-                return Some(format!("{}:{}.{}", bucket, id, ext));
+        // Path forms. `/files/` covers both the v2 route and the
+        // `/v2/dbs/<db>/files/<bucket>/<file>` route (the tail is identical).
+        for marker in ["/api/buckets/", "/files/", "/file/"] {
+            if let Some(compact) = Self::compact_from_path_marker(s, marker) {
+                return Some(compact);
             }
         }
 
+        None
+    }
+
+    fn compact_from_path_marker(s: &str, marker: &str) -> Option<String> {
+        let idx = s.find(marker)?;
+        let rest = &s[idx + marker.len()..];
+        let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+        let mut parts = rest.splitn(2, '/');
+        let bucket = parts.next().unwrap_or("");
+        let file = parts.next().unwrap_or("");
+        if bucket.is_empty() || file.is_empty() || bucket.contains('/') {
+            return None;
+        }
+        let file = file.split(['?', '#']).next().unwrap_or(file);
+        let dot = file.rfind('.')?;
+        let id = &file[..dot];
+        let ext = &file[dot + 1..];
+        if id.len() >= 8 && !ext.is_empty() {
+            return Some(format!("{}:{}.{}", bucket, id, ext));
+        }
         None
     }
 
@@ -2808,9 +3723,20 @@ impl Database {
     }
 }
 
+/// Fsync a journal file through its own handle. `FlushFileBuffers` flushes the
+/// file's system buffers regardless of which handle asks, and on Windows needs
+/// a write-capable handle — hence `write(true)` rather than `read(true)`.
+fn fsync_journal(path: &Path) -> Result<()> {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(Error::io_err(path, "open journal for scheduled fsync"))?;
+    file.sync_all()
+        .map_err(Error::io_err(path, "scheduled fsync"))
+}
+
 /// Recursive directory copy for snapshot export (item folders, #9).
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst).map_err(Error::io_err(dst, "create directory for copy"))?;
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {    fs::create_dir_all(dst).map_err(Error::io_err(dst, "create directory for copy"))?;
     for entry in fs::read_dir(src).map_err(Error::io_err(src, "read directory for copy"))? {
         let entry = entry.map_err(Error::io_err(src, "read directory entry for copy"))?;
         let target = dst.join(entry.file_name());
@@ -2834,6 +3760,17 @@ impl Error {
 
 impl Drop for Database {
     fn drop(&mut self) {
+        // Stop the scheduled flusher first: its final pass must not race the
+        // flush below (and the journal handle must stay valid while it runs).
+        if let Some(tx) = self.flush_tx.lock().take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.flush_thread.lock().take() {
+            if handle.join().is_err() {
+                report::detached("drop: join flush thread", "background thread panicked");
+            }
+        }
+
         // Signal the TTL background thread to stop. A send failure means the
         // thread already exited, which is the outcome we were after.
         if let Some(tx) = self.ttl_tx.lock().take() {
@@ -2853,6 +3790,8 @@ impl Drop for Database {
         if let Err(e) = self.flush() {
             report::detached("drop: flush pending writes", e);
         }
+
+        // `_lock` drops here: closing the handle is the OS lock release.
     }
 }
 
@@ -2869,6 +3808,113 @@ mod tests {
         let path = dir.path().join("test.jsonl");
         let db = Database::open(&path).unwrap();
         (db, dir)
+    }
+
+    // ─── File references (C4) ─────────────────────────────────────
+
+    #[test]
+    fn every_bucket_ref_form_normalizes_to_the_compact_uri() {
+        let hash = "a".repeat(64);
+        let expected = format!("images:{hash}.png");
+        let forms = [
+            expected.clone(),
+            format!("/api/buckets/images/{hash}.png"),
+            format!("https://host:3100/api/buckets/images/{hash}.png?w=10"),
+            format!("/file/images/{hash}.png"),
+            format!("/files/images/{hash}.png"),
+            format!("/v2/dbs/photos/files/images/{hash}.png"),
+        ];
+        for form in forms {
+            assert_eq!(
+                Database::normalize_file_ref(&form).as_deref(),
+                Some(expected.as_str()),
+                "form {form} must be a live reference"
+            );
+        }
+        assert_eq!(Database::normalize_file_ref("/files/images/"), None);
+        assert_eq!(Database::normalize_file_ref("not a ref"), None);
+    }
+
+    #[test]
+    fn a_doc_referencing_the_files_url_survives_gc_and_refuses_release() {
+        let (db, _dir) = test_db();
+        let meta = db.bucket("images").store("pic.png", b"bytes", "image/png").unwrap();
+        let url = format!("/files/images/{}.png", meta._file.id);
+        let id = db.insert(json!({"attachment": url})).unwrap();
+
+        assert_eq!(db.gc_buckets().unwrap(), 0, "a URL-form ref is a live ref");
+        assert!(db.bucket("images").exists(&meta._file));
+        assert!(!db.release_file(&format!("/files/images/{}.png", meta._file.id)).unwrap());
+
+        db.delete(&id).unwrap();
+        // The restorable trash record still holds it.
+        assert!(
+            !db.release_file(&format!("images:{}.png", meta._file.id)).unwrap(),
+            "a restorable document keeps its file"
+        );
+    }
+
+    #[test]
+    fn apply_ops_commits_once_and_rolls_back_entirely() {
+        let (db, _dir) = test_db();
+        let id = db.insert(json!({"a": 1, "list": [1], "tmp": true})).unwrap();
+        let seq = db.doc_seq(&id).unwrap();
+
+        let result = db
+            .apply_ops(
+                &id,
+                &[
+                    PatchOp::Set {
+                        path: "a".to_string(),
+                        value: json!(2),
+                    },
+                    PatchOp::ArrayPush {
+                        path: "list".to_string(),
+                        value: json!(2),
+                    },
+                    PatchOp::Remove {
+                        path: "tmp".to_string(),
+                    },
+                ],
+                Some(seq),
+            )
+            .unwrap();
+        assert_eq!(result.applied, vec![true, true, true]);
+        assert_eq!(result.seq, seq + 1, "one journal record for the batch");
+        assert_eq!(result.doc, json!({"_id": id, "a": 2, "list": [1, 2]}));
+        assert_eq!(db.lineage().last_seq, seq + 1);
+
+        // A stale token conflicts; a bad path aborts without a record.
+        let err = db
+            .apply_ops(
+                &id,
+                &[PatchOp::Set {
+                    path: "a".to_string(),
+                    value: json!(3),
+                }],
+                Some(seq),
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Conflict { .. }));
+        let err = db
+            .apply_ops(
+                &id,
+                &[
+                    PatchOp::Set {
+                        path: "a".to_string(),
+                        value: json!(3),
+                    },
+                    PatchOp::ArrayPush {
+                        path: "a".to_string(),
+                        value: json!(9),
+                    },
+                ],
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { .. }));
+        assert_eq!(db.get(&id).unwrap()["a"], json!(2));
+        assert_eq!(db.lineage().last_seq, seq + 1, "nothing journaled");
     }
 
     // ─── Phase 1: Core CRUD ────────────────────────────────────────
@@ -3004,6 +4050,7 @@ mod tests {
         db.delete(&id2).unwrap();
 
         db.compact().unwrap();
+        drop(db); // the OS writer lock forbids a second handle on one journal
 
         // Reopen and verify
         let db2 = Database::open(&path).unwrap();

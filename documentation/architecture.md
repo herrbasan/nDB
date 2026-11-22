@@ -104,12 +104,43 @@ The database file is a sequence of JSON objects, one per line:
 
 ### Crash Recovery
 
-On load, `read_all_with_meta()` parses each line individually. Malformed or truncated lines (from power loss during write) are **skipped with a warning** rather than causing a fatal error. This means:
+On load, `read_all_with_meta()` streams the journal line by line with a
+`BufReader`, tracking the exact byte offset just past the last complete, valid
+line. Recovery is **tail-only**:
 
-- All data written *before* the crash is preserved.
-- Only the incomplete last write is lost.
-- `last_seq` is the highest `_seq` actually present, so the next commit reuses the number the torn line never got.
-- The database opens successfully after a crash.
+- **Torn final line** (interrupted write: no terminator, or invalid JSON with
+  nothing after it) → the file is truncated to `last_good_offset`
+  (`set_len` + `sync_all` + parent-dir fsync) and a warning is reported. The
+  next append therefore starts on a clean boundary — the pre-1.6 bug was that
+  the next `writeln!` was glued onto the corrupt bytes and lost on reopen.
+- **Mid-journal corruption** (an invalid line *followed by more content*) →
+  `Error::Corruption` naming the line number, the file, and `ndb repair`. It is
+  never skipped: skipping would silently resurrect deleted documents or drop
+  updates.
+- **Corrupt `_meta` header** (line 1 valid JSON but not a header, or invalid
+  JSON followed by more lines) → `Error::Corruption`, never a silent downgrade
+  to legacy mode.
+- **`ndb repair <path>`** copies the journal to
+  `<file>.corrupt.<timestamp>.bak`, truncates at the last good line, fsyncs,
+  and prints the preserved record count plus the lost byte/line range.
+
+`last_seq` is the highest `_seq` actually present, so the next commit reuses the
+number a torn line never got.
+
+### Single Writer per Journal
+
+`Database::open` takes an OS-enforced exclusive lock held for the `Database`
+lifetime and released by `Drop` or by process death:
+
+- **Windows**: the lock file is opened with `FILE_SHARE_READ` (`share_mode(1)`),
+  so any other opener requesting write/delete gets `ERROR_SHARING_VIOLATION`.
+- **Unix**: non-blocking `flock(LOCK_EX | LOCK_NB)`.
+- Lock file: `.lock` beside a folder database's `data.jsonl`, `<file>.lock` for
+  a flat journal. It is deliberately never unlinked (unlinking after unlock
+  races a third opener onto a fresh inode).
+- `open_in_memory()` takes no file lock. A second `Database::open` on a mounted
+  journal fails with `Error::DatabaseLocked`.
+
 
 ---
 
@@ -157,7 +188,7 @@ Uniqueness is guaranteed by checking against the in-memory HashMap. On collision
 | Mode | Behavior | Use Case |
 |------|----------|----------|
 | `Lazy` (default) | Buffer in OS cache, flush on explicit `flush()` or drop | Fastest, for caches/temp data |
-| `Scheduled(Duration)` | Flush every N seconds | Balanced, for most applications |
+| `Scheduled(Duration)` | A real background flusher fsyncs the journal every interval *if* anything was written since the last flush; `Drop` stops it and flushes what is left | Balanced, for most applications |
 | `Immediate` | `fsync` after every write | Maximum safety, for critical data |
 
 ```rust

@@ -357,6 +357,14 @@ impl ItemBucket {
                 })
             {
                 report::suppressed("delete_item: move folder to trash", e);
+            } else {
+                let trashed = trash.join(item_id);
+                if let Err(e) = storage::sync_parent_dir(&trashed) {
+                    report::suppressed("delete_item: fsync item trash directory", e);
+                }
+                if let Err(e) = storage::sync_parent_dir(&folder) {
+                    report::suppressed("delete_item: fsync item bucket directory", e);
+                }
             }
         }
         Ok(())
@@ -389,6 +397,13 @@ impl ItemBucket {
                 .map_err(Error::io_err(&trashed, "restore item folder from trash"))
             {
                 report::suppressed("restore_item: move folder back from trash", e);
+            } else {
+                if let Err(e) = storage::sync_parent_dir(&folder) {
+                    report::suppressed("restore_item: fsync item bucket directory", e);
+                }
+                if let Err(e) = storage::sync_parent_dir(&trashed) {
+                    report::suppressed("restore_item: fsync item trash directory", e);
+                }
             }
         }
         Ok(())

@@ -20,6 +20,83 @@ fn fatal(msg: &str) -> ! {
     process::exit(EXIT_GENERAL_ERROR);
 }
 
+// ─── Graceful shutdown (M3) ─────────────────────────────────────────
+
+/// The OS-level hook for `ndb serve`: a first Ctrl-C / SIGINT sets the
+/// process shutdown latch, which stops the accept loop, drains in-flight
+/// workers and flushes every mounted database. A second signal falls through
+/// to the OS default (an operator who really wants the process gone can have
+/// it) — but the first one always drains first.
+#[cfg(windows)]
+mod shutdown {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    type HandlerRoutine = Option<unsafe extern "system" fn(u32) -> i32>;
+
+    extern "system" {
+        fn SetConsoleCtrlHandler(handler: HandlerRoutine, add: i32) -> i32;
+    }
+
+    const CTRL_C_EVENT: u32 = 0;
+    const CTRL_BREAK_EVENT: u32 = 1;
+    const CTRL_CLOSE_EVENT: u32 = 2;
+    const CTRL_SHUTDOWN_EVENT: u32 = 5;
+
+    static INTERRUPTS: AtomicUsize = AtomicUsize::new(0);
+
+    // Async-signal-safe by construction: an atomic bump and a flag store.
+    unsafe extern "system" fn handler(ctrl_type: u32) -> i32 {
+        match ctrl_type {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_SHUTDOWN_EVENT => {
+                if INTERRUPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ndb::server::request_process_shutdown();
+                    return 1; // handled: the serve loop drains and exits
+                }
+                0 // second signal: OS default termination
+            }
+            _ => 0,
+        }
+    }
+
+    pub fn install() -> bool {
+        (unsafe { SetConsoleCtrlHandler(Some(handler), 1) }) != 0
+    }
+}
+
+/// POSIX twin of the Windows handler (SIGINT + SIGTERM).
+#[cfg(unix)]
+mod shutdown {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+
+    static INTERRUPTS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn handler(_sig: i32) {
+        if INTERRUPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+            ndb::server::request_process_shutdown();
+        }
+    }
+
+    pub fn install() -> bool {
+        let h = handler as usize;
+        (unsafe { signal(SIGINT, h) }) != usize::MAX
+            && (unsafe { signal(SIGTERM, h) }) != usize::MAX
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+mod shutdown {
+    pub fn install() -> bool {
+        false
+    }
+}
+
 /// Read the `buckets` block in either form: the library's object form
 /// (`{"name": {policy}}`, #10) or the legacy CLI name array (`["name"]`).
 /// Legacy names map to an empty policy. The CLI writes the object form;
@@ -63,6 +140,7 @@ fn main() {
         "import" => handle_import(&args[2..]),
         "merge" => handle_merge(&args[2..]),
         "verify" | "check" => handle_verify(&args[2..]),
+        "repair" => handle_repair(&args[2..]),
         "recover" => handle_recover(&args[2..]),
         "dump" => handle_dump(&args[2..]),
         "config" => handle_config(&args[2..]),
@@ -89,85 +167,262 @@ fn print_usage() {
     eprintln!("  import <src> <path>           Restore a snapshot");
     eprintln!("  merge <base> <merge-in>       Combine databases");
     eprintln!("  verify <path>                 Check for corruptions");
+    eprintln!("  repair <path>                 Quarantine a corrupt journal and truncate at the last good line");
     eprintln!("  recover <src> <dest>          Recover corrupted data");
     eprintln!("  dump <path>                   Export JSON Lines to stdout");
     eprintln!("  config <get|set> ...          Manage metadata/config");
     eprintln!("  query <path> <query_ast>      Run a raw JSON AST query");
     eprintln!("  serve <path> [options]         Run as resident HTTP daemon");
+    eprintln!("  serve --db <name>=<path> ...   Serve several databases by name");
+    eprintln!("  serve --dir <root>             Serve every child DB folder under <root>");
+    eprintln!("  serve --config <file.json>     Service configuration (CLI wins)");
     eprintln!("");
     eprintln!("Serve options:");
     eprintln!("  --bind <addr>    Bind address (default 127.0.0.1; 0.0.0.0 for LAN)");
     eprintln!("  --port <n>       Port (default 8323)");
     eprintln!("  --token <secret> Require 'Authorization: Bearer <secret>' (recommended for LAN)");
+    eprintln!("  --db <name>=<path>  Mount a database under a name (repeatable;");
+    eprintln!("                     path is a data.jsonl file or a database folder)");
+    eprintln!("  --dir <root>     Mount every child folder holding data.jsonl or meta.json,");
+    eprintln!("                     and allow POST /v2/dbs to create new databases under <root>");
+    eprintln!("  --config <file>  JSON config (bind/port/token/persistence/scheduled_ms/");
+    eprintln!("                     dir/max_limit/default_limit/dbs)");
+    eprintln!("  --persistence <immediate|scheduled|lazy>  Service default (immediate)");
+    eprintln!("  --scheduled-ms <n>  Flush interval for persistence=scheduled (default 5000)");
+    eprintln!("  --max-limit <n>     Hard cap for an explicit query limit (default 50000)");
+    eprintln!("  --default-limit <n> Page size when a query omits limit (default 1000)");
     eprintln!("  --text-index <f>  Build a full-text index on field <f> at boot (repeatable;");
     eprintln!("                     cached on disk - unchanged journal boots instantly)");
-    eprintln!("  --threads <n>     Threads for index builds (default: all logical cores)");
+    eprintln!("  --threads <n>     Worker threads: connections + index builds (default: all cores)");
 }
 
 fn handle_serve(args: &[String]) {
-    if args.is_empty() {
-        eprintln!("Usage: ndb serve <path/to/data.jsonl> [--bind addr] [--port n] [--token secret]");
-        process::exit(EXIT_GENERAL_ERROR);
-    }
-    let path = Path::new(&args[0]);
-    if !path.exists() {
-        eprintln!("Error: database file does not exist: {}", path.display());
-        process::exit(EXIT_GENERAL_ERROR);
-    }
+    use ndb::server::{
+        serve_registry, DbRegistry, PersistenceMode, ServiceConfig, ServerConfig,
+        DEFAULT_SCHEDULED_MS,
+    };
 
-    let mut config = ndb::server::ServerConfig::default();
-    let mut text_indexes = Vec::new();
-    let mut i = 1;
+    let mut config = ServerConfig::default();
+    let mut text_indexes: Vec<String> = Vec::new();
+    let mut positional: Option<std::path::PathBuf> = None;
+    let mut config_file: Option<std::path::PathBuf> = None;
+    let mut cli_dbs: Vec<(String, String)> = Vec::new();
+    let mut cli_dir: Option<std::path::PathBuf> = None;
+    let mut cli_persistence: Option<PersistenceMode> = None;
+    let mut cli_scheduled_ms: Option<u64> = None;
+    let mut cli_max_limit: Option<usize> = None;
+    let mut cli_default_limit: Option<usize> = None;
+
+    let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--bind" if i + 1 < args.len() => {
-                config.bind = args[i + 1].clone();
-                i += 2;
+        let arg = args[i].as_str();
+        let mut value = |name: &str| -> String {
+            if i + 1 >= args.len() {
+                fatal(&format!("{name} requires a value"));
             }
-            "--port" if i + 1 < args.len() => {
-                config.port = match args[i + 1].parse::<u16>() {
+            i += 1;
+            args[i].clone()
+        };
+        match arg {
+            "--bind" => config.bind = value("--bind"),
+            "--port" => {
+                let raw = value("--port");
+                config.port = match raw.parse::<u16>() {
                     Ok(p) => p,
-                    Err(_) => {
-                        eprintln!("Error: invalid port: {}", args[i + 1]);
-                        process::exit(EXIT_GENERAL_ERROR);
-                    }
+                    Err(_) => fatal(&format!("invalid port: {raw}")),
                 };
-                i += 2;
             }
-            "--token" if i + 1 < args.len() => {
-                config.token = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--text-index" if i + 1 < args.len() => {
-                text_indexes.push(args[i + 1].clone());
-                i += 2;
-            }
-            "--threads" if i + 1 < args.len() => {
-                config.threads = match args[i + 1].parse::<usize>() {
+            "--token" => config.token = Some(value("--token")),
+            "--text-index" => text_indexes.push(value("--text-index")),
+            "--threads" => {
+                let raw = value("--threads");
+                config.threads = match raw.parse::<usize>() {
                     Ok(t) => t,
-                    Err(_) => {
-                        eprintln!("Error: invalid thread count: {}", args[i + 1]);
-                        process::exit(EXIT_GENERAL_ERROR);
-                    }
+                    Err(_) => fatal(&format!("invalid thread count: {raw}")),
                 };
-                i += 2;
+            }
+            "--config" => config_file = Some(std::path::PathBuf::from(value("--config"))),
+            "--db" => {
+                let raw = value("--db");
+                match raw.split_once('=') {
+                    Some((name, path)) if !name.is_empty() && !path.is_empty() => {
+                        cli_dbs.push((name.to_string(), path.to_string()));
+                    }
+                    _ => fatal(&format!(
+                        "--db expects <name>=<path>, got '{raw}'"
+                    )),
+                }
+            }
+            "--dir" => cli_dir = Some(std::path::PathBuf::from(value("--dir"))),
+            "--persistence" => {
+                let raw = value("--persistence");
+                cli_persistence = Some(
+                    PersistenceMode::parse(&raw)
+                        .unwrap_or_else(|e| fatal(&e.to_string())),
+                );
+            }
+            "--scheduled-ms" => {
+                let raw = value("--scheduled-ms");
+                cli_scheduled_ms = Some(
+                    raw.parse::<u64>()
+                        .unwrap_or_else(|_| fatal(&format!("invalid --scheduled-ms: {raw}"))),
+                );
+            }
+            "--max-limit" => {
+                let raw = value("--max-limit");
+                cli_max_limit = Some(
+                    raw.parse::<usize>()
+                        .unwrap_or_else(|_| fatal(&format!("invalid --max-limit: {raw}"))),
+                );
+            }
+            "--default-limit" => {
+                let raw = value("--default-limit");
+                cli_default_limit = Some(
+                    raw.parse::<usize>()
+                        .unwrap_or_else(|_| fatal(&format!("invalid --default-limit: {raw}"))),
+                );
+            }
+            other if other.starts_with("--") => {
+                fatal(&format!("unknown serve option: {other}"));
             }
             other => {
-                eprintln!("Error: unknown serve option: {}", other);
-                process::exit(EXIT_GENERAL_ERROR);
+                if positional.is_some() {
+                    fatal(&format!(
+                        "unexpected extra argument '{other}' (one database path may be given positionally)"
+                    ));
+                }
+                positional = Some(std::path::PathBuf::from(other));
             }
         }
+        i += 1;
+    }
+
+    // The config file supplies defaults; explicit CLI flags win.
+    let mut declared_dbs = Vec::new();
+    let mut file_dir: Option<std::path::PathBuf> = None;
+    let mut file_persistence: Option<PersistenceMode> = None;
+    let mut file_scheduled_ms: Option<u64> = None;
+    if let Some(path) = &config_file {
+        let loaded = ServiceConfig::load(path)
+            .unwrap_or_else(|e| fatal(&format!("{}: {e}", path.display())));
+        declared_dbs = loaded
+            .apply_to(&mut config)
+            .unwrap_or_else(|e| fatal(&e.to_string()));
+        file_persistence = loaded
+            .persistence()
+            .unwrap_or_else(|e| fatal(&e.to_string()));
+        file_dir = loaded.dir.clone();
+        file_scheduled_ms = loaded.scheduled_ms;
+    }
+
+    if let Some(m) = cli_max_limit {
+        config.max_limit = m;
+    }
+    if let Some(d) = cli_default_limit {
+        config.default_limit = d;
+    }
+    if config.default_limit > config.max_limit {
+        fatal(&format!(
+            "default-limit {} exceeds max-limit {}",
+            config.default_limit, config.max_limit
+        ));
     }
     config.text_indexes = text_indexes;
 
-    let db = match ndb::Database::open(path) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("Error opening database: {}", e);
-            process::exit(EXIT_CORRUPTION);
+    let persistence = cli_persistence
+        .or(file_persistence)
+        .unwrap_or(PersistenceMode::Immediate);
+    let scheduled_ms = cli_scheduled_ms
+        .or(file_scheduled_ms)
+        .unwrap_or(DEFAULT_SCHEDULED_MS);
+    let root_dir = cli_dir.or(file_dir);
+
+    if positional.is_none() && cli_dbs.is_empty() && declared_dbs.is_empty() && root_dir.is_none() {
+        eprintln!("Error: nothing to serve. Give a database path, --db, --dir or --config with dbs.");
+        print_usage();
+        process::exit(EXIT_GENERAL_ERROR);
+    }
+    if let Some(root) = &root_dir {
+        if !root.is_dir() {
+            fatal(&format!(
+                "--dir root does not exist or is not a directory: {}",
+                root.display()
+            ));
         }
-    };
-    if let Err(e) = ndb::server::serve(db, config) {
+    }
+
+    let registry = DbRegistry::new(root_dir.clone(), persistence, scheduled_ms);
+
+    if let Some(path) = &positional {
+        // Legacy contract: a positional database must already exist.
+        if !path.exists() {
+            eprintln!("Error: database file does not exist: {}", path.display());
+            process::exit(EXIT_GENERAL_ERROR);
+        }
+        registry
+            .mount_resolved("default", path, persistence.to_persistence(scheduled_ms))
+            .unwrap_or_else(|e| fatal(&format!("mounting 'default': {e}")));
+    }
+
+    for (name, path) in &cli_dbs {
+        registry
+            .mount_resolved(name, path, persistence.to_persistence(scheduled_ms))
+            .unwrap_or_else(|e| fatal(&format!("mounting '{name}': {e}")));
+    }
+
+    for (name, path, mode, sched) in &declared_dbs {
+        let mode = mode.unwrap_or(persistence);
+        let p = mode.to_persistence(sched.unwrap_or(scheduled_ms));
+        registry
+            .mount_resolved(name, path, p)
+            .unwrap_or_else(|e| fatal(&format!("mounting '{name}': {e}")));
+    }
+
+    // Discovery: every direct child of --dir that holds a journal or meta.json
+    // is a database, mounted by folder name. Sorted for deterministic boots.
+    if let Some(root) = &root_dir {
+        let mut children: Vec<std::path::PathBuf> = fs::read_dir(root)
+            .unwrap_or_else(|e| fatal(&format!("reading --dir {}: {e}", root.display())))
+            .filter_map(|entry| match entry {
+                Ok(entry) => {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        Some(path)
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => fatal(&format!("reading --dir {}: {e}", root.display())),
+            })
+            .collect();
+        children.sort();
+        for child in children {
+            if !(child.join("data.jsonl").exists() || child.join("meta.json").exists()) {
+                continue;
+            }
+            let Some(name) = child.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                fatal(&format!("cannot derive a database name from {}", child.display()));
+            };
+            registry
+                .mount_resolved(&name, &child, persistence.to_persistence(scheduled_ms))
+                .unwrap_or_else(|e| fatal(&format!("mounting discovered DB '{name}': {e}")));
+        }
+    }
+
+    if registry.is_empty() {
+        fatal("no database was mounted");
+    }
+
+    // Ctrl-C / SIGINT must flush, not kill mid-write. A platform without a
+    // hook still serves; it just says so instead of pretending.
+    if !shutdown::install() {
+        eprintln!(
+            "warning: could not install the shutdown handler on this platform; \
+             Ctrl-C will not flush mounted databases"
+        );
+    }
+
+    if let Err(e) = serve_registry(std::sync::Arc::new(registry), config) {
         eprintln!("Server error: {}", e);
         process::exit(EXIT_GENERAL_ERROR);
     }
@@ -842,8 +1097,63 @@ fn handle_verify(args: &[String]) {
     process::exit(EXIT_SUCCESS); // Code 0
 }
 
-fn handle_recover(args: &[String]) {
-    if args.len() < 3 || args[1] != "--output" {
+/// `ndb repair <path>` — quarantine a corrupt journal and truncate it at the
+/// last complete record.
+///
+/// Recovery is destructive by nature, so the pre-repair bytes are copied to
+/// `<file>.corrupt.<timestamp>.bak` first and the exact preserved/lost counts
+/// are printed. Nothing is silent.
+fn handle_repair(args: &[String]) {
+    if args.len() != 1 {
+        eprintln!("Usage: ndb repair <path>");
+        process::exit(EXIT_GENERAL_ERROR);
+    }
+    let input = Path::new(&args[0]);
+    let journal: std::path::PathBuf = if input.is_dir() {
+        input.join("data.jsonl")
+    } else if input.exists() {
+        input.to_path_buf()
+    } else {
+        fatal(&format!("no journal or database folder at {}", input.display()));
+    };
+    if !journal.exists() {
+        fatal(&format!("journal not found: {}", journal.display()));
+    }
+
+    // Truncating a journal under a live writer destroys the data the writer is
+    // piling up. Refuse instead of racing it.
+    let _lock = match ndb::MaintenanceLock::acquire(&journal) {
+        Ok(lock) => lock,
+        Err(e) => fatal(&format!(
+            "cannot repair {}: {e} (is a service still running on this database?)",
+            journal.display()
+        )),
+    };
+
+    let report = match ndb::storage::repair_journal(&journal) {
+        Ok(report) => report,
+        Err(e) => fatal(&format!("repair {}: {e}", journal.display())),
+    };
+
+    println!("Journal: {}", journal.display());
+    println!(
+        "Preserved: {} record(s), {} of {} byte(s)",
+        report.kept_records, report.kept_bytes, report.total_bytes
+    );
+    match (&report.backup, report.removed_from_line) {
+        (Some(backup), Some(line)) => {
+            println!(
+                "Removed: {} line(s) from line {} ({} byte(s))",
+                report.removed_lines, line, report.removed_bytes
+            );
+            println!("Original preserved at: {}", backup.display());
+        }
+        _ => println!("Nothing to repair: the journal is intact."),
+    }
+    process::exit(EXIT_SUCCESS);
+}
+
+fn handle_recover(args: &[String]) {    if args.len() < 3 || args[1] != "--output" {
         eprintln!("Usage: ndb recover <src> --output <dest>");
         process::exit(EXIT_GENERAL_ERROR);
     }

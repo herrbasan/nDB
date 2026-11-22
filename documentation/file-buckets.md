@@ -29,7 +29,7 @@ mydb/
 ├── meta.json                   # Declares kind (and policies) per bucket
 └── _files/                     # All buckets, both kinds (created implicitly)
     ├── avatars/                # kind: "hash"
-    │   └── a1b2c3d4.png        # Content-keyed blob
+    │   └── <sha256>.png        # Content-keyed blob
     └── media/                  # kind: "items"
         ├── items.jsonl         # Engine-owned record journal
         └── itm_V1StGXR8Z5jdHi6B/   # One folder per item
@@ -190,7 +190,7 @@ let meta = bucket.store("photo.png", &data, "image/png")?;
 // meta = FileMeta {
 //     _file: FileRef {
 //         bucket: "avatars",
-//         id: "a1b2c3d4",      // First 8 chars of SHA-256
+//         id: "<64 hex>",      // Full SHA-256 of the content
 //         ext: "png",
 //     },
 //     name: "photo.png",
@@ -228,7 +228,7 @@ std::fs::write("retrieved.png", &data)?;
 Retrieve by hash and extension directly.
 
 ```rust
-let data = bucket.get_by_id("a1b2c3d4", "png")?;
+let data = bucket.get_by_id("<sha256>", "png")?;
 ```
 
 ---
@@ -267,6 +267,20 @@ println!("GC collected {} orphaned files.", trashed);
 
 The returned count is files that actually moved. A bucket that cannot be enumerated, and a file that cannot be moved, are reported on stderr (`ndb: suppressed failure: ...`) and left out of the count — so calling this a successful sweep of *n* files is always true of *n* files. Nothing here throws: a sweep you asked for reports how far it got.
 
+`gc_buckets()` and `store_file()` serialize on the database's writer lock: an
+upload landing mid-sweep can no longer be trashed before its document exists.
+The mark phase recognizes **every** ref form a document may store — the compact
+`bucket:<hash>.<ext>` nURI, `/api/buckets/<bucket>/<file>`, `/file/<bucket>/<file>`,
+`/files/<bucket>/<file>`, and `/v2/dbs/<db>/files/<bucket>/<file>`.
+
+### `release_file(ref) -> Result<bool>` / `release_file_with(ref, force)`
+
+Delete one file if nothing needs it. Returns `false` (HTTP `409
+file_referenced`) when it is held by a live document **or by a restorable record
+in `_trash/docs/`** — a trashed document can be restored, and its files come
+back with it. `force: true` (HTTP `?force=true`) deletes anyway; the dangling
+reference then belongs to the caller.
+
 ### `purge_trash_ttl(ttl: Duration) -> Result<()>`
 
 Delete all trashed files in this bucket that exceed the given TTL by reading their filesystem modification date.
@@ -281,7 +295,7 @@ bucket.purge_trash_ttl(Duration::from_secs(86400))?;
 
 ### `list() -> Result<Vec<String>>`
 
-List all active files in the bucket. Returns the stored filenames (e.g. `a1b2c3d4e5f6.png`). It reads the directory directly — there are no companion `.meta` files.
+List all active files in the bucket. Returns the stored filenames (e.g. `<64 hex>.png`). It reads the directory directly — there are no companion `.meta` files.
 
 ```rust
 let files = bucket.list()?;
@@ -319,7 +333,7 @@ Or use the compact string form:
 let doc_id = db.insert(json!({
     "title": "Q4 Report",
     "_file": meta._file.to_string_compact()
-    // "avatars:a1b2c3d4.png"
+    // "avatars:<64 hex>.png"
 }))?;
 ```
 
@@ -332,13 +346,13 @@ Reference to a stored file.
 | Field | Type | Description |
 |-------|------|-------------|
 | `bucket` | `String` | Bucket name |
-| `id` | `String` | First 8 chars of SHA-256 hash |
+| `id` | `String` | Full 64-char SHA-256 of the content (legacy databases may hold 8-char ids; they stay readable) |
 | `ext` | `String` | File extension (without dot) |
 
 ### Methods
 
-- `filename()` → `"{id}.{ext}"` e.g. `"a1b2c3d4.png"`
-- `to_string_compact()` → `"{bucket}:{id}.{ext}"` e.g. `"avatars:a1b2c3d4.png"`
+- `filename()` → `"{id}.{ext}"` e.g. `"<64 hex>.png"`
+- `to_string_compact()` → `"{bucket}:{id}.{ext}"` e.g. `"avatars:<64 hex>.png"`
 - `from_compact(s)` → Parse from compact string
 
 ## FileMeta
@@ -357,7 +371,7 @@ Full file metadata.
 
 ## SHA-256 Implementation
 
-nDB implements SHA-256 internally without external cryptographic crates. The hash is computed over the file content bytes, producing a 64-character hex string. The first 8 characters are used as the storage filename.
+nDB implements SHA-256 internally without external cryptographic crates. The hash is computed over the file content bytes, producing a 64-character hex string, and that full value is the storage filename. Older databases hold 8-character ids; reads keep working because the id is used verbatim as a filename, but every new store writes the full hash. A dedup hit is verified (size + re-hash) before it is returned — a truncated or colliding blob is reported as `Error::Corruption`, never handed back as the caller's upload.
 
 This provides:
 - **Content-addressed storage**: same content → same hash → same file

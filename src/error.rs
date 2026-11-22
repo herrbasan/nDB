@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
+use serde_json::Value;
+
 /// All errors that can occur in ndb operations.
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -62,6 +64,12 @@ pub enum Error {
     /// A sync cursor points past the last committed sequence.
     #[error("cursor ahead of journal: requested seq {requested_seq}, last {last_seq}")]
     CursorAhead { requested_seq: u64, last_seq: u64 },
+
+    /// Optimistic-concurrency check failed: the document moved since the
+    /// caller read it. Carries the current state so the caller can retry
+    /// without a second round trip.
+    #[error("conflict: document is at seq {current_seq}")]
+    Conflict { current_seq: u64, doc: Value },
 }
 
 impl Error {

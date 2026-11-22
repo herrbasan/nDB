@@ -19,25 +19,27 @@ fn setup() -> (Database, TempDir) {
 // ─── Corruption Recovery ─────────────────────────────────────────────
 
 #[test]
-fn open_recovers_from_truncated_lines() {
+fn open_refuses_mid_journal_corruption() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("corrupted.jsonl");
 
-    // Write a file with mixed valid and corrupted lines
+    // A torn line in the MIDDLE of the journal is not a crash artifact that
+    // can be discarded: the records after it are still there, and skipping it
+    // would silently resurrect deleted documents or drop updates.
     let mut file = fs::File::create(&path).unwrap();
     writeln!(file, r#"{{"_meta":{{"version":1,"created":"0"}}}}"#).unwrap();
     writeln!(file, r#"{{"_id":"good1","v":1}}"#).unwrap();
     writeln!(file, r#"{{"_id":"broken","v":2"#).unwrap(); // truncated
     writeln!(file, r#"{{"_id":"good2","v":3}}"#).unwrap();
-    writeln!(file, "not json at all").unwrap();
-    writeln!(file, r#"{{"_id":"good3","v":4}}"#).unwrap();
+    drop(file);
 
-    let db = Database::open(&path).unwrap();
-    assert_eq!(db.len(), 3); // good1, good2, good3
-    assert!(db.get("good1").is_ok());
-    assert!(db.get("good2").is_ok());
-    assert!(db.get("good3").is_ok());
-    assert!(db.get("broken").is_err()); // corrupted line skipped
+    match Database::open(&path).err().expect("open must refuse corruption") {
+        ndb::Error::Corruption { message, .. } => {
+            assert!(message.contains("line 3"), "must name the line: {message}");
+            assert!(message.contains("ndb repair"), "must name the fix: {message}");
+        }
+        other => panic!("expected Corruption, got {other:?}"),
+    }
 }
 
 #[test]
@@ -56,13 +58,17 @@ fn open_handles_empty_file() {
 }
 
 #[test]
-fn open_handles_garbage_file() {
+fn open_refuses_garbage_file() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("garbage.jsonl");
+    // The first line is invalid and more lines follow: that is a corrupt
+    // journal, not a legacy one with no `_meta` header.
     fs::write(&path, "not json\nalso not json\n").unwrap();
 
-    let db = Database::open(&path).unwrap();
-    assert_eq!(db.len(), 0);
+    assert!(matches!(
+        Database::open(&path),
+        Err(ndb::Error::Corruption { .. })
+    ));
 }
 
 // ─── Crash Simulation ────────────────────────────────────────────────
@@ -73,16 +79,20 @@ fn crash_during_write_preserves_previous_data() {
     let path = dir.path().join("crash.jsonl");
 
     // Write valid data
-    let db = Database::open(&path).unwrap();
-    let id1 = db.insert(json!({"important": "data"})).unwrap();
-    db.flush().unwrap();
+    let id1 = {
+        let db = Database::open(&path).unwrap();
+        let id1 = db.insert(json!({"important": "data"})).unwrap();
+        db.flush().unwrap();
+        id1
+    };
 
     // Simulate crash: append a partial line directly to the file
     let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
     write!(file, "{}", r#"{"_id":"partial","data":"incomplete"#).unwrap();
     drop(file);
 
-    // Reopen — should recover id1, skip partial
+    // Reopen — should recover id1, and the torn tail must be gone so the next
+    // append cannot be glued onto it.
     let db2 = Database::open(&path).unwrap();
     assert_eq!(db2.len(), 1);
     let doc = db2.get(&id1).unwrap();
@@ -94,16 +104,36 @@ fn crash_with_multiple_partial_lines() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("multi_crash.jsonl");
 
-    // Build a file with meta + valid + partial + valid + partial
+    // Build a file with meta + valid + partial + valid + partial, the final
+    // write torn without a terminator. Only the tail can be recovered from;
+    // the middle partial line makes this journal corrupt, so it must be
+    // refused rather than silently skipped.
     let mut file = fs::File::create(&path).unwrap();
     writeln!(file, r#"{{"_meta":{{"version":1,"created":"0"}}}}"#).unwrap();
     writeln!(file, r#"{{"_id":"a","v":1}}"#).unwrap();
     writeln!(file, r#"{{"_id":"b"#).unwrap(); // partial
     writeln!(file, r#"{{"_id":"c","v":3}}"#).unwrap();
     write!(file, r#"{{"_id":"d","v":4"#).unwrap(); // partial, no newline
+    drop(file);
 
+    assert!(matches!(
+        Database::open(&path),
+        Err(ndb::Error::Corruption { .. })
+    ));
+
+    // With only the final write torn, recovery keeps every complete record.
+    fs::write(
+        &path,
+        concat!(
+            "{\"_meta\":{\"version\":1,\"created\":\"0\"}}\n",
+            "{\"_id\":\"a\",\"v\":1}\n",
+            "{\"_id\":\"c\",\"v\":3}\n",
+            "{\"_id\":\"d\",\"v\":4"
+        ),
+    )
+    .unwrap();
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.len(), 2); // a and c only
+    assert_eq!(db.len(), 2);
     assert!(db.get("a").is_ok());
     assert!(db.get("c").is_ok());
 }
@@ -392,6 +422,7 @@ fn compact_after_many_updates() {
 
     // Compact
     db.compact().unwrap();
+    drop(db); // one journal, one writer: the lock forbids a second handle
 
     // Reopen and verify
     let db2 = Database::open(&path).unwrap();
@@ -536,6 +567,7 @@ fn full_lifecycle_persist_reopen() {
 
     // Compact
     db2.compact().unwrap();
+    drop(db2);
 
     // Phase 3: Reopen after compact
     let db3 = Database::open(&path).unwrap();

@@ -25,8 +25,6 @@ ndb = { path = ".." }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-[profile.release]
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true
+# Build profiles live at the workspace root (D:\DEV\nDB\Cargo.toml); a
+# [profile] block here is ignored by Cargo and only produces a warning.
+

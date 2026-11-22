@@ -18,7 +18,7 @@ nDB has two interfaces: napi (in-process Node) and CLI (one-shot). Neither fits 
 | Decision | Choice | Rationale |
 |---|---|---|
 | Transport | Hand-rolled HTTP/1.1 on `std::net::TcpListener` | Zero new crates. ~400 lines. curl + fetch + every language for free. Sync I/O is sufficient for a handful of local/LAN clients. |
-| Concurrency | Thread-per-connection, small cap | Reads already concurrent (`RwLock`); writes serialize on the write lock — maps 1:1 onto nDB's single-writer model. No async runtime. |
+| Concurrency | Bounded worker pool over a queue (`config.threads` workers, `max_connections` deep) | Reads are already concurrent (`RwLock`); writes serialize on the write lock — maps 1:1 onto nDB's single-writer model. A burst fills the queue instead of spawning unbounded OS threads; a full queue is `503`. No async runtime. |
 | API shape | Query-oriented, not CRUD-mirrored | The point is computation in Rust. One powerful `/query` beats mirroring 20 methods. |
 | Framing | `Content-Length` only, keep-alive | We control both ends; no chunked encoding needed. |
 | Process model | Resident daemon, loads JSONL once at boot, never exits on its own | Boot replay is a one-time cost. The server IS the database process (redis-server model). |
@@ -101,8 +101,78 @@ Minor core-adjacent: `set`/`remove` silently skip unresolvable paths — over HT
 - **Read timeout** on every connection (`set_read_timeout`) — kills the slow-loris class and reclaims threads from crashed clients holding half-open connections out of the small pool.
 - **Body cap** (generous, e.g. 64 MB) on `PUT /doc` / `PATCH` — fail loud 413 on excess `Content-Length` rather than OOM on a client bug.
 - **Thread-cap exhaustion → 503**, fail loud, no queueing.
+- **Hot path:** `TCP_NODELAY` per accepted connection; the response is one `write_all` (head+body) for bodies ≤64 KB and head-then-body above it, with `Response::Binary` moved into the socket rather than cloned.
+- **Keep-alive** uses one `BufReader` per socket; a socket ends on `Connection: close`, HTTP/1.0 without keep-alive, clean EOF, 5 s idle between requests (30 s for a live one), or a shutdown flag.
+- **Shutdown (M3):** `server::request_process_shutdown()` is set by the `ndb serve` OS signal hook (Windows `SetConsoleCtrlHandler`, Unix `signal`). The accept loop breaks, the queue closes, workers drain, every mounted DB is `flush()`ed, exit 0.
 - **`POST /compact` and `POST /index` hold the writer lock for minutes at 10 GB** — every write hangs until client timeouts fire. Return `202 Accepted` + expose completion via `/stats`, and document required client timeouts.
 - **Bucket endpoints use raw bytes, not base64-in-JSON** (33% overhead + full buffering defeats the purpose): `PUT /file/:bucket` with file body, `GET /file/:bucket/:hash.ext` with real `Content-Type`.
 - **Writes:** add `PUT /doc/:id` (full replace — maps to existing core `update()`) alongside insert + deltas. `PATCH` response includes per-op `applied: true/false` so wrong-path writes surface immediately.
 - SHA-1 not needed (no WebSocket in v1). WebSocket/push (watch/subscribe) is a later layer on the same listener if a real need appears.
 - Tests: spin up server on ephemeral port in-process; round-trip query/projection/delta/limit; token 401 path; concurrent readers during a write; 400 on unknown operator; 413 on oversized body; 503 on thread exhaustion.
+
+## v2 — Multi-DB service (step 1, implemented)
+
+> Status: **IMPLEMENTED** (`src/server.rs` `DbRegistry`, `src/bin/ndb.rs`, tests `tests/phase13_multi_db_serve_tests.rs`).
+> The legacy single-DB routes are unchanged; the database mounted positionally is also reachable as `default`.
+
+### Model
+
+One `ndb serve` process owns a **registry** of named databases. A name is the HTTP identity, a canonical filesystem path is the uniqueness key: the same database never answers under two names, and two names never share one journal. Names are non-empty ASCII `[a-zA-Z0-9._-]`, never `.`/`..`.
+
+### CLI
+
+```
+ndb serve <path>                       # legacy: one DB, mounted as "default"
+ndb serve --db <name>=<path> ...       # mount arbitrary paths by name (repeatable)
+ndb serve --dir <root>                 # mount every child folder holding data.jsonl or meta.json;
+                                       # also enables POST /v2/dbs creation under <root>
+ndb serve --config <file.json>         # service config; explicit CLI flags win
+```
+
+Flags: `--bind`, `--port`, `--token`, `--persistence immediate|scheduled|lazy` (default `immediate`), `--scheduled-ms <n>` (default 5000), `--max-limit <n>` (default 50000), `--default-limit <n>` (default 1000), `--text-index <field>` (repeatable, applied to every mounted DB at boot), `--threads <n>`.
+
+Startup aborts loudly when: no source was given; a configured/discovered DB fails to open; a name or a canonical path is duplicated (including `./`, `../`, folder-vs-journal aliases); a discovered folder name is not a valid DB name; `--dir` does not exist.
+
+A path names a database **folder** unless it exists or ends in `.jsonl`; the journal is then `<folder>/data.jsonl`.
+
+### Config file
+
+`#[serde(deny_unknown_fields)]`:
+
+```json
+{
+  "bind": "0.0.0.0", "port": 8323, "token": "secret",
+  "persistence": "immediate", "scheduled_ms": 5000,
+  "dir": "dbs", "max_limit": 50000, "default_limit": 1000,
+  "dbs": {
+    "notes": "stores/notes.jsonl",
+    "media": { "path": "stores/media", "persistence": "scheduled", "scheduled_ms": 500 }
+  }
+}
+```
+
+### HTTP
+
+Auth: the configured bearer token is required on **every** route.
+
+- `GET /health` → `{ ok, engine, version, dbs: [sorted names], allow_create }`.
+- `GET /v2/dbs` → `{ ok, dbs: [{ name, documents, source_epoch_uuid, last_seq, min_available_seq }] }`. Filesystem paths are never exposed.
+- `POST /v2/dbs` → `{ name, persistence? }` only (a `path` field is a 400: the root is operator configuration). `201` created, `409` exists, `400` invalid name, `403 create_disabled` when `--dir` was not given.
+- Per database, under `/v2/dbs/{name}` (`404 database_not_found` when unknown):
+  - `GET  /stats`, `GET /lineage`
+  - `GET  /doc/{id}` (`?fields=a,b`), `PUT /doc` (`?prefix=p`), `PUT /doc/{id}`, `PATCH /doc/{id}`, `DELETE /doc/{id}`, `POST /doc/{id}/restore`
+  - `POST /docs/mget` (`{ids, fields?}` → `{docs: {id: doc}, missing: [id]}`; ids deduplicated, at most 1000 per call — more is `413 payload_too_large`)
+  - `POST /query` (`filter? sort? offset? limit? fields? text?`; `limit` ≤ `max_limit`, default `default_limit`; `took_ms`)
+  - `POST /find`, `POST /facets`, `POST /search` (+ `took_ms`)
+  - `POST /index` (`hash|btree|text`, idempotent → `created: bool`)
+  - `POST /compact` (synchronous → `lineage`), `POST /flush`
+  - `GET  /changes?since=&limit=` → `{ok, source_epoch_uuid, from_seq, to_seq, last_seq, has_more, changes}`; each change is `{seq, id, kind: "upsert"|"delete", doc?}`. `409 cursor_expired` / `409 cursor_ahead`; `400` without a valid `since` or with `limit=0`.
+  - `GET  /snapshot?offset=&limit=&snapshot_id=` → `{ok, source_epoch_uuid, watermark_seq, snapshot_id, total, count, docs}` (docs sorted by id). A paginated call pins the frozen snapshot (300 s TTL) and returns `snapshot_id`; pass it back with a new `offset` to page the *same* state instead of drifting under concurrent writes. An unknown/expired/foreign id is `410 snapshot_expired`.
+  - `PUT  /files/{bucket}` (raw body; filename from `X-Filename` or `?filename=`, single component, extension after lowercasing must be 0–10 of `a-z0-9`, otherwise `400`; stored under the full SHA-256), `GET /files/{bucket}`, `GET /files/{bucket}/{hash.ext}`, `DELETE /files/{bucket}/{hash.ext}` (`release_file`; `409 file_referenced` while a live **or restorable** document references it; `?force=true` deletes anyway), `POST /files/gc`.
+
+`PATCH` is transactional: every op object is validated before anything runs (`400` on a malformed op, zero ops applied), then the batch commits as one journal record. A path that does not resolve aborts the whole batch (`400 invalid_argument`). `PATCH` and `PUT /doc/{id}` accept `?if_seq=<seq>` or `If-Match: <seq>` (`409 conflict` with `current_seq` + `doc` on a stale token); `PUT`, `PATCH`, `DELETE` and `restore` responses carry `seq`.
+
+Error bodies under `/v2/` are `{ ok: false, error: <code>, message }`; `error` names the failure (`not_found`, `invalid_argument`, `cursor_expired`, `cursor_ahead`, `database_not_found`, `create_disabled`, ...).
+
+Integration handle: `server::serve_multi_in_background(Arc<DbRegistry>, ServerConfig)` → `ServeHandle { addr, shutdown() }`.
+

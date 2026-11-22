@@ -5,6 +5,7 @@
 
 use crate::error::{Error, Result};
 use crate::report;
+use crate::storage::sync_parent_dir;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -15,9 +16,10 @@ use std::path::{Path, PathBuf};
 pub struct FileRef {
     /// Bucket name (folder).
     pub bucket: String,
-    /// Content hash (first 8 chars of SHA-256).
+    /// Content hash (full 64-char SHA-256; legacy databases hold 8-char ids,
+    /// which stay readable because the id is used verbatim as a filename).
     pub id: String,
-    /// File extension (preserved from original).
+    /// File extension (preserved from original, lowercased).
     pub ext: String,
 }
 
@@ -63,6 +65,43 @@ pub struct FileMeta {
     pub created: u64,
 }
 
+/// MIME type for a file extension. Unknown extensions are deliberately
+/// `application/octet-stream` — a wrong guess would corrupt a download.
+pub fn mime_for_extension(ext: &str) -> &'static str {
+    match ext.to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "avif" => "image/avif",
+        "json" => "application/json",
+        "txt" | "md" => "text/plain; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "html" => "text/html; charset=utf-8",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "flac" => "audio/flac",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "mov" => "video/quicktime",
+        _ => "application/octet-stream",
+    }
+}
+
+/// MIME type derived from a filename's extension (empty extension → octet-stream).
+pub fn mime_for_filename(filename: &str) -> &'static str {
+    Path::new(filename)
+        .extension()
+        .map(|e| mime_for_extension(&e.to_string_lossy()))
+        .unwrap_or("application/octet-stream")
+}
+
 /// A file bucket for storing binary data.
 pub struct FileBucket {
     /// Bucket name.
@@ -103,25 +142,31 @@ impl FileBucket {
         hex_encode(&hash)
     }
 
-    /// Store a file. Returns FileMeta with hash reference.
-    /// If file already exists (same hash), just returns the reference (dedup).
+    /// Store a file. Returns FileMeta keyed by the full SHA-256 of the content.
+    ///
+    /// A dedup hit is verified against the incoming bytes: a truncated or
+    /// colliding file under that name would otherwise be handed to a caller as
+    /// if it were the content they just uploaded (H4).
     pub fn store(&self, name: &str, data: &[u8], mime_type: &str) -> Result<FileMeta> {
         let dir = self.dir();
         fs::create_dir_all(&dir).map_err(Error::io_err(&dir, "create bucket directory"))?;
 
-        let full_hash = Self::sha256(data);
-        let hash_id = &full_hash[..8];
-        let ext = Path::new(name)
-            .extension()
-            .map(|e| e.to_string_lossy().to_string())
-            .unwrap_or_default();
-
+        let ext = normalize_extension(name)?;
+        let hash_id = Self::sha256(data);
         let file_path = dir.join(format!("{}.{}", hash_id, ext));
 
-        // Only write if file doesn't exist (dedup)
-        if !file_path.exists() {
-            // Write atomically: temp file then rename
-            let tmp_path = file_path.with_extension("tmp");
+        if file_path.exists() {
+            verify_stored_file(&file_path, &hash_id, data.len())?;
+        } else {
+            // Write atomically: temp file then rename. The temp name carries a
+            // random suffix so two concurrent stores of the same content
+            // cannot interleave into one file.
+            let tmp_path = dir.join(format!(
+                "{}.{}.{}.tmp",
+                hash_id,
+                std::process::id(),
+                fastrand::u64(..)
+            ));
             let mut file =
                 fs::File::create(&tmp_path).map_err(Error::io_err(&tmp_path, "create temp file"))?;
             file.write_all(data)
@@ -130,8 +175,10 @@ impl FileBucket {
                 .map_err(Error::io_err(&tmp_path, "flush file data"))?;
             file.sync_all()
                 .map_err(Error::io_err(&tmp_path, "fsync file data"))?;
+            drop(file);
             fs::rename(&tmp_path, &file_path)
                 .map_err(Error::io_err(&file_path, "atomic rename file"))?;
+            sync_parent_dir(&file_path)?;
         }
 
         let now = std::time::SystemTime::now()
@@ -142,8 +189,8 @@ impl FileBucket {
         Ok(FileMeta {
             _file: FileRef {
                 bucket: self.name.clone(),
-                id: hash_id.to_string(),
-                ext: ext.clone(),
+                id: hash_id,
+                ext,
             },
             name: name.to_string(),
             size: data.len(),
@@ -182,6 +229,8 @@ impl FileBucket {
 
         let dst = trash_dir.join(file_ref.filename());
         fs::rename(&src, &dst).map_err(Error::io_err(&src, "move file to trash"))?;
+        sync_parent_dir(&dst)?;
+        sync_parent_dir(&src)?;
 
         Ok(())
     }
@@ -220,6 +269,8 @@ impl FileBucket {
         }
 
         fs::rename(&src, &dst).map_err(Error::io_err(&src, "restore file from trash"))?;
+        sync_parent_dir(&dst)?;
+        sync_parent_dir(&src)?;
         Ok(())
     }
 
@@ -460,6 +511,50 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// The only extensions a bucket file may carry: empty, or 1–10 ASCII
+/// lowercase letters/digits. The extension becomes part of a filename and of
+/// the MIME lookup, so anything else is refused rather than sanitized.
+fn normalize_extension(name: &str) -> Result<String> {
+    let ext = Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext.len() > 10 || !ext.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
+        return Err(Error::invalid_arg(format!(
+            "invalid file extension '{ext}' in '{name}' (allowed: at most 10 of a-z 0-9)"
+        )));
+    }
+    Ok(ext)
+}
+
+/// A dedup hit must be the file it claims to be. A truncated or colliding
+/// file is reported, never returned as if it were the caller's upload.
+fn verify_stored_file(path: &Path, expected_hash: &str, expected_len: usize) -> Result<()> {
+    let meta = fs::metadata(path).map_err(Error::io_err(path, "stat stored bucket file"))?;
+    if meta.len() != expected_len as u64 {
+        return Err(Error::corruption(
+            path,
+            format!(
+                "stored file is {} byte(s), the resubmitted content is {} byte(s); \
+                 the file is damaged — delete it and store the content again",
+                meta.len(),
+                expected_len
+            ),
+        ));
+    }
+    let actual = sha256_file_hex(path)?;
+    if actual != expected_hash {
+        return Err(Error::corruption(
+            path,
+            format!(
+                "stored file hashes to {actual}, expected {expected_hash}; \
+                 the file is damaged — delete it and store the content again"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +593,37 @@ mod tests {
 
         assert_eq!(ref1._file.id, ref2._file.id);
         assert_eq!(bucket.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn store_uses_the_full_sha256_as_id_and_filename() {
+        let (bucket, _) = test_bucket("files");
+        let meta = bucket.store("a.TXT", b"content", "text/plain").unwrap();
+        assert_eq!(meta._file.id.len(), 64);
+        assert_eq!(meta._file.ext, "txt", "extensions are lowercased");
+        assert_eq!(bucket.list().unwrap(), vec![format!("{}.txt", meta._file.id)]);
+    }
+
+    #[test]
+    fn store_refuses_an_unusable_extension() {
+        let (bucket, _) = test_bucket("files");
+        let err = bucket.store("payload.tar.gz.bak!", b"x", "text/plain").unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
+
+        // README-style names (no extension) stay valid.
+        let meta = bucket.store("README", b"x", "text/plain").unwrap();
+        assert_eq!(meta._file.ext, "");
+    }
+
+    #[test]
+    fn a_damaged_file_is_detected_instead_of_deduplicated() {
+        let (bucket, dir) = test_bucket("files");
+        let meta = bucket.store("keep.txt", b"the payload", "text/plain").unwrap();
+        let stored = dir.path().join("_files").join("files").join(meta._file.filename());
+        fs::write(&stored, b"the pay").unwrap();
+
+        let err = bucket.store("keep.txt", b"the payload", "text/plain").unwrap_err();
+        assert!(matches!(err, Error::Corruption { .. }), "{err:?}");
     }
 
     #[test]

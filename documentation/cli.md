@@ -32,6 +32,7 @@ Commands:
 | `import <src> <path> [--force]` | Restore a snapshot |
 | `merge <base> <merge-in> --output <dest>` | Combine two databases (resolves `_modified` collisions) |
 | `verify <path>` | Check for corruptions, missing file references, and item-bucket integrity |
+| `repair <path>` | Quarantine a corrupt journal (`<file>.corrupt.<ts>.bak`) and truncate it at the last good line |
 | `recover <src> --output <dest>` | Salvage surviving rows from a corrupted database |
 | `dump <path>` | Print all documents as JSON Lines to stdout |
 | `config <get\|set> <key> [value]` | Read/write `meta.json` keys (dot notation) |
@@ -48,7 +49,7 @@ ndb serve <path/to/data.jsonl> [--bind 127.0.0.1|0.0.0.0] [--port 8323] [--token
 ```
 
 - `--text-index <field>`: boot a full-text index on the field (cache-aware: `base_dir/_index_<field>.fti` is journal-size-stamped; unchanged journal = instant boot).
-- `--threads <n>`: threads for index (re)builds. `0` (default) = all logical cores.
+- `--threads <n>`: worker threads — the HTTP connection pool size and the index (re)build thread count. `0` (default) = all logical cores (pool floor: 4). The pool pulls from a bounded queue (`--max-connections` deep); a full queue answers `503`.
 
 - The file must already exist (`ndb init` first) — serve fails fast on a missing path.
 - `--token <secret>`: clients must send `Authorization: Bearer <secret>`. Required for LAN binds; 401 otherwise.
@@ -143,7 +144,8 @@ constraint (zero overhead). `$in` on array fields matches elements
 
 ## Notes
 
-- **`destroy` checks for a `.lock` marker** and refuses if present (`EXIT_LOCKED`). The library does not create `.lock`/`.readonly` markers, so these checks are effectively advisory for CLI-created databases.
+- **`destroy` checks for a `.lock` marker** and refuses if present (`EXIT_LOCKED`). The library now creates a real OS lock file (`.lock` beside a folder database's `data.jsonl`, `<file>.lock` for a flat journal) while a `Database` is open; `ndb` maintenance commands open the database, so run them against a database no service has mounted.
+- **`repair`** is the recovery path for the corruption `Database::open` refuses: it copies the journal to `<file>.corrupt.<timestamp>.bak`, truncates at the last complete record, fsyncs, and prints the preserved record count plus the lost byte/line range. A torn *final* line never needs it — opening truncates that automatically with a warning.
 - **`config`** operates on `meta.json` in the *current directory* — run it inside the database folder.
 - **`merge`** resolves ID collisions by comparing a `_modified` field on each document; documents without it default to `0`.
 - **`verify`** checks for `_file` object references inside documents (the `{bucket, id, ext}` form) against the `_files/` tree, and validates JSON on every journal line. For buckets declared `kind: "items"` in `meta.json` it additionally verifies each live item's original against its committed `size`/`sha256`, that reserved items have their folder, and flags orphan folders.

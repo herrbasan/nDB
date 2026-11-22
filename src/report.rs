@@ -24,3 +24,12 @@ pub fn suppressed(op: &str, detail: impl std::fmt::Display) {
 pub fn detached(op: &str, detail: impl std::fmt::Display) {
     eprintln!("ndb: detached failure: {op}: {detail}");
 }
+
+/// A state the engine absorbed deliberately and must be visible afterwards.
+///
+/// A torn journal tail is the case this exists for: truncating it is the
+/// correct recovery, but a recovery the operator never hears about is
+/// indistinguishable from silent data loss on the next inspection.
+pub fn warning(op: &str, detail: impl std::fmt::Display) {
+    eprintln!("ndb: warning: {op}: {detail}");
+}

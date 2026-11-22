@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use tempfile::TempDir;
 
-fn start_server(token: Option<String>) -> (u16, Database, TempDir) {
+fn start_server(token: Option<String>) -> (u16, TempDir) {
     let dir = TempDir::new().unwrap();
     let db = Database::open(dir.path().join("serve.jsonl")).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -20,9 +20,9 @@ fn start_server(token: Option<String>) -> (u16, Database, TempDir) {
     std::thread::spawn(move || {
         serve_listener(listener, db, cfg).unwrap();
     });
-    (port, Database::open(dir.path().join("serve.jsonl")).unwrap(), dir)
-    // NOTE: second open is a separate handle; tests that assert persisted state
-    // use it read-only after writes go through the server.
+    (port, dir)
+    // NOTE: the daemon owns the Database (and its exclusive writer lock), so
+    // tests observe state through HTTP, never a second handle on the journal.
 }
 
 /// Minimal HTTP/1.1 client: one request per connection.
@@ -56,7 +56,7 @@ fn request(port: u16, method: &str, path: &str, body: Option<&Value>, token: Opt
 
 #[test]
 fn token_required_when_configured() {
-    let (port, _db, _dir) = start_server(Some("secret123".to_string()));
+    let (port, _dir) = start_server(Some("secret123".to_string()));
 
     let (status, _) = request(port, "GET", "/stats", None, None);
     assert_eq!(status, 401, "no token must be rejected");
@@ -71,7 +71,7 @@ fn token_required_when_configured() {
 
 #[test]
 fn no_token_needed_when_unset() {
-    let (port, _db, _dir) = start_server(None);
+    let (port, _dir) = start_server(None);
     let (status, _) = request(port, "GET", "/stats", None, None);
     assert_eq!(status, 200);
 }
@@ -80,7 +80,7 @@ fn no_token_needed_when_unset() {
 
 #[test]
 fn insert_get_delete_roundtrip() {
-    let (port, _db, _dir) = start_server(None);
+    let (port, _dir) = start_server(None);
 
     let (status, body) = request(port, "PUT", "/doc", Some(&json!({"name": "alice", "age": 30})), None);
     assert_eq!(status, 201, "insert: {}", body);
@@ -110,7 +110,7 @@ fn insert_get_delete_roundtrip() {
 
 #[test]
 fn patch_delta_ops() {
-    let (port, _db, _dir) = start_server(None);
+    let (port, _dir) = start_server(None);
     let (_, body) = request(port, "PUT", "/doc", Some(&json!({"status": "pending", "tags": ["a"]})), None);
     let id = body["id"].as_str().unwrap().to_string();
 
@@ -132,7 +132,8 @@ fn patch_delta_ops() {
     assert_eq!(body["doc"]["tags"], json!(["a", "b"]));
     assert!(body["doc"].get("status").is_none());
 
-    // Unresolvable path surfaces as applied=false — silent no-ops are visible.
+    // An unresolvable path aborts the whole batch: applied is all-or-nothing,
+    // never "ops 1-2 landed and op 3 quietly did not".
     let (status, body) = request(
         port,
         "PATCH",
@@ -140,8 +141,9 @@ fn patch_delta_ops() {
         Some(&json!({"ops": [{"op": "set", "path": "no.such.path.here", "value": 1}]})),
         None,
     );
-    assert_eq!(status, 200);
-    assert_eq!(body["applied"], json!([false]), "unresolvable path must report applied=false");
+    assert_eq!(status, 400, "unresolvable path must refuse the batch: {}", body);
+    let (_, body) = request(port, "GET", &format!("/doc/{}", id), None, None);
+    assert_eq!(body["doc"]["tags"], json!(["a", "b"]), "a refused batch changes nothing");
 
     // Unknown op name: 400
     let (status, _) = request(
@@ -158,7 +160,7 @@ fn patch_delta_ops() {
 fn patch_malformed_ops_are_400_not_crash() {
     // B2 regression: the handler must reject malformed ops with 400,
     // never panic — the release profile aborts on panic, killing the daemon.
-    let (port, _db, _dir) = start_server(None);
+    let (port, _dir) = start_server(None);
     let (_, body) = request(port, "PUT", "/doc", Some(&json!({"status": "pending"})), None);
     let id = body["id"].as_str().unwrap().to_string();
 
@@ -191,7 +193,7 @@ fn patch_malformed_ops_are_400_not_crash() {
 fn patch_same_value_set_is_applied() {
     // D1: applied comes from the path walker, not a before/after diff.
     // Assigning the identical value is an applied write, not a no-op.
-    let (port, _db, _dir) = start_server(None);
+    let (port, _dir) = start_server(None);
     let (_, body) = request(port, "PUT", "/doc", Some(&json!({"n": 1})), None);
     let id = body["id"].as_str().unwrap().to_string();
 
@@ -205,15 +207,16 @@ fn patch_same_value_set_is_applied() {
         ]})),
         None,
     );
-    assert_eq!(status, 200, "patch: {}", body);
-    assert_eq!(body["applied"], json!([true, false]), "same-value set is applied; unresolvable path is not");
+    assert_eq!(status, 400, "one unresolvable op refuses the batch: {}", body);
+    let (_, body) = request(port, "GET", &format!("/doc/{}", id), None, None);
+    assert_eq!(body["doc"]["n"], json!(1), "the same-value op 1 was rolled back too");
 }
 
 // ─── Query ──────────────────────────────────────────────────────────
 
 #[test]
 fn query_with_projection_sort_limit() {
-    let (port, _db, _dir) = start_server(None);
+    let (port, _dir) = start_server(None);
     for (name, score) in [("a", 3), ("b", 10), ("c", 1)] {
         request(port, "PUT", "/doc", Some(&json!({"name": name, "score": score, "meta": {"views": score * 2}})), None);
     }
@@ -252,7 +255,7 @@ fn query_with_projection_sort_limit() {
 
 #[test]
 fn query_rejects_unknown_operator() {
-    let (port, _db, _dir) = start_server(None);
+    let (port, _dir) = start_server(None);
     let (status, body) = request(
         port,
         "POST",
@@ -287,7 +290,7 @@ fn query_rejects_unknown_operator() {
 /// total = pre-pagination match count; count = page size.
 #[test]
 fn query_total_is_pre_pagination() {
-    let (port, _db, _dir) = start_server(None);
+    let (port, _dir) = start_server(None);
     for i in 0..5 {
         request(port, "PUT", "/doc", Some(&json!({"n": i, "status": "warm"})), None);
     }
@@ -311,7 +314,7 @@ fn query_total_is_pre_pagination() {
 /// $in on an array field matches elements (old-fmrip category semantics).
 #[test]
 fn query_array_in_matches_elements() {
-    let (port, _db, _dir) = start_server(None);
+    let (port, _dir) = start_server(None);
     request(port, "PUT", "/doc", Some(&json!({"categories": ["A", "B"], "n": 1})), None);
     request(port, "PUT", "/doc", Some(&json!({"categories": ["C"], "n": 2})), None);
     request(port, "PUT", "/doc", Some(&json!({"categories": ["B"], "n": 3})), None);
@@ -334,7 +337,7 @@ fn query_array_in_matches_elements() {
 /// /query with text: filter ∩ full-text candidate set, one endpoint.
 #[test]
 fn query_text_constraint_intersects_filter() {
-    let (port, _db, _dir) = start_server(None);
+    let (port, _dir) = start_server(None);
     request(port, "PUT", "/doc", Some(&json!({"title": "tortoise", "content": "The hare was tired.", "tag": "x"})), None);
     request(port, "PUT", "/doc", Some(&json!({"title": "hare", "content": "The hare was tired.", "tag": "y"})), None);
     request(port, "PUT", "/doc", Some(&json!({"title": "other", "content": "Nothing relevant.", "tag": "x"})), None);
@@ -375,7 +378,7 @@ fn query_text_constraint_intersects_filter() {
 /// /facets: array fields count per element, scalars per value, strings only.
 #[test]
 fn facets_endpoint() {
-    let (port, _db, _dir) = start_server(None);
+    let (port, _dir) = start_server(None);
     request(port, "PUT", "/doc", Some(&json!({"categories": ["A", "B"], "status": "on"})), None);
     request(port, "PUT", "/doc", Some(&json!({"categories": ["A"], "status": "off", "n": 7})), None);
     request(port, "PUT", "/doc", Some(&json!({"categories": ["A", "B"], "status": "on"})), None);
@@ -400,7 +403,7 @@ fn facets_endpoint() {
 
 #[test]
 fn find_endpoint() {
-    let (port, _db, _dir) = start_server(None);
+    let (port, _dir) = start_server(None);
     request(port, "PUT", "/doc", Some(&json!({"status": "active", "n": 5})), None);
     request(port, "PUT", "/doc", Some(&json!({"status": "active", "n": 9})), None);
 
@@ -417,7 +420,7 @@ fn find_endpoint() {
 
 #[test]
 fn index_and_compact_accepted() {
-    let (port, _db, _dir) = start_server(None);
+    let (port, _dir) = start_server(None);
     request(port, "PUT", "/doc", Some(&json!({"status": "x"})), None);
 
     let (status, body) = request(port, "POST", "/index", Some(&json!({"field": "status", "type": "hash"})), None);
@@ -430,7 +433,7 @@ fn index_and_compact_accepted() {
 /// Full-text search over HTTP: text index creation + /search AND query.
 #[test]
 fn full_text_search_route() {
-    let (port, _db, _dir) = start_server(None);
+    let (port, _dir) = start_server(None);
     request(port, "PUT", "/doc", Some(&json!({"title": "tortoise", "content": "The hare was tired. At the end of the race, Paul laughed."})), None);
     request(port, "PUT", "/doc", Some(&json!({"title": "other", "content": "Nothing relevant here."})), None);
 
@@ -482,7 +485,7 @@ fn full_text_search_route() {
 
 #[test]
 fn unknown_route_404() {
-    let (port, _db, _dir) = start_server(None);
+    let (port, _dir) = start_server(None);
     let (status, body) = request(port, "GET", "/nope", None, None);
     assert_eq!(status, 404);
     assert!(body["error"].is_string());
@@ -490,7 +493,7 @@ fn unknown_route_404() {
 
 #[test]
 fn invalid_json_body_400() {
-    let (port, _db, _dir) = start_server(None);
+    let (port, _dir) = start_server(None);
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     let payload = "{not json";
     let req = format!(
@@ -508,7 +511,7 @@ fn invalid_json_body_400() {
 /// Concurrent readers while writing — the RwLock model over HTTP.
 #[test]
 fn concurrent_readers_during_writes() {
-    let (port, _db, _dir) = start_server(None);
+    let (port, _dir) = start_server(None);
     for i in 0..20 {
         request(port, "PUT", "/doc", Some(&json!({"i": i, "status": "warm"})), None);
     }

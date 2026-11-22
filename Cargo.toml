@@ -13,6 +13,10 @@ repository = "https://github.com/herrbasan/nDB"
 keywords = ["document", "database", "json", "embedded"]
 categories = ["database", "data-structures"]
 rust-version = "1.75"
+# Bench files are split in two kinds: one Criterion harness, and standalone
+# probes that are examples. Auto-discovery would claim every file under
+# `benches/` as a bench, putting the probes in two targets at once.
+autobenches = false
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -32,6 +36,11 @@ panic = "abort"
 
 [profile.bench]
 debug = true
+
+[[bench]]
+name = "bench_insert"
+path = "benches/bench_insert.rs"
+harness = false
 
 [[example]]
 name = "search_perf"

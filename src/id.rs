@@ -49,6 +49,36 @@ pub fn generate_unique_with_prefix(prefix: &str, existing: &HashSet<String>) -> 
     panic!("ndb: failed to generate unique prefixed ID after 10 attempts");
 }
 
+/// Generate a unique ID with an O(1) caller-supplied check.
+///
+/// The caller answers "is this id taken?" from its own store — no key set is
+/// enumerated, so this stays O(1) regardless of database size.
+pub fn generate_checked<F>(is_taken: F) -> String
+where
+    F: Fn(&str) -> bool,
+{
+    generate_checked_with_prefix("", is_taken)
+}
+
+/// Prefixed form of [`generate_checked`] (`prefix` empty = plain NanoID).
+pub fn generate_checked_with_prefix<F>(prefix: &str, is_taken: F) -> String
+where
+    F: Fn(&str) -> bool,
+{
+    for _ in 0..10 {
+        let id = if prefix.is_empty() {
+            generate()
+        } else {
+            generate_with_prefix(prefix)
+        };
+        if !is_taken(&id) {
+            return id;
+        }
+    }
+    // After 10 collisions something is deeply wrong
+    panic!("ndb: failed to generate unique ID after 10 attempts");
+}
+
 /// Validate that a string is a valid ndb ID.
 /// Must be non-empty, only base62 chars (and optionally one underscore separator for prefixed IDs).
 pub fn is_valid_id(id: &str) -> bool {

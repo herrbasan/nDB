@@ -231,6 +231,53 @@ Soft delete (tombstone). The document is removed from the in-memory store and a 
 db.delete(&id)?;
 ```
 
+### `apply_ops(id, ops, if_seq) -> Result<ApplyOpsResult>`
+
+Apply a batch of path operations as **one atomic journal commit** — the
+transaction boundary behind `PATCH`.
+
+```rust
+use ndb::PatchOp;
+
+let result = db.apply_ops(
+    &id,
+    &[
+        PatchOp::Set { path: "status".into(), value: json!("done") },
+        PatchOp::ArrayPush { path: "tags".into(), value: json!("b") },
+        PatchOp::Remove { path: "draft".into() },
+    ],
+    Some(current_seq), // optimistic concurrency; None = no check
+)?;
+// ApplyOpsResult { applied: vec![true; 3], seq, doc }
+```
+
+- All ops are staged on one copy under the writer lock; the full
+  post-mutation document is journaled once (carrying `_seq`), then the store,
+  indexes and file-ref counters are updated once.
+- **All-or-nothing.** A malformed batch is rejected before this call (HTTP
+  `400`); an op whose path does not resolve (missing intermediate,
+  out-of-bounds index, push onto a non-array, empty path) aborts the whole
+  batch with `Error::InvalidArgument` naming the op index and **applies
+  nothing** — not to RAM, not to the journal. This is deliberately stricter
+  than `set`/`remove`/`array_push`, which report `Ok(false)` for an
+  unresolvable path.
+- `applied` is therefore always `vec![true; ops.len()]`; it exists so callers
+  see the same shape as before.
+- `if_seq: Some(n)` refuses with `Error::Conflict { current_seq, doc }` when
+  the document is not at seq `n`. The token is per-document (`doc_seq`), so a
+  concurrent edit to a *different* document never causes a false conflict.
+  HTTP maps it to `409 {"ok":false,"error":"conflict","current_seq":…,"doc":…}`.
+
+### `doc_seq(id) -> Option<u64>`
+
+The document's current commit seq — the value to send as `If-Match` /
+`?if_seq=`.
+
+### `update_if(id, doc, if_seq) -> Result<()>`
+
+`update` with the same optimistic-concurrency check. Check and commit happen
+under one writer lock.
+
 ### `iter() -> Vec<Value>`
 
 Return all active (non-deleted) documents. Thread-safe (returns cloned values).
@@ -259,9 +306,10 @@ Check if a document exists (and is not deleted).
 
 ### `find(field: &str, value: &Value) -> Vec<Value>`
 
-Find all documents where `field` equals `value`.
+Find all documents where `field` equals `value` (whole-value equality).
 
-- Uses hash index if available (O(1) per match)
+- Uses a hash or BTree index if one exists on the field; the index only narrows
+  candidates, every candidate is re-checked with the scan's equality
 - Falls back to linear scan otherwise
 
 ```rust
@@ -281,8 +329,9 @@ let seniors = db.find_where("age", |v| v.as_u64().unwrap_or(0) >= 65);
 
 Find documents where `min <= field_value <= max` (inclusive).
 
-- Uses BTree index if available for O(log n) range scan
-- Falls back to linear scan
+- Uses the BTree index for an O(log n) `BTreeMap::range` scan when one exists
+- Falls back to linear scan otherwise
+- Same result set either way: the BTree key order is the `value_cmp` order
 
 ```rust
 let mid_range = db.find_range("score", &json!(50), &json!(100));
@@ -354,6 +403,11 @@ let ids = db.text_search("content", &TextSearch::and(vec![
 Execute a JSON AST query. The AST is a plain JSON object representing filter conditions.
 
 The AST is **validated before execution** (G4): an unknown operator, malformed combinator, or non-object root returns `Err(InvalidArgument)` — on every path (library, napi, HTTP), never a silent full-DB scan. `validate_query_ast` is the same check, exposed for pre-flight validation.
+
+Indexable conjuncts are planned first (see **Query planner** under *Index
+Management*): the scan is narrowed to index candidates and each candidate is
+re-evaluated with the full AST. Unindexed queries scan the whole store. The
+result set is identical either way; only the cost differs.
 
 ```rust
 let results = db.query(json!({
@@ -474,27 +528,52 @@ db.query(json!({"$and": [{"a": 1}, {"b": 2}]}));
 
 ## Index Management
 
+Indexes are opt-in, maintained on every write path (insert / update / delete /
+`apply_ops` / `set` / `remove` / `array_push` / `restore`), and they **never
+change a query's result set** — they only narrow candidate ids that
+`query_matches` then re-checks. `tests/phase15_perf_and_planner_tests.rs` is
+the oracle: 28 query shapes must return identical documents on an unindexed and
+a fully indexed database.
+
 ### `create_index(field: &str) -> Result<()>`
 
-Create a hash index on a field. Scans all existing documents once. O(1) equality lookups.
+Create a hash index on a field. Scans all existing documents once. O(1)
+equality lookups.
 
 ```rust
 db.create_index("email")?;
-// Now find("email", ...) uses the index
+// Now find("email", ...) and query({"email": ...}) use the index
 ```
 
 ### `create_btree_index(field: &str) -> Result<()>`
 
-Create a BTree index on a field. Enables O(log n) range queries.
+Create a BTree index on a field. Enables O(log n) equality **and** range scans
+(`$gt` `$gte` `$lt` `$lte`, and `find_range`). A field may carry a hash index
+and a BTree index at the same time; the planner picks by operator.
 
 ```rust
 db.create_btree_index("score")?;
-// Now find_range("score", min, max) uses the index
+// Now find_range("score", min, max) and query({"score": {"$gte": 5}}) use it
 ```
+
+### Index semantics
+
+- **Paths:** the indexed path is resolved with the same dot-notation engine as
+  reads, so `meta.score` is indexable (and `messages.0.role` resolves too).
+- **Order:** BTree keys are a typed `OrderedValue` (`Null < Bool < Number <
+  String < array/object`), and `value_cmp` uses that same total order. Numbers
+  always sort numerically — `9 < 10`, `-5 < 2` — never as decimal text.
+- **Arrays:** an array field contributes its whole value *and* each element to
+  the index, matching how `$in`/`$eq` read array fields. `$eq` with a scalar
+  against an array field therefore yields candidates that `query_matches`
+  filters away — a superset, never a miss.
+- **`find(field, value)`** reports whole-value equality (the same predicate the
+  linear scan uses), so it stays exact even with element keys present.
 
 ### `drop_index(field: &str) -> Result<()>`
 
-Drop an index, freeing memory. Returns `Error::IndexError` if no index exists.
+Drop every index on a field (hash and BTree), freeing memory. Returns
+`Error::IndexError` if no index exists.
 
 ```rust
 db.drop_index("email")?;
@@ -502,7 +581,30 @@ db.drop_index("email")?;
 
 ### `has_index(field: &str) -> bool`
 
-Check if an index exists for a field.
+Check if any index (hash or BTree) exists for a field.
+
+### Query planner
+
+`query`, `query_with` and `query_projected` plan before they scan:
+
+1. Collect indexable conjuncts from the top level and from `$and` (including
+   nested `$and`). `$or` / `$not` regions are scanned — a child of `$or` is not
+   a necessary condition.
+2. Map them to index operations: implicit `$eq` / `$eq` → hash-or-BTree lookup,
+   `$in` → union of lookups, `$gt`/`$gte`/`$lt`/`$lte` → a single merged BTree
+   interval per field. `$ne`, `$nin`, `$exists` are not indexable.
+3. Intersect the candidate sets smallest-first, short-circuiting to empty.
+4. Run `query_matches` on the candidates only.
+
+Without an indexable conjunct the query falls back to a full scan. `$and`
+siblings of a field key are ignored exactly as `query_matches` ignores them.
+
+### Memory model
+
+Documents live in the store as `Arc<Value>`, shared with the change log: a
+write materializes one document (plus its journal line), and reads clone only
+what they return. `snapshot_at`, `query_projected`, `get`, `find` and the
+change feed each copy only the values they hand out.
 
 ---
 
@@ -648,12 +750,13 @@ All operations return `ndb::Result<T>` which is `std::result::Result<T, ndb::Err
 | `NotFound` | Document not found | `get("nonexistent")` |
 | `InvalidArgument` | Bad input | Restore in in-memory db |
 | `Serialization` | JSON parse/serialize errors | Invalid JSON |
-| `DatabaseLocked` | Concurrent access conflict | Already locked |
+| `DatabaseLocked` | Another process/handle owns the database's exclusive writer lock | Second `Database::open` on a mounted journal |
 | `IndexError` | Index operation failed | Drop nonexistent index |
 | `BucketError` | File bucket error | File not in bucket |
 | `PolicyViolation` | `meta.json` bucket policy forbids it | Deleting a doc whose files are `restrict` |
 | `CursorExpired` | Sync cursor predates the oldest replayable seq | `changes_since` across a compaction |
 | `CursorAhead` | Sync cursor is past the last committed seq | `changes_since(last_seq + 1)` |
+| `Conflict` | `if_seq` / `If-Match` did not match the document's current seq | A concurrent edit landed first; carries `current_seq` + `doc` |
 
 ```rust
 match db.get(&id) {
@@ -672,7 +775,8 @@ match db.get(&id) {
 ```rust
 pub enum Persistence {
     Lazy,                        // Default. Flush on explicit call.
-    Scheduled(Duration),         // Flush every N seconds.
+    Scheduled(Duration),         // Background flusher fsyncs the journal every
+                                 // interval if anything was written.
     Immediate,                   // fsync after every write.
 }
 ```
