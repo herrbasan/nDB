@@ -32,7 +32,6 @@ pub mod id;
 pub mod item;
 pub mod mmap;
 pub mod report;
-pub mod search;
 pub mod server;
 pub mod storage;
 pub mod v2_format;
@@ -46,7 +45,6 @@ pub use crc32::{crc32, Crc32Hasher};
 pub use error::{Error, Result};
 pub use item::{ItemBucket, ItemRecord, ItemState};
 pub use mmap::MmapFile;
-pub use search::{TextMode, TextQuery, TextSearch};
 pub use storage::{ChangeBatch, ChangeEvent, ChangeKind, Snapshot, SourceLineage};
 pub use v2_format::{
     base_file_name, base_file_path, fsck_v2_dir, manifest_path, read_manifest, repair_wal_file,
@@ -1417,8 +1415,7 @@ pub struct Database {
     hash_indexes: RwLock<HashMap<String, HashIndex>>,
     /// BTree indexes (opt-in, O(log n) equality + exact range scans). A field
     /// may carry both kinds; the planner prefers whichever fits the operator.
-    btree_indexes: RwLock<HashMap<String, BTreeIndex>>,    /// Full-text indexes (opt-in): field → inverted index.
-    text_indexes: RwLock<HashMap<String, search::TextIndex>>,
+    btree_indexes: RwLock<HashMap<String, BTreeIndex>>,
     /// Single-writer mutex. Arc-shared with the TTL thread so its
     /// reserved-item sweep serializes against writers exactly like the
     /// public item API does (G3).
@@ -1601,7 +1598,6 @@ impl Database {
             file_refs: RwLock::new((*file_refs.read()).clone()),
             hash_indexes: RwLock::new(HashMap::new()),
             btree_indexes: RwLock::new(HashMap::new()),
-            text_indexes: RwLock::new(HashMap::new()),
             writer: Arc::new(Mutex::new(())),
             trash_lock,
             persistence,
@@ -1748,7 +1744,6 @@ impl Database {
             file_refs: RwLock::new(file_refs),
             hash_indexes: RwLock::new(HashMap::new()),
             btree_indexes: RwLock::new(HashMap::new()),
-            text_indexes: RwLock::new(HashMap::new()),
             writer: std::sync::Arc::new(Mutex::new(())),
             trash_lock: std::sync::Arc::new(Mutex::new(())),
             persistence: Persistence::Lazy,
@@ -1792,7 +1787,6 @@ impl Database {
             file_refs: RwLock::new(HashMap::new()),
             hash_indexes: RwLock::new(HashMap::new()),
             btree_indexes: RwLock::new(HashMap::new()),
-            text_indexes: RwLock::new(HashMap::new()),
             writer: std::sync::Arc::new(Mutex::new(())),
             trash_lock: std::sync::Arc::new(Mutex::new(())),
             persistence: Persistence::Lazy,
@@ -2194,9 +2188,6 @@ impl Database {
         self.deleted.write().remove(&id);
         self.docs.write().insert(id.clone(), stored);
 
-        // Full-text indexes (after the doc is in the store)
-        self.retext_doc(&id, &Value::Null);
-
         Ok(id)
     }
 
@@ -2226,9 +2217,6 @@ impl Database {
 
         self.deleted.write().remove(&id);
         self.docs.write().insert(id.clone(), stored);
-
-        // Full-text indexes (after the doc is in the store)
-        self.retext_doc(&id, &Value::Null);
 
         Ok(id)
     }
@@ -2315,132 +2303,6 @@ impl Database {
             Some(new_doc) => self.index_update_doc(id, old_doc, &new_doc),
             None => self.index_remove_doc(id, old_doc),
         }
-
-        // Full-text indexes: re-tokenize the field text.
-        self.retext_doc(id, old_doc);
-    }
-
-    /// Sync full-text indexes after an in-place mutation. Caller holds the
-    /// writer lock; `old_doc` is the pre-mutation snapshot.
-    fn retext_doc(&self, id: &str, old_doc: &Value) {
-        let mut text_indexes = self.text_indexes.write();
-        if text_indexes.is_empty() {
-            return;
-        }
-        let new_doc = self.docs.read().get(id).map(std::sync::Arc::clone);
-        for (field, tindex) in text_indexes.iter_mut() {
-            if old_doc.get(field).is_some()
-                || new_doc.as_ref().map(|d| d.get(field).is_some()).unwrap_or(false)
-            {
-                match &new_doc {
-                    Some(doc) => {
-                        tindex.index_doc(id, doc);
-                    }
-                    None => tindex.remove_doc(id),
-                }
-            }
-        }
-    }
-
-    /// Create a full-text index on a text field (opt-in, like hash/btree
-    /// indexes). Boot path: load the disk cache if the journal is unchanged;
-    /// otherwise build in parallel across all logical cores and cache the
-    /// result. AND/OR/phrase/prefix queries then run via `text_search`.
-    pub fn create_text_index(&self, field: &str) -> Result<()> {
-        self.create_text_index_with_threads(field, 0)
-    }
-
-    /// Same as `create_text_index` with an explicit thread count for the
-    /// (re)build. `threads = 0` means all logical cores. Ignored when the
-    /// disk cache is fresh.
-    pub fn create_text_index_with_threads(&self, field: &str, threads: usize) -> Result<()> {
-        if let Some(v2) = &self.v2 {
-            return v2.create_text_index(field, threads);
-        }
-        let _guard = self.writer.lock();
-
-        // 1. Cache path: journal unchanged → load instead of building.
-        if !self.is_in_memory() {
-            let journal_size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
-            let cache = self.base_dir.join(format!("_index_{}.fti", field));
-            if let Some(tindex) = search::TextIndex::load(&cache, journal_size, field) {
-                // Trust-but-verify: indexed-doc count must match the store's
-                // docs-with-this-field, else the stamp lied.
-                let with_field = self
-                    .docs
-                    .read()
-                    .values()
-                    .filter(|d| search::extract_text(d, field).is_some())
-                    .count();
-                if tindex.doc_count() == with_field {
-                    self.text_indexes.write().insert(field.to_string(), tindex);
-                    return Ok(());
-                }
-            }
-        }
-
-        // 2. Parallel build from (id, text) pairs.
-        let docs_text: Vec<(String, String)> = {
-            let docs = self.docs.read();
-            docs.iter()
-                .filter_map(|(id, doc)| {
-                    search::extract_text(doc, field).map(|t| (id.clone(), t))
-                })
-                .collect()
-        };
-        let mut tindex = search::TextIndex::new(field);
-        tindex.build_parallel(docs_text, threads);
-
-        // 3. Cache for the next boot.
-        if !self.is_in_memory() {
-            let journal_size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
-            let cache = self.base_dir.join(format!("_index_{}.fti", field));
-            // Cache write failure is non-fatal (read-only dir): search still works.
-            if let Err(e) = tindex.save(&cache, journal_size) {
-                report::suppressed("create_text_index: write disk cache", e);
-            }
-        }
-
-        self.text_indexes.write().insert(field.to_string(), tindex);
-        Ok(())
-    }
-
-    /// Drop a full-text index (and its disk cache, if any).
-    pub fn drop_text_index(&self, field: &str) -> Result<()> {
-        if let Some(v2) = &self.v2 {
-            return v2.drop_text_index(field);
-        }
-        let _guard = self.writer.lock();
-        self.text_indexes.write().remove(field);
-        if !self.is_in_memory() {
-            let cache = self.base_dir.join(format!("_index_{}.fti", field));
-            // The load-time doc-count check catches a stale cache either way,
-            // but failing to drop it is still said out loud.
-            if cache.exists() {
-                if let Err(e) = std::fs::remove_file(&cache) {
-                    report::suppressed("drop_text_index: remove disk cache", e);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Run a full-text search over an indexed field. Returns matching _ids
-    /// (unordered). The field must have a text index (fail loud otherwise).
-    pub fn text_search(&self, field: &str, search: &TextSearch) -> Result<Vec<String>> {
-        if let Some(v2) = &self.v2 {
-            return v2.text_search(field, search);
-        }
-        search.validate()?;
-        let text_indexes = self.text_indexes.read();
-        let tindex = text_indexes
-            .get(field)
-            .ok_or_else(|| Error::invalid_arg(format!("no text index on '{}'", field)))?;
-        let docs = self.docs.read();
-        let ids = tindex.search(search, |id| {
-            docs.get(id).and_then(|d| search::extract_text(d, field))
-        });
-        Ok(ids)
     }
 
     /// Update a document. Appends new version to file, old version superseded.
@@ -2501,9 +2363,6 @@ impl Database {
         self.docs
             .write()
             .insert(id.to_string(), std::sync::Arc::clone(&stored));
-
-        // Full-text indexes (old_doc is the pre-update snapshot)
-        self.retext_doc(id, &old_doc);
 
         // Ref-count delta and orphan cleanup, last: a file that fails to
         // move is under-cleaning — named, reported, swept by gc later.
@@ -2878,15 +2737,6 @@ impl Database {
         // Remove from indexes
         self.index_remove_doc(id, &doc_to_trash);
 
-        // Remove from full-text indexes (doc is about to leave the store;
-        // retext_doc would re-see it, so purge directly)
-        {
-            let mut text_indexes = self.text_indexes.write();
-            for (_, tindex) in text_indexes.iter_mut() {
-                tindex.remove_doc(id);
-            }
-        }
-
         // Update in-memory state
         self.docs.write().remove(id);
         self.deleted.write().insert(id.to_string());
@@ -3096,12 +2946,7 @@ impl Database {
     /// Every document matching `ast`, as shared references: matching itself
     /// copies no document, and the returned handles keep the values alive
     /// after the store lock is released.
-    fn collect_matches(
-        &self,
-        ast: &Value,
-        text_ids: Option<&HashSet<String>>,
-    ) -> Vec<std::sync::Arc<Value>> {
-        let text_ok = |id: &str| text_ids.map_or(true, |set| set.contains(id));
+    fn collect_matches(&self, ast: &Value) -> Vec<std::sync::Arc<Value>> {
         let candidates = self.plan_candidates(ast);
         let docs = self.docs.read();
 
@@ -3111,15 +2956,13 @@ impl Database {
                 ids.sort();
                 ids.into_iter()
                     .filter_map(|id| docs.get(id).map(|doc| (id, doc)))
-                    .filter(|(id, doc)| {
-                        text_ok(id) && query_matches(doc.as_ref(), ast)
-                    })
+                    .filter(|(_, doc)| query_matches(doc.as_ref(), ast))
                     .map(|(_, doc)| std::sync::Arc::clone(doc))
                     .collect()
             }
             None => docs
                 .iter()
-                .filter(|(id, doc)| text_ok(id) && query_matches(doc.as_ref(), ast))
+                .filter(|(_, doc)| query_matches(doc.as_ref(), ast))
                 .map(|(_, doc)| std::sync::Arc::clone(doc))
                 .collect(),
         }
@@ -3141,7 +2984,7 @@ impl Database {
         }
         validate_query_ast(&ast)?;
         Ok(self
-            .collect_matches(&ast, None)
+            .collect_matches(&ast)
             .into_iter()
             .map(|doc| (*doc).clone())
             .collect())
@@ -3192,22 +3035,18 @@ impl Database {
     /// Returns `(total, page)` where `total` is the pre-pagination match count.
     ///
     /// `fields: None` returns full documents (same as query_with).
-    /// `text_ids: Some(set)` additionally requires the doc id to be in the
-    /// set — the intersection of a full-text candidate set with the filter.
-    /// `None` = no text constraint (zero overhead).
     pub fn query_projected(
         &self,
         ast: Value,
         opts: QueryOptions,
         fields: Option<&[String]>,
-        text_ids: Option<&HashSet<String>>,
     ) -> Result<(usize, Vec<Value>)> {
         if let Some(v2) = &self.v2 {
-            return v2.query_projected(ast, opts, fields, text_ids);
+            return v2.query_projected(ast, opts, fields);
         }
         validate_query_ast(&ast)?;
         let sort_field = opts.sort_by.as_ref().map(|(f, _)| f.clone());
-        let matches = self.collect_matches(&ast, text_ids);
+        let matches = self.collect_matches(&ast);
 
         let mut rows: Vec<(Value, Value)> = matches
             .iter()
@@ -3254,12 +3093,11 @@ impl Database {
         &self,
         ast: Value,
         opts: QueryOptions,
-        text_ids: Option<&HashSet<String>>,
     ) -> Result<(usize, Vec<std::sync::Arc<[u8]>>)> {
         if let Some(v2) = &self.v2 {
-            return v2.query_raw(ast, opts, text_ids);
+            return v2.query_raw(ast, opts);
         }
-        let (total, docs) = self.query_projected(ast, opts, None, text_ids)?;
+        let (total, docs) = self.query_projected(ast, opts, None)?;
         let mut out = Vec::with_capacity(docs.len());
         for doc in docs {
             out.push(std::sync::Arc::from(serde_json::to_vec(&doc)?));
@@ -3381,14 +3219,6 @@ impl Database {
             return v2.has_btree_index(field);
         }
         self.btree_indexes.read().contains_key(field)
-    }
-
-    /// Check if a full-text index exists for a field.
-    pub fn has_text_index(&self, field: &str) -> bool {
-        if let Some(v2) = &self.v2 {
-            return v2.has_text_index(field);
-        }
-        self.text_indexes.read().contains_key(field)
     }
 
     // ─── Compaction & Trash ────────────────────────────────────────

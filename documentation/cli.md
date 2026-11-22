@@ -1,6 +1,6 @@
 # nDB CLI Reference
 
-> The `ndb` command-line tool. A third interface alongside the Rust crate and the Node.js bindings — used for **maintenance and administration**, plus one long-running mode: `serve`.
+> The `ndb` command-line tool. The second interface alongside the Rust crate — used for **maintenance and administration**, plus one long-running mode: `serve`. (The Node.js binding is gone as of v2.0.0; Node consumers use `serve`.)
 
 ## Folder model
 
@@ -45,10 +45,9 @@ Long-running HTTP daemon: loads the database once, keeps it in memory, serves qu
 
 ```
 ndb serve <path/to/data.jsonl> [--bind 127.0.0.1|0.0.0.0] [--port 8323] [--token <secret>]
-       [--text-index <field>]... [--threads <n>]
+       [--threads <n>]
 ```
 
-- `--text-index <field>`: boot a full-text index on the field (cache-aware: `base_dir/_index_<field>.fti` is journal-size-stamped; unchanged journal = instant boot).
 - `--threads <n>`: worker threads — the HTTP connection pool size and the index (re)build thread count. `0` (default) = all logical cores (pool floor: 4). The pool pulls from a bounded queue (`--max-connections` deep); a full queue answers `503`.
 
 - The file must already exist (`ndb init` first) — serve fails fast on a missing path.
@@ -59,8 +58,7 @@ Routes (all JSON unless noted):
 
 | Route | Description |
 |-------|-------------|
-| `POST /query` | `{filter, text, fields, sort: {field, dir}, limit, offset}` — Layer-3 AST ∩ optional full-text constraint, server-side projection, default limit 1000. Response `{ok, total, count, results}` — `total` is the pre-pagination match count |
-| `POST /search` | Full-text search — see below |
+| `POST /query` | `{filter, fields, sort: {field, dir}, limit, offset}` — Layer-3 AST, server-side projection, default limit 1000. Response `{ok, total, count, results}` — `total` is the pre-pagination match count |
 | `POST /facets` | `{fields: [...]}` → `{ok, facets: {field: {term: count}}}` — array fields count per element, scalars per value, strings only |
 | `POST /find` | `{field, value}` or `{field, min, max}` |
 | `GET /doc/:id[?fields=a,b]` | Fetch one doc, optional projection |
@@ -74,64 +72,13 @@ Routes (all JSON unless noted):
 | `PUT /file/:bucket` | Store file (body = raw bytes, `Content-Type` used as MIME) |
 | `GET /file/:bucket/:hash.ext` | Fetch file — raw bytes with real Content-Type |
 
-Limits: 64 concurrent connections (503 over), 64 MB request bodies (413), 30 s read timeout, query limit capped at 1000. Unknown query operators are rejected on every path — 400 over HTTP, thrown errors from the library/napi — never silently-match.
+Limits: 64 concurrent connections (503 over), 64 MB request bodies (413), 30 s read timeout, query limit capped at 1000. Unknown query operators are rejected on every path — 400 over HTTP, an error from the library — never silently-match.
 
-### `POST /search`
+### No full-text search (v2.0.0)
 
-Full-text search over a text-indexed field. Create the index first:
+`POST /search`, `type: "text"` in `POST /index`, the `text` parameter in `POST /query` and the `--text-index` flag were **removed in v2.0.0** along with `src/search.rs`. Full-text, lexical, vector and hybrid search are owned by **`nVDB`** (`nvdb serve`). nDB answers structured filters, sort, projection and pagination only. A folder holding old `_index_*.fti` files still opens: they are warned about and ignored.
 
-```
-curl -X POST .../index -d '{"field": "content", "type": "text"}'
-```
-
-Then query:
-
-```json
-{
-  "field": "content",
-  "mode": "and",
-  "case_sensitive": false,
-  "queries": [
-    {"type": "phrase", "value": "The hare was tired"},
-    {"type": "phrase", "value": "at the end of the race"},
-    {"type": "term",   "value": "paul"},
-    {"type": "term",   "value": "yesterday"},
-    {"type": "term",   "value": "rabbit", "exclude": true}
-  ],
-  "fields": ["title"],
-  "limit": 50,
-  "offset": 0
-}
-```
-
-- `mode`: `"and"` (default) — every positive query must match; `"or"` — any.
-- `queries[].type`: `term` (whole token) \| `phrase` (contiguous words) \|
-  `prefix` (`"yester"` → `"yesterday"`). `exclude: true` negates a query.
-- `case_sensitive`: default false.
-- `fields` / `limit` / `offset`: response projection and paging
-  (`total` in the response is the full match count).
-- Response: `{ok, count, total, results: [...]}`.
-- Requires a text index on the field (`POST /index` with `type: "text"`);
-  otherwise the request fails loud with `no text index on '<field>'`.
-
-### `POST /query` — `text` parameter
-
-`text` takes the same shape as the `/search` body (`{field, mode, case_sensitive?, queries}`):
-
-```json
-{
-  "filter": {"categories": {"$in": ["A", "B"]}},
-  "text": {"field": "story", "mode": "and", "queries": [{"type": "prefix", "value": "tentacle"}]},
-  "sort": {"field": "date", "dir": "desc"},
-  "limit": 50,
-  "offset": 0
-}
-```
-
-The filter and the text constraint are intersected: a doc must satisfy both.
-`total` is the count of that intersection (pre-pagination). Absent `text` = no
-constraint (zero overhead). `$in` on array fields matches elements
-(`{"categories": {"$in": ["A"]}}` finds docs whose `categories` contains `A`).
+`$in` on array fields matches elements (`{"categories": {"$in": ["A"]}}` finds docs whose `categories` contains `A`).
 
 ## Exit codes
 

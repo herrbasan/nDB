@@ -25,7 +25,6 @@
 
 use crate::error::{Error, Result};
 use crate::report;
-use crate::search::{self, TextIndex, TextSearch};
 use crate::storage::{self, ChangeBatch, ChangeEvent, ChangeKind, Snapshot, SourceLineage};
 use crate::v2_format;
 use crate::v2_format::{
@@ -543,7 +542,6 @@ pub(crate) struct V2Engine {
     /// whose base section is persisted. Empty at cold boot.
     wal_hash_indexes: RwLock<HashMap<String, HashIndex>>,
     wal_btree_indexes: RwLock<HashMap<String, BTreeIndex>>,
-    text_indexes: RwLock<HashMap<String, TextIndex>>,
     /// Parsed documents, keyed by id and guarded by `doc_seq`.
     parsed_cache: Mutex<HashMap<Box<str>, (u64, Arc<Value>)>>,
     change_ring: RwLock<VecDeque<LoggedChange>>,
@@ -900,7 +898,6 @@ impl V2Engine {
             btree_indexes: RwLock::new(btree_indexes),
             wal_hash_indexes: RwLock::new(wal_hash_indexes),
             wal_btree_indexes: RwLock::new(wal_btree_indexes),
-            text_indexes: RwLock::new(HashMap::new()),
             parsed_cache: Mutex::new(HashMap::new()),
             change_ring: RwLock::new(change_ring),
             commit_lock: Mutex::new(()),
@@ -1187,12 +1184,7 @@ impl V2Engine {
         crate::plan_candidates(ast, self)
     }
 
-    fn collect_matches(
-        &self,
-        ast: &Value,
-        text_ids: Option<&HashSet<String>>,
-    ) -> Result<Vec<Arc<Value>>> {
-        let text_ok = |id: &str| text_ids.map_or(true, |set| set.contains(id));
+    fn collect_matches(&self, ast: &Value) -> Result<Vec<Arc<Value>>> {
         let candidates = self.plan_candidates(ast);
         let state = self.state.read();
         let mut out = Vec::new();
@@ -1201,9 +1193,6 @@ impl V2Engine {
                 let mut ids: Vec<&String> = ids.iter().collect();
                 ids.sort();
                 for id in ids {
-                    if !text_ok(id) {
-                        continue;
-                    }
                     let Some((bytes, doc_seq)) = state.doc(id) else {
                         continue;
                     };
@@ -1215,7 +1204,7 @@ impl V2Engine {
             None => {
                 let mut rows: Vec<(String, Arc<[u8]>, u64)> = Vec::new();
                 state.for_each_live(|id, bytes, doc_seq| {
-                    if text_ok(id) && v2_json_scan::matches(bytes, ast) {
+                    if v2_json_scan::matches(bytes, ast) {
                         rows.push((id.to_string(), Arc::from(bytes), doc_seq));
                     }
                     Ok(())
@@ -1315,14 +1304,14 @@ impl V2Engine {
     pub(crate) fn query(&self, ast: Value) -> Result<Vec<Value>> {
         validate_query_ast(&ast)?;
         Ok(self
-            .collect_matches(&ast, None)?
+            .collect_matches(&ast)?
             .into_iter()
             .map(|doc| (*doc).clone())
             .collect())
     }
 
     pub(crate) fn query_with(&self, ast: Value, opts: QueryOptions) -> Result<Vec<Value>> {
-        let (_, hits) = self.select_matches(&ast, &opts, None)?;
+        let (_, hits) = self.select_matches(&ast, &opts)?;
         let mut out = Vec::with_capacity(hits.len());
         for (id, bytes, doc_seq) in hits {
             out.push((*self.parsed(&id, doc_seq, &bytes)?).clone());
@@ -1341,9 +1330,7 @@ impl V2Engine {
         &self,
         ast: &Value,
         opts: &QueryOptions,
-        text_ids: Option<&HashSet<String>>,
     ) -> Result<(usize, Vec<(String, Arc<[u8]>, u64)>)> {
-        let text_ok = |id: &str| text_ids.map_or(true, |set| set.contains(id));
         let candidates = self.plan_candidates(ast);
         let state = self.state.read();
 
@@ -1357,7 +1344,7 @@ impl V2Engine {
             std::collections::BinaryHeap::new();
 
         let mut consider = |id: &str, bytes: &[u8], doc_seq: u64| -> Result<()> {
-            if !text_ok(id) || !v2_json_scan::matches(bytes, ast) {
+            if !v2_json_scan::matches(bytes, ast) {
                 return Ok(());
             }
             let index = total;
@@ -1415,9 +1402,6 @@ impl V2Engine {
                 let slots = state.slot_count();
                 let mut slot = 0u32;
                 for id in ids {
-                    if !text_ok(id) {
-                        continue;
-                    }
                     if state.wal_overlay.contains_key(id.as_str()) {
                         if let Some((bytes, doc_seq)) = state.doc(id) {
                             consider(id, bytes, doc_seq)?;
@@ -1466,10 +1450,9 @@ impl V2Engine {
         ast: Value,
         opts: QueryOptions,
         fields: Option<&[String]>,
-        text_ids: Option<&HashSet<String>>,
     ) -> Result<(usize, Vec<Value>)> {
         validate_query_ast(&ast)?;
-        let (total, hits) = self.select_matches(&ast, &opts, text_ids)?;
+        let (total, hits) = self.select_matches(&ast, &opts)?;
         let mut page = Vec::with_capacity(hits.len());
         for (id, bytes, doc_seq) in hits {
             page.push(match fields {
@@ -1706,7 +1689,6 @@ impl V2Engine {
                             Some(value),
                         );
                     }
-                    self.retext(id, old.as_deref(), Some(value));
                     self.adjust_file_refs(old.as_deref(), Some(value));
                     self.push_change(*doc_seq, id, Some(Arc::clone(value)));
                 }
@@ -1734,7 +1716,6 @@ impl V2Engine {
                             None,
                         );
                     }
-                    self.retext(id, Some(old), None);
                     {
                         let mut file_refs = self.file_refs.write();
                         for r in extracted {
@@ -1795,26 +1776,6 @@ impl V2Engine {
         }
         for r in new_refs.difference(&old_refs) {
             *refs.entry(r.clone()).or_insert(0) += 1;
-        }
-    }
-
-    fn retext(&self, id: &str, old: Option<&Value>, new: Option<&Value>) {
-        let mut text_indexes = self.text_indexes.write();
-        if text_indexes.is_empty() {
-            return;
-        }
-        for (field, index) in text_indexes.iter_mut() {
-            let had_old = old.map(|d| d.get(field).is_some()).unwrap_or(false);
-            let has_new = new.map(|d| d.get(field).is_some()).unwrap_or(false);
-            if !had_old && !has_new {
-                continue;
-            }
-            match new {
-                Some(doc) => {
-                    index.index_doc(id, doc);
-                }
-                None => index.remove_doc(id),
-            }
         }
     }
 
@@ -1981,56 +1942,6 @@ impl V2Engine {
             return true;
         }
         self.btree_indexes.read().contains_key(field)
-    }
-
-    // ─── Full-text indexes ──────────────────────────────────────────
-
-    pub(crate) fn has_text_index(&self, field: &str) -> bool {
-        self.text_indexes.read().contains_key(field)
-    }
-
-    pub(crate) fn create_text_index(&self, field: &str, threads: usize) -> Result<()> {
-        let _commit = self.commit_lock.lock();
-        let docs_text: Vec<(String, String)> = {
-            let state = self.state.read();
-            let mut out = Vec::new();
-            state.for_each_live(|id, bytes, _| {
-                let doc = parse_doc(bytes, id)?;
-                if let Some(text) = search::extract_text(&doc, field) {
-                    out.push((id.to_string(), text));
-                }
-                Ok(())
-            })?;
-            out
-        };
-        let mut index = TextIndex::new(field);
-        index.build_parallel(docs_text, threads);
-        self.text_indexes.write().insert(field.to_string(), index);
-        Ok(())
-    }
-
-    pub(crate) fn drop_text_index(&self, field: &str) -> Result<()> {
-        let _commit = self.commit_lock.lock();
-        self.text_indexes.write().remove(field);
-        Ok(())
-    }
-
-    pub(crate) fn text_search(&self, field: &str, search: &TextSearch) -> Result<Vec<String>> {
-        search.validate()?;
-        let state = self.state.read();
-        let text_indexes = self.text_indexes.read();
-        let index = text_indexes
-            .get(field)
-            .ok_or_else(|| Error::invalid_arg(format!("no text index on '{}'", field)))?;
-        let mut texts: HashMap<String, String> = HashMap::new();
-        state.for_each_live(|id, bytes, _| {
-            let doc = parse_doc(bytes, id)?;
-            if let Some(text) = search::extract_text(&doc, field) {
-                texts.insert(id.to_string(), text);
-            }
-            Ok(())
-        })?;
-        Ok(index.search(search, |id| texts.get(id).cloned()))
     }
 
     // ─── Sync feed ──────────────────────────────────────────────────
@@ -2429,10 +2340,9 @@ impl V2Engine {
         &self,
         ast: Value,
         opts: QueryOptions,
-        text_ids: Option<&HashSet<String>>,
     ) -> Result<(usize, Vec<Arc<[u8]>>)> {
         validate_query_ast(&ast)?;
-        let (total, hits) = self.select_matches(&ast, &opts, text_ids)?;
+        let (total, hits) = self.select_matches(&ast, &opts)?;
         Ok((total, hits.into_iter().map(|(_, bytes, _)| bytes).collect()))
     }
 }

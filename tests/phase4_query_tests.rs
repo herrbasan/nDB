@@ -248,7 +248,6 @@ fn query_projected_returns_only_requested_fields() {
         json!({"status": "active"}),
         QueryOptions { sort_by: Some(("score".to_string(), SortDir::Desc)), ..Default::default() },
         Some(&fields),
-        None,
     ).unwrap();
     assert_eq!(total, 3);
     assert_eq!(results.len(), 3);
@@ -264,7 +263,6 @@ fn query_projected_returns_only_requested_fields() {
         json!({"status": "active"}),
         QueryOptions { sort_by: Some(("score".to_string(), SortDir::Desc)), offset: Some(1), limit: Some(1), ..Default::default() },
         Some(&fields),
-        None,
     ).unwrap();
     assert_eq!(total, 3, "total must be the pre-pagination match count");
     assert_eq!(results.len(), 1);

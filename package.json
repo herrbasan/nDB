@@ -1,7 +1,7 @@
 {
   "name": "ndb",
-  "version": "1.5.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Embeddable in-memory document database (Rust core, Node.js bindings in napi/)",
+  "description": "Embeddable in-memory document database (Rust core; standalone multi-DB HTTP service `ndb serve`)",
   "type": "commonjs"
 }

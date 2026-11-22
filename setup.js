@@ -6,8 +6,6 @@
  *
  * Builds the `ndb` CLI (including `ndb serve`) in release mode and copies
  * it to bin/. Run this on each machine after pulling the submodule.
- *
- * For the Node.js bindings, run: node napi/setup.js
  */
 
 const { execSync } = require('child_process');

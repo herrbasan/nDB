@@ -3,6 +3,8 @@
 > Idioms for working with nDB that aren't obvious from the API signatures.
 > These cover the three traps from the original docs gap: `get()` throwing, the
 > singleton/config-record pattern, and soft-delete visibility.
+>
+> ⚠️ Examples below are written against the v1.x Node binding, which was **removed in v2.0.0**. The semantics still hold for the Rust crate and the HTTP API (`ndb serve`) — only the call syntax changed.
 
 ---
 
@@ -103,7 +105,7 @@ Deltas are replayed in memory on load and baked into a fresh base document on `c
 
 ## 5. Reading large corpora
 
-`iter()` marshals the entire database across the napi boundary as one string and can exceed napi's ~2 GB string limit on very large databases. Page bulk reads with `queryWith` instead:
+`iter()` marshalled the entire database across the (removed) napi boundary as one string and could exceed the ~2 GB string limit on very large databases. Page bulk reads instead:
 
 ```js
 const page = await db.queryWith(

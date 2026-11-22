@@ -526,7 +526,7 @@ fn time_mget(http: &mut Http, db_name: &str, ids: &[String], rounds: usize) -> D
 fn time_query(db: &Database, filter: &Value, opts: &QueryOptions) -> (Dist, usize, usize) {
     let started = Instant::now();
     let (mut matched, mut rows) = db
-        .query_projected(filter.clone(), opts.clone(), None, None)
+        .query_projected(filter.clone(), opts.clone(), None)
         .expect("query warm-up");
     let warm_secs = started.elapsed().as_secs_f64();
     std::hint::black_box(&rows);
@@ -535,7 +535,7 @@ fn time_query(db: &Database, filter: &Value, opts: &QueryOptions) -> (Dist, usiz
     for _ in 0..rounds {
         let started = Instant::now();
         let (total, page) = db
-            .query_projected(filter.clone(), opts.clone(), None, None)
+            .query_projected(filter.clone(), opts.clone(), None)
             .expect("query");
         samples.push(started.elapsed().as_secs_f64() * 1e6);
         matched = total;

@@ -6,7 +6,7 @@
 
 ## Overview
 
-**Three interfaces.** nDB is consumed three ways: the Rust crate (`Database::open`), the Node.js bindings (napi, `napi/`), and the **HTTP daemon** (`ndb serve`, design: `docs/ndb-serve-design.md`) — a resident process that owns the database in memory and serves queries to any client over HTTP. The daemon exists for large shared databases (multi-GB) where N apps must not each hold the data in their own heap: data and computation stay in Rust, only results cross the wire.
+**Three interfaces until v2.0.0, two now.** The napi Node binding crate was removed in v2.0.0. nDB is consumed two ways: the Rust crate (`Database::open`) and the **HTTP daemon** (`ndb serve`, design: `docs/ndb-serve-design.md`) — a resident process that owns one or many named databases in memory and serves queries to any client over HTTP. The daemon exists for large shared databases (multi-GB) where N apps must not each hold the data in their own heap: data and computation stay in Rust, only results cross the wire. Node consumers (`mcp_server`, `LLM-Gateway-Chat`) use this HTTP API.
 
 **Database-as-a-Folder.** nDB's intended and production structure is one **directory per database**. The convention used by the primary consumer (LLM-Gateway-Chat) and produced by the CLI is:
 
@@ -43,15 +43,13 @@ Every document lives in a `HashMap<String, Value>` at runtime, providing O(1) lo
 ```
 `Database::open("my-app/data.jsonl")` → in-memory store backed by `my-app/data.jsonl`, with buckets in `my-app/_files/` and trash in `my-app/_trash/`.
 
-**Deployment (submodule workflow).** Consumers embed nDB as a git submodule. On Windows x64 no build step is needed — the committed `napi/*.win32-x64-msvc.node` prebuilt is what `index.js` loads. For a checkout without the binary (or to repair one), `node napi/vendor.js` fetches the artifact for the package's version from the GitHub release and verifies it against the release's SHA-256 sidecar before it enters the load path. Only when neither applies — an unsupported platform — is the Rust toolchain needed:
+**Deployment (submodule workflow).** Consumers embed nDB as a git submodule and use the `ndb serve` HTTP daemon (v2.0.0 removed the Node binding and its prebuilt `.node`). Build the CLI once per machine:
 
 ```
-node napi/vendor.js   # ensure the Node binding (prebuilt or fetched+verified)
-node napi/setup.js    # or build the Node bindings from source → napi/*.node
 node setup.js         # build the CLI (ndb, incl. `ndb serve`) → bin/ndb[.exe]
 ```
 
-`bin/` and `target/` are per-machine artifacts (gitignored). Release binaries (`ndb-node.*.node`, `ndb[.exe]`, plus `.sha256` sidecars) are attached to the GitHub release for each version tag.
+`bin/` and `target/` are per-machine artifacts (gitignored). Release binaries (`ndb[.exe]` plus a `.sha256` sidecar) are attached to the GitHub release for each version tag.
 
 ---
 
@@ -257,15 +255,15 @@ Two kinds of failure, two contracts:
 
 Nothing is swallowed. There is no bare `let _ =` on a `Result` anywhere in the library; the sink and its rationale live in `src/report.rs`.
 
-### Reliability at the JS boundary
+### Reliability at the HTTP boundary
 
 In Rust a `Result` is a returned value: it cannot crash anything, and the caller cannot proceed past it without looking at it. That stays the library's contract.
 
-At the napi boundary an `Err` becomes a **JavaScript exception** — the established contract, and a fine one: a caught exception lets an application report a failed operation and carry on. What it does *not* tolerate is a failure that cannot be caught at all.
+Over `ndb serve` an `Err` becomes a **JSON error with a 4xx/5xx status** (`{ok:false, error, message}`) — a caught error lets a client report a failed operation and carry on. What the boundary does *not* tolerate is a failure that cannot be caught at all.
 
 So the boundary makes four guarantees, and they are about crash-and-data, not about avoiding exceptions:
 
-- **No process abort.** Panics abort outright and cannot be caught on either side, so caller-supplied shape is validated rather than unwrapped — a non-object document raises a catchable error instead of taking the host down. A poisoned lock is reported for the same reason.
+- **No process abort.** Panics abort outright and cannot be caught on either side, so caller-supplied shape is validated rather than unwrapped — a non-object document raises a catchable error instead of taking the daemon down. A poisoned lock is reported for the same reason.
 - **A delete is never reported as reversible when it is not.** The restorable copy is written before anything destructive, so an unrecordable delete is refused rather than reported as success. This is delete-specific; see the caveat below.
 - **Cleanup never fails the operation.** Moving files to trash, sweeping buckets, purging trash and flushing at shutdown report failures on stderr (`ndb: suppressed failure: ...`) and leave the primary result intact. `gc_buckets()` returns a count of files that actually moved.
 - **A failed journal write changes nothing.** Every mutating operation — `insert`, `update`, the delta ops `set`/`remove`/`array_push`, and `delete` — appends to the journal *before* any in-memory, index, ref-counter or file-bucket state is touched. If the append fails, the call raises and the document, indexes, ref counts, live blobs and the journal itself are exactly as they were; the operation is retryable. What happens after a successful append is infallible bookkeeping or reported cleanup.

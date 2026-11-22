@@ -19,7 +19,7 @@
 
 ## What nDB Is
 
-nDB is an **embeddable in-memory document database** built in Rust with native Node.js bindings. It stores JSON documents in a `HashMap` for O(1) lookups and persists them to an append-only JSON Lines file on disk. It is designed for AI-age applications — chat apps, agents, Electron tools — where you need fast local storage without external database servers.
+nDB is an **embeddable in-memory document database** built in Rust. It stores JSON documents in a `HashMap` for O(1) lookups and persists them to an append-only JSON Lines file (v1) or a binary/mmap generation pair (v2). Since **v2.0.0** it is also the **standalone multi-DB HTTP service `ndb serve`** — the only non-Rust interface. The napi Node binding crate was removed in v2.0.0 (no `.node` prebuilts, zero NAPI); `mcp_server` and `LLM-Gateway-Chat` talk to `ndb serve`. Full-text, lexical, vector and hybrid search belong to `nVDB`, not here.
 
 ## Core Design
 
@@ -74,6 +74,8 @@ reference: `documentation/v2-storage.md`; benchmark and gate verdicts:
 2. **Layer 2 — Field Queries:** `find(field, value)`, `find_where()`, `find_range()`. Accelerated by opt-in hash and BTree indexes.
 3. **Layer 3 — JSON AST Queries:** MongoDB-style filter objects with `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$and`, `$or`, `$not`, and dot-notation nested field access.
 
+> Full-text search is **not** a query layer. `nVDB` owns it (BM25 + dense vectors + rerank); nDB answers structured queries only.
+
 ## File Buckets
 
 Named binary storage with **SHA-256 content-hash deduplication**. Identical files are stored once, under the **full 64-char hash** (legacy 8-char ids stay readable); a dedup hit is verified (size + re-hash) so a damaged blob is reported, never returned. Files are referenced by compact `bucket:hash.ext` strings (nURI) or any of `/api/buckets/{b}/{f}`, `/file/{b}/{f}`, `/files/{b}/{f}`, `/v2/dbs/{db}/files/{b}/{f}` — all count as live references. Soft-delete moves files to `_trash/files/` rather than removing them. Garbage collection (`gc_buckets`) sweeps unreferenced files to trash and serializes with `store_file` on the writer lock. Targeted release (`release_file`) checks live **and restorable (trash) documents** before trashing a specific file.
@@ -110,7 +112,7 @@ Resident daemon (`src/server.rs`) — hand-rolled HTTP/1.1 on `std::net`, no asy
 
 - Mount sources: positional `<path>` (legacy, mounted as `default`), repeatable `--db <name>=<path>`, `--dir <root>` (auto-mounts child folders holding `data.jsonl` or `meta.json`), and `--config <file.json>` (`bind/port/token/persistence/scheduled_ms/dir/max_limit/default_limit/dbs`; unknown fields rejected).
 - Startup refuses: no source at all, an unopenable DB, a duplicate name or canonical path, an invalid DB name (`[a-zA-Z0-9._-]+`, not `.`/`..`), a missing `--dir`.
-- `GET /health`, `GET|POST /v2/dbs`, and per-DB `/v2/dbs/{name}/{stats,lineage,doc,docs/mget,query,find,facets,search,index,compact,flush,changes,snapshot,files/...}`. `POST /v2/dbs` accepts only `{name, persistence?}` (never a path) and is `403 create_disabled` without `--dir`.
+- `GET /health`, `GET|POST /v2/dbs`, and per-DB `/v2/dbs/{name}/{stats,lineage,doc,docs/mget,query,find,facets,index,compact,flush,changes,snapshot,files/...}`. `POST /v2/dbs` accepts only `{name, persistence?}` (never a path) and is `403 create_disabled` without `--dir`.
 - Legacy single-DB routes (`/stats`, `/doc`, `/query`, `/file/...`) keep working against `default`; `/v2/` errors are `{ok:false, error, message}`.
 - **Transport:** `TCP_NODELAY` on every accepted connection; one `write_all` per response frame (head+body for ≤64 KB), binary bodies move into the socket without a clone; `Content-Length` always exact and `Connection: keep-alive` / `close` always truthful.
 - **Keep-alive:** one `BufReader` persists across requests on a socket; the loop ends on `Connection: close`, HTTP/1.0 without keep-alive, clean EOF, a 5 s idle timeout between requests (30 s for a live request), or a shutdown flag.
@@ -118,9 +120,11 @@ Resident daemon (`src/server.rs`) — hand-rolled HTTP/1.1 on `std::net`, no asy
 - **Graceful shutdown (M3):** Ctrl-C / SIGINT (Windows `SetConsoleCtrlHandler`, Unix `signal`) sets `server::request_process_shutdown()`. The accept loop stops, the queue closes, workers drain, and every mounted database is `flush()`ed before the process exits 0. A second Ctrl-C falls through to OS termination.
 - Contract and route list: `docs/ndb-serve-design.md`.
 
-## Node.js Bindings
+## Node.js Access
 
-Powered by **napi-rs**. The `napi/` crate wraps the Rust `Database` type and exposes all operations to JavaScript. Async tasks handle `query`, `queryWith`, `compact`, and `exportSnapshot`. File bucket operations (`storeFile`, `getFile`, `deleteFile`, `releaseFile`, `gcBuckets`) are exposed directly.
+**There is no Node binding.** The `napi/` crate was removed in **v2.0.0** (2026-11-23) along with its committed `.node` prebuilts, `index.js`/`vendor.js`/`setup.js` — zero NAPI anywhere in the ecosystem. Node and Electron consumers use `ndb serve` over HTTP; `mcp_server` and `LLM-Gateway-Chat` are live on it. `ndb serve` keeps one copy of the data in one Rust process instead of one copy per Node process, which is what the binding could never do.
+
+**Full-text search is not part of nDB.** `src/search.rs`, `/search`, `POST /v2/dbs/{n}/search`, `type: "text"` in `/index` and the `text` constraint in `/query` were removed in v2.0.0 — `nVDB` owns all full-text, lexical, vector, hybrid and reranked search. Old `_index_*.fti` files left on disk are warned about and ignored at v2 open, so existing folders mount unchanged.
 
 ## Current Implementation Status
 
@@ -133,34 +137,29 @@ Powered by **napi-rs**. The `napi/` crate wraps the Rust `Database` type and exp
 | File buckets with SHA-256 dedup | Complete |
 | `array_push` delta (Rust core) | Complete |
 | Delta updates in Node.js backend | Complete (`arrayPush`, `set`, `remove` wired and used by consumers; ops return an `applied` flag — `Ok(false)`/`false` = no-op, writes nothing, D1 2026-09-28) |
-| `release_file` + `gc_buckets` (Rust + NAPI) | Complete |
-| TTL-based trash purging | Complete (`with_trash_ttl` + background thread; napi via `trash_ttl` option; purge serialized against delete's trash append via `trash_lock`, B3 2026-09-28) |
+| `release_file` + `gc_buckets` (Rust) | Complete |
+| TTL-based trash purging | Complete (`with_trash_ttl` + background thread; purge serialized against delete's trash append via `trash_lock`, B3 2026-09-28) |
 | Failure discipline | Complete — no bare `let _ =` on a `Result`; preconditions return `Err`, ancillary cleanup is reported (`src/report.rs`); a document is never reported deleted when its trash record could not be written |
 | Journal-first write ordering | Complete — every mutating op appends before any in-memory/index/ref state moves; a failed append changes nothing (fault-injected tests) |
 | Durability hardening (Phase 1b slice 1) | Complete — torn-tail truncation + mid-journal corruption refusal + `ndb repair`, per-DB OS writer lock, transactional `apply_ops` with per-doc `doc_seq`/`If-Match` (`409 conflict`), bucket ref normalization + GC/store serialization + full-SHA-256 dedup verification, durable doc-trash `sync_all`, parent-dir fsync after renames, real `Scheduled` flusher, Windows reserved/case-folded DB names, mget cap, pinned snapshot pagination; `tests/phase14_durability_hardening_tests.rs` |
 | Hot-path performance (Phase 1b slice 2) | Complete — O(1) `insert` (no per-write id-set clone), real query planner (`$eq`/`$in` → hash/BTree, ranges merged into one BTree interval, smallest-first intersection), index-backed `find_range`, `Arc<Value>` store + change log (one document instance per write), O(1) `/stats`, `TCP_NODELAY` + single-frame responses + bounded worker pool + HTTP keep-alive + Ctrl-C drain/flush, `autobenches = false` (zero Cargo warnings); `tests/phase15_perf_and_planner_tests.rs` |
 | Durable lineage + sync feed | Complete — `_meta` lineage (`source_epoch_uuid`/`last_seq`/`min_available_seq`), `_seq` on every committed line, `lineage()`/`snapshot_at()`/`changes_since()`, replay-on-open incl. legacy + compacted journals; `tests/phase0_sync_feed_tests.rs` |
 | `meta.json` bucket policies | Complete — `kind`, `onDocumentDelete`, `ttl_seconds`, `reserved_ttl_seconds` enforced at open; malformed policy fails loudly; schema validation still unenforced |
-| Item buckets (`kind: "items"`) | Complete — item folders + `items.jsonl` journal, reserve/commit/trash/restore, reserved sweep, `verify` integrity; napi + CLI wired |
+| Item buckets (`kind: "items"`) | Complete — item folders + `items.jsonl` journal, reserve/commit/trash/restore, reserved sweep, `verify` integrity; CLI wired |
 | Multi-DB HTTP service (`ndb serve`) | Complete (step 1) — `DbRegistry` mounts arbitrary DB paths by name, `--db`/`--dir`/`--config`, `/health` + `/v2/dbs` + per-DB CRUD/query/sync/bucket routes; `tests/phase13_multi_db_serve_tests.rs` |
 | Schema validation from `meta.json` | Not implemented (`meta.json` schemas block ignored) |
 | v2 binary/mmap storage backend (Phase 3, slice 3D) | Complete — `manifest.json` + mmap base generations + CRC32 WAL; zero-copy directory and persisted index sections (fixed-stride offset tables, O(1) slot access, O(log n) id lookup, `&[u32]` slot views); no per-document slot map (superseded bitset + WAL overlay, empty at cold boot); raw-JSON filter/sort-key scanning with bounded top-K and projected/raw materialization (`src/v2_json_scan.rs`); per-DB leader/follower group commit (one fsync per batch, RAM published only after fsync), bounded 1024-entry change ring with on-disk WAL fallback, non-blocking compaction with a mirror WAL and a few-KB freeze; `StorageFormat::{Auto,V1,V2}` gains `Database::open_v2*`; CLI `init --v2`, `migrate`, `fsck`, v2 `repair`, `export --jsonl`; `POST /v2/dbs` accepts `format: "v2"`. Reference: `documentation/v2-storage.md`; benchmark and gate verdicts: `docs/phase3-benchmark-v1-vs-v2.md`; tests: `tests/phase3_slice3b_v2_tests.rs`, `tests/phase16_v2_storage_tests.rs`, `tests/phase15_perf_and_planner_tests.rs` |
 | nURI `link` type enforcement | Not implemented (file refs detected heuristically by string match, not by schema) |
 | Bucket migration script for legacy data | Not bundled here (the consumer's `migrate-ndb-to-folder.js` was used in production) |
 
-## Release Path (established 2026-09-28, v1.4.0)
+## Release Path (v2.0.0, standalone service)
 
 **The git tag is the version truth.** Cutting a release:
 
-1. Bump all four manifests in one commit: `Cargo.toml`, `napi/Cargo.toml`, `napi/package.json`, root `package.json`.
-2. Rebuild both binaries and deploy them by copy — **`npm run build` compiles but does not deploy**; the copy is the deploy:
-   - `cargo build --release -p ndb-node` → copy `target/release/ndb_node.dll` over `napi/ndb-node.win32-x64-msvc.node`
-   - `cargo build --release --bin ndb` → copy `target/release/ndb.exe` to `bin/ndb.exe` (bin/ is gitignored; the CLI ships via the release, not the repo)
-3. Oracles before tagging: full `cargo test` (all phases, unmodified) + `npm test` in `napi/` **against the fresh binary** (66+ tests + shape guard + harness self-check).
-4. Commit the bump *with* the rebuilt `napi/*.node` — the committed prebuilt is the zero-setup path for win32-x64 consumers; a stale committed binary is the #6 trap (panic locations that don't map to source).
-5. `git tag -a vX.Y.Z`, push, then `gh release create vX.Y.Z` with `ndb-node.win32-x64-msvc.node`, `ndb.exe`, and a `.sha256` sidecar per artifact (`<hash>  <name>`, lowercase hex).
-
-**Consumer side:** `node napi/vendor.js` — no-op when the committed prebuilt exists; otherwise downloads the artifact for its own `package.json` version from the GitHub release and verifies it against the sidecar *before* it enters the load path (temp file, verify, rename; a failed verification keeps nothing). Unsupported platform/arch fails loudly with the build-from-source path (`napi/setup.js` / `setup.js`, Rust toolchain required). Release matrix is **Windows x64 only** for now; add platforms as matrix entries in `vendor.js` + release assets, not by cross-compiling locally.
+1. Bump `Cargo.toml` and root `package.json` in one commit (there is one Cargo package now — the workspace and the `napi/` member are gone).
+2. `cargo build --release --bin ndb`; copy `target/release/ndb.exe` to `bin/ndb.exe` (bin/ is gitignored — the CLI ships via the release, not the repo).
+3. Oracles before tagging: full `cargo test` (all phases, unmodified) and `cargo check --all-targets` with zero warnings.
+4. `git tag -a vX.Y.Z`, push, then `gh release create vX.Y.Z` with the `ndb.exe` artifact and a `.sha256` sidecar (`<hash>  <name>`, lowercase hex). Release matrix is **Windows x64 only** for now.
 
 ## What nDB Is Not
 

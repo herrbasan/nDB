@@ -2,7 +2,12 @@
 
 > Human-readable document database for the AI age.
 
-nDB is an **in-memory document database** with JSON Lines persistence, layered query API, and file bucket support. Standalone embeddable database for Node.js and Electron applications.
+nDB is an **in-memory document database** with JSON Lines persistence, layered query API, and file bucket support. It runs either embedded in a Rust process or as the standalone multi-DB HTTP service `ndb serve` (port 8323) — the way Node and Electron applications share one database without holding a copy in their own heap.
+
+> **v2.0.0 (2026-11-23) — breaking:**
+> - The `napi/` crate and its `.node` prebuilts are **gone**. There is no native Node binding; consumers talk to `ndb serve` over HTTP (`mcp_server` and `LLM-Gateway-Chat` already do).
+> - The in-crate full-text search engine (`src/search.rs`, `/search`, `text` indexes) is **gone**. Full-text, lexical, vector and hybrid search is owned by **nVDB**; nDB keeps structured query/filter/sort/projection/pagination, typed Hash/BTree indexes, v2 binary/mmap storage with group commit, and the multi-DB HTTP service.
+> - Stray `_index_*.fti` files left in a folder by older versions are ignored with a warning, so existing databases mount unchanged.
 
 
 > **⚠️ BREAKING CHANGE (v3 Architecture)**
@@ -14,12 +19,10 @@ nDB is an **in-memory document database** with JSON Lines persistence, layered q
 > 
 > This removes the need for upper-layer management wrappers (like the deprecated nGDB). nDB natively handles **Delta patch operations** (e.g. `array_push`) for large objects and **bucket garbage collection**. Schema enforcement and nURI link-type validation remain unimplemented — the core reads `meta.json`'s `buckets` policy block (kind, lifecycle, TTLs) but ignores the `schemas` block.
 
-## What's New in v1.4.0 (Non-Breaking)
-- **Item buckets** — a second bucket kind (`kind: "items"` in `meta.json`) for app-managed assets: the engine hands out a folder per item, your code streams the bytes (any size — no buffers, no ceilings), and commits one facts record. Reserve/commit/trash/restore, reserved-TTL sweeps, and `verify` integrity with streaming SHA-256.
-- **`meta.json` bucket policies** — `onDocumentDelete` (`restrict`/`trash`), per-bucket `ttl_seconds`, read at open. Malformed policy fails loudly; absence means the pre-policy behavior.
-- **Journal-first write ordering** — every mutating operation appends to the journal before any state moves; a failed write changes nothing and is retryable.
-- **Failure discipline** — operations that used to silently succeed while failing now return errors; `close()` on the public wrapper; no process aborts on bad input.
-- **Release package** — prebuilt Windows x64 binaries + SHA-256 sidecars on the GitHub release, and `napi/vendor.js` to fetch-and-verify them without a Rust toolchain.
+## What's New in v2.0.0
+- **Standalone multi-DB service** — one `ndb serve` process mounts independent database folders by name (`--db name=path`, `--dir <root>`, `--config`), with per-DB v2 binary/mmap storage and group-commit durability.
+- **Zero NAPI** — the `napi/` crate and committed Windows prebuilts were removed; Node consumers use the HTTP API, which keeps one copy of the data in one Rust process instead of one copy per Node process.
+- **Full-text search moved out** — the in-crate inverted index was deleted (zero production callers); `nVDB` owns all full-text, lexical, vector and hybrid search. Structured query, filters, sort, projection, pagination, typed Hash/BTree indexes and file buckets are unchanged.
 
 ## Features
 
@@ -30,7 +33,7 @@ nDB is an **in-memory document database** with JSON Lines persistence, layered q
 - **Opt-in indexes** — Hash indexes for equality, BTree indexes for ranges
 - **File buckets** — Binary storage with SHA-256 deduplication
 - **Soft delete & trash** — Recoverable deletes with compaction
-- **Node.js native bindings** — napi-rs powered, zero-copy where possible
+- **Multi-DB HTTP service** — `ndb serve`: one resident Rust process, many named databases, HTTP/1.1 + keep-alive
 - **Zero dependencies** — Minimal Rust crate, no external crypto/DB libs
 
 ## Quick Start
@@ -58,14 +61,30 @@ db.delete(&id)?;
 db.restore(&id)?;
 ```
 
-### Node.js
+### Node.js (HTTP)
+
+The native binding was removed in v2.0.0. Run the daemon once and talk to it from any app:
+
+```bash
+ndb serve --db notes=D:\data\notes --bind 127.0.0.1 --port 8323
+```
+
 ```js
-const { Database } = require('ndb');
+const base = 'http://127.0.0.1:8323/v2/dbs/notes';
 
-const db = new Database('./mydata/data.jsonl');
+const id = await fetch(`${base}/doc`, {
+  method: 'PUT',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ name: 'Alice', age: 30 }),
+}).then(r => r.json()).then(b => b.id);
 
-const id = db.insert({ name: 'Alice', age: 30 });
-const doc = db.get(id);
-const results = db.query({ age: { $gte: 25 } });
+const { results } = await fetch(`${base}/query`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ filter: { age: { $gte: 25 } }, fields: ['name'] }),
+}).then(r => r.json());
 
-db.delete(id);
+await fetch(`${base}/doc/${id}`, { method: 'DELETE' });
+```
+
+Full contract: `docs/ndb-serve-design.md`.

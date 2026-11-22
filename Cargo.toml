@@ -1,10 +1,6 @@
-[workspace]
-members = [".", "napi"]
-resolver = "2"
-
 [package]
 name = "ndb"
-version = "1.5.0"
+version = "2.0.0"
 edition = "2021"
 authors = ["ndb Contributors"]
 description = "Human-readable document database for the AI age"
@@ -43,16 +39,8 @@ path = "benches/bench_insert.rs"
 harness = false
 
 [[example]]
-name = "search_perf"
-path = "benches/search_perf.rs"
-
-[[example]]
 name = "doc_perf"
 path = "benches/doc_perf.rs"
-
-[[example]]
-name = "boundary_rust"
-path = "benches/boundary_rust.rs"
 
 [[example]]
 name = "phase3_corpus_bench"

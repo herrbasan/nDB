@@ -208,10 +208,10 @@ fn planner_equals_full_scan_on_every_probe() {
 
     for p in planner_probes() {
         let plain_hits = plain
-            .query_projected(p.filter.clone(), p.opts.clone(), p.fields.as_deref(), None)
+            .query_projected(p.filter.clone(), p.opts.clone(), p.fields.as_deref())
             .unwrap();
         let indexed_hits = indexed
-            .query_projected(p.filter.clone(), p.opts.clone(), p.fields.as_deref(), None)
+            .query_projected(p.filter.clone(), p.opts.clone(), p.fields.as_deref())
             .unwrap();
 
         assert_eq!(
@@ -334,10 +334,10 @@ fn planner_equals_full_scan_on_a_compacted_v2_database() {
 
     for p in planner_probes() {
         let expected = reference
-            .query_projected(p.filter.clone(), p.opts.clone(), p.fields.as_deref(), None)
+            .query_projected(p.filter.clone(), p.opts.clone(), p.fields.as_deref())
             .unwrap();
         let actual = v2
-            .query_projected(p.filter.clone(), p.opts.clone(), p.fields.as_deref(), None)
+            .query_projected(p.filter.clone(), p.opts.clone(), p.fields.as_deref())
             .unwrap();
         assert_eq!(expected.0, actual.0, "probe '{}': total mismatch", p.label);
         assert_eq!(
@@ -361,10 +361,10 @@ fn planner_equals_full_scan_on_a_compacted_v2_database() {
         // The HTTP raw fast path must select exactly the same page as the
         // unprojected query (projection is a separate path).
         let (raw_total, raw_docs) = v2
-            .query_raw(p.filter.clone(), p.opts.clone(), None)
+            .query_raw(p.filter.clone(), p.opts.clone())
             .unwrap();
         let unprojected = v2
-            .query_projected(p.filter.clone(), p.opts.clone(), None, None)
+            .query_projected(p.filter.clone(), p.opts.clone(), None)
             .unwrap();
         assert_eq!(raw_total, unprojected.0, "probe '{}': query_raw total", p.label);
         let raw_values: Vec<Value> = raw_docs

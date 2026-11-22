@@ -261,7 +261,6 @@ fn v2_query_layers_match_the_v1_semantics() {
             json!({"kind": {"$in": ["a", "b"]}}),
             opts,
             Some(&["n".to_string()]),
-            None,
         )
         .unwrap();
     assert_eq!(total, 4);
@@ -404,23 +403,6 @@ fn v2_delete_writes_a_restorable_trash_record_and_tombstone() {
     assert!(!db.contains(&id));
     db.restore(&id).unwrap();
     assert!(db.contains(&id));
-}
-
-#[test]
-fn v2_full_text_index_works_and_tracks_writes() {
-    let dir = TempDir::new().unwrap();
-    let db = open_v2(dir.path());
-    db.insert(json!({"body": "the quick brown fox"})).unwrap();
-    db.insert(json!({"body": "lazy dog sleeps"})).unwrap();
-    db.create_text_index("body").unwrap();
-
-    let query = ndb::TextSearch::and(vec![ndb::TextQuery::Term("quick".to_string())]);
-    assert_eq!(db.text_search("body", &query).unwrap().len(), 1);
-
-    let id = db.insert(json!({"body": "quick silver"})).unwrap();
-    assert_eq!(db.text_search("body", &query).unwrap().len(), 2);
-    db.delete(&id).unwrap();
-    assert_eq!(db.text_search("body", &query).unwrap().len(), 1);
 }
 
 #[test]

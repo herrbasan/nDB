@@ -339,60 +339,9 @@ let mid_range = db.find_range("score", &json!(50), &json!(100));
 
 ---
 
-## Layer 4: Full-Text Search
+## Layer 4: Full-Text Search — removed in v2.0.0
 
-Fast multi-term/phrase search over story-sized text fields (built for 300KB
-docs, 10GB corpora). Opt-in per field, like hash/btree indexes: an inverted
-index (token → sorted doc-id list) is built once and maintained on every
-write path. Index memory: ~3-8% of indexed text size.
-
-### `create_text_index(field: &str) -> Result<()>`
-
-Build the inverted index over a text field; tokenizes existing documents
-once. String fields and arrays-of-strings are searchable. `drop_text_index(field)` removes it.
-
-### `text_search(field: &str, search: &TextSearch) -> Result<Vec<String>>`
-
-Returns matching `_id`s. Fails loud (`Err`) if the field has no text index.
-
-```rust
-use ndb::{TextSearch, TextQuery};
-
-let ids = db.text_search("content", &TextSearch::and(vec![
-    TextQuery::Phrase("The hare was tired".into()),
-    TextQuery::Phrase("at the end of the race".into()),
-    TextQuery::Term("paul".into()),
-    TextQuery::Term("yesterday".into()),
-])).unwrap();
-// → stories containing ALL of these (phrases contiguous, case-insensitive)
-```
-
-### Query types
-
-| Type | Matches | Notes |
-|------|---------|-------|
-| `Term(s)` | Whole token `s` | `"race"` never matches `"racetrack"` |
-| `Phrase(s)` | The words of `s` contiguous, in order | The headline use case |
-| `Prefix(s)` | Any token starting with `s` | `"yester"` matches `"yesterday"` |
-| `Exclude(q)` | NOT the inner query | Only meaningful alongside a positive query |
-
-### Modes & flags
-
-- `TextMode::And` — doc must match every positive query (set intersection,
-  rarest-first). `TextMode::Or` — any (union).
-- `case_sensitive: bool` — default false. Case-insensitive: index-only.
-  Case-sensitive: verified against raw text of the shortlisted candidates.
-- Validation (`validate()`): rejects all-exclude query sets, empty strings,
-  nested excludes — fail loud at the boundary, not mid-query.
-
-### Semantics notes
-
-- Tokenization: Unicode alphanumeric runs, lowercased. German umlauts and
-  numbers tokenize sanely.
-- AND queries are evaluated rarest-token-first; query cost scales with
-  result-set size, not corpus size.
-- Measured (release, 55MB / 1000 stories): 4-part AND phrase query 7.4ms,
-  single term 25µs, index build 778ms single-threaded.
+There is no full-text layer in nDB. `create_text_index`, `create_text_index_with_threads`, `drop_text_index`, `has_text_index`, `text_search`, `TextSearch`/`TextQuery`/`TextMode` and `src/search.rs` were deleted in **v2.0.0** (zero production callers). Full-text, lexical, vector, hybrid and reranked search belong to **`nVDB`**. Structured filters, sort, projection, pagination and the typed Hash/BTree indexes are unchanged.
 
 ---
 
@@ -402,7 +351,7 @@ let ids = db.text_search("content", &TextSearch::and(vec![
 
 Execute a JSON AST query. The AST is a plain JSON object representing filter conditions.
 
-The AST is **validated before execution** (G4): an unknown operator, malformed combinator, or non-object root returns `Err(InvalidArgument)` — on every path (library, napi, HTTP), never a silent full-DB scan. `validate_query_ast` is the same check, exposed for pre-flight validation.
+The AST is **validated before execution** (G4): an unknown operator, malformed combinator, or non-object root returns `Err(InvalidArgument)` — on every path (library, HTTP), never a silent full-DB scan. `validate_query_ast` is the same check, exposed for pre-flight validation.
 
 Indexable conjuncts are planned first (see **Query planner** under *Index
 Management*): the scan is narrowed to index candidates and each candidate is
@@ -433,13 +382,11 @@ let results = db.query_with(
 );
 ```
 
-### `query_projected(ast: Value, opts: QueryOptions, fields: Option<&[String]>, text_ids: Option<&HashSet<String>>) -> (usize, Vec<Value>)`
+### `query_projected(ast: Value, opts: QueryOptions, fields: Option<&[String]>) -> (usize, Vec<Value>)`
 
 Query returning only the requested fields (plus `_id`). At multi-GB scale this is the right query entry point: under the read lock it clones only the sort key and projected fields (never whole documents), then sorts/paginates outside the lock — writers are not blocked by result materialization. `fields: None` behaves like `query_with`.
 
 Returns `(total, page)`: `total` is the pre-pagination match count, `page` the projected/sorted/paginated rows.
-
-`text_ids: Some(set)` intersects the filter with a full-text candidate set (doc ids from `text_search`) — the way `/query`'s `text` field works. `None` = no text constraint.
 
 ```rust
 let (total, names) = db.query_projected(
@@ -453,7 +400,7 @@ let (total, names) = db.query_projected(
 
 ### `validate_query_ast(ast: &Value) -> Result<()>`
 
-Validate a query AST before executing it. Rejects unknown operators (`$eqq` → `Err`), malformed combinators (non-array `$and`, empty `$and`), and non-object roots. Every key in a field-condition operator object must be a known operator (`$eq $ne $gt $gte $lt $lte $in $nin $exists`) — this makes validation and evaluation agree, with the consequence that implicit `$eq` on nested object values (`{"field": {"a": 1}}`) is not supported. **`query()`/`query_with()`/`query_projected()` run this same validation themselves** (G4): a typo'd operator is `Err(InvalidArgument)` on every path — library, napi, HTTP — never a silent match-everything scan. The exposed function remains useful to validate before doing other work in request handlers.
+Validate a query AST before executing it. Rejects unknown operators (`$eqq` → `Err`), malformed combinators (non-array `$and`, empty `$and`), and non-object roots. Every key in a field-condition operator object must be a known operator (`$eq $ne $gt $gte $lt $lte $in $nin $exists`) — this makes validation and evaluation agree, with the consequence that implicit `$eq` on nested object values (`{"field": {"a": 1}}`) is not supported. **`query()`/`query_with()`/`query_projected()` run this same validation themselves** (G4): a typo'd operator is `Err(InvalidArgument)` on every path — library, HTTP — never a silent match-everything scan. The exposed function remains useful to validate before doing other work in request handlers.
 
 ### Path resolution (reads)
 

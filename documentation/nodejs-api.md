@@ -1,17 +1,14 @@
-# nDB Node.js API Reference
+# nDB Node.js API Reference (REMOVED in v2.0.0)
 
-> Complete API documentation for the `ndb` Node.js native addon.---
+> ⚠️ **This API no longer exists.** The `napi/` native addon, its `.node` prebuilts, `index.js`, `vendor.js` and `setup.js` were **deleted in nDB v2.0.0** (2026-11-23). Node and Electron consumers use the `ndb serve` HTTP API instead — see `documentation/cli.md` and `docs/ndb-serve-design.md`.
+>
+> What follows is the historical reference for v1.x, kept only so old call sites can be migrated. Do not treat any method here as available.
 
-## Installation
+---
 
-```bash
-npm install ndb
-```
+## Installation (v1.x, historical)
 
-The package includes prebuilt native binaries for:
-- Windows x64
-- macOS x64 / arm64
-- Linux x64
+The v1.x package shipped prebuilt native binaries for Windows x64, macOS x64/arm64 and Linux x64.
 
 ---
 
@@ -266,7 +263,7 @@ Get all active (non-deleted) documents.
 const allDocs = db.iter();
 ```
 
-> ⚠️ **Size limit:** `iter()` marshals the entire database as one JSON string across the napi boundary. Very large databases can exceed napi's string size limit (~2 GB) and throw. For bulk reads on large corpora, page with `queryWith({ limit, offset })` instead (each page crosses the boundary separately).
+> ⚠️ **Size limit (v1.x only):** `iter()` marshalled the entire database as one JSON string across the (now removed) napi boundary. Node consumers on v2.0.0 use `POST /v2/dbs/{name}/query` with `limit`/`offset` paging.
 
 ---
 

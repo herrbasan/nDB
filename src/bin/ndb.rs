@@ -197,8 +197,6 @@ fn print_usage() {
     eprintln!("  --scheduled-ms <n>  Flush interval for persistence=scheduled (default 5000)");
     eprintln!("  --max-limit <n>     Hard cap for an explicit query limit (default 50000)");
     eprintln!("  --default-limit <n> Page size when a query omits limit (default 1000)");
-    eprintln!("  --text-index <f>  Build a full-text index on field <f> at boot (repeatable;");
-    eprintln!("                     cached on disk - unchanged journal boots instantly)");
     eprintln!("  --threads <n>     Worker threads: connections + index builds (default: all cores)");
 }
 
@@ -209,7 +207,6 @@ fn handle_serve(args: &[String]) {
     };
 
     let mut config = ServerConfig::default();
-    let mut text_indexes: Vec<String> = Vec::new();
     let mut positional: Option<std::path::PathBuf> = None;
     let mut config_file: Option<std::path::PathBuf> = None;
     let mut cli_dbs: Vec<(String, String)> = Vec::new();
@@ -247,7 +244,6 @@ fn handle_serve(args: &[String]) {
                     Err(e) => fatal(&e.to_string()),
                 }
             }
-            "--text-index" => text_indexes.push(value("--text-index")),
             "--threads" => {
                 let raw = value("--threads");
                 config.threads = match raw.parse::<usize>() {
@@ -343,7 +339,6 @@ fn handle_serve(args: &[String]) {
             config.default_limit, config.max_limit
         ));
     }
-    config.text_indexes = text_indexes;
 
     let persistence = cli_persistence
         .or(file_persistence)

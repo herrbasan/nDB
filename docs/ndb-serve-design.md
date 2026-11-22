@@ -2,13 +2,16 @@
 
 > Status: **IMPLEMENTED** (v1.3, commit f17a016 + core prerequisites 0ea6afd/0031b1d). Tracks issue #2.
 > Decisions agreed 2026-08-26 (herrbasan + Copilot session). Reviewed 2026-08-27 (Kimi) — prerequisites landed before the server.
+> **v2.0.0 (2026-11-23):** `ndb serve` is the only interface besides the CLI and the embeddable Rust crate.
+> The napi Node binding crate was removed; `mcp_server` and `LLM-Gateway-Chat` speak this HTTP API.
+> Full-text search (`/search`, `text` indexes, `text` query constraint) was removed with it — full-text,
+> lexical, vector and hybrid search are owned by `nVDB`.
 > Change via this file, not memory.
 
 ## Motivation
 
-nDB has two interfaces: napi (in-process Node) and CLI (one-shot). Neither fits the case of a **large shared database (4–10 GB) queried by Node apps that must not hold the data in their own heap**.
+nDB has two interfaces: CLI (one-shot) and the embeddable Rust crate. Neither fits the case of a **large shared database (4–10 GB) queried by apps that must not hold the data in their own heap**. (A third interface, the napi in-process Node binding, existed until v2.0.0 and was removed then.)
 
-- napi: every Node process embeds its own full copy of the DB in the Node heap. N apps = N copies. At 10 GB this is untenable, and napi's ~2 GB string marshaling limit caps bulk reads (`iter()`) outright.
 - CLI: process spawn per operation = full JSONL replay each time. Useless for queries.
 
 `ndb serve` is the third interface: a **resident Rust daemon** that owns the database in memory. Data and computation stay in Rust; only results cross to the Node process. One process holds the 10 GB; N clients share it.
@@ -129,7 +132,7 @@ ndb serve --dir <root>                 # mount every child folder holding data.j
 ndb serve --config <file.json>         # service config; explicit CLI flags win
 ```
 
-Flags: `--bind`, `--port`, `--token`, `--persistence immediate|scheduled|lazy` (default `immediate`), `--scheduled-ms <n>` (default 5000), `--max-limit <n>` (default 50000), `--default-limit <n>` (default 1000), `--text-index <field>` (repeatable, applied to every mounted DB at boot), `--threads <n>`.
+Flags: `--bind`, `--port`, `--token`, `--persistence immediate|scheduled|lazy` (default `immediate`), `--scheduled-ms <n>` (default 5000), `--max-limit <n>` (default 50000), `--default-limit <n>` (default 1000), `--threads <n>`.
 
 Startup aborts loudly when: no source was given; a configured/discovered DB fails to open; a name or a canonical path is duplicated (including `./`, `../`, folder-vs-journal aliases); a discovered folder name is not a valid DB name; `--dir` does not exist.
 
@@ -162,9 +165,9 @@ Auth: the configured bearer token is required on **every** route.
   - `GET  /stats`, `GET /lineage`
   - `GET  /doc/{id}` (`?fields=a,b`), `PUT /doc` (`?prefix=p`), `PUT /doc/{id}`, `PATCH /doc/{id}`, `DELETE /doc/{id}`, `POST /doc/{id}/restore`
   - `POST /docs/mget` (`{ids, fields?}` → `{docs: {id: doc}, missing: [id]}`; ids deduplicated, at most 1000 per call — more is `413 payload_too_large`)
-  - `POST /query` (`filter? sort? offset? limit? fields? text?`; `limit` ≤ `max_limit`, default `default_limit`; `took_ms`)
-  - `POST /find`, `POST /facets`, `POST /search` (+ `took_ms`)
-  - `POST /index` (`hash|btree|text`, idempotent → `created: bool`)
+  - `POST /query` (`filter? sort? offset? limit? fields?`; `limit` ≤ `max_limit`, default `default_limit`; `took_ms`)
+  - `POST /find`, `POST /facets` (+ `took_ms`)
+  - `POST /index` (`hash|btree`, idempotent → `created: bool`)
   - `POST /compact` (synchronous → `lineage`), `POST /flush`
   - `GET  /changes?since=&limit=` → `{ok, source_epoch_uuid, from_seq, to_seq, last_seq, has_more, changes}`; each change is `{seq, id, kind: "upsert"|"delete", doc?}`. `409 cursor_expired` / `409 cursor_ahead`; `400` without a valid `since` or with `limit=0`.
   - `GET  /snapshot?offset=&limit=&snapshot_id=` → `{ok, source_epoch_uuid, watermark_seq, snapshot_id, total, count, docs}` (docs sorted by id). A paginated call pins the frozen snapshot (300 s TTL) and returns `snapshot_id`; pass it back with a new `offset` to page the *same* state instead of drifting under concurrent writes. An unknown/expired/foreign id is `410 snapshot_expired`.

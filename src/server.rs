@@ -1,4 +1,5 @@
-//! ndb serve — resident HTTP daemon (third interface alongside CLI and napi).
+//! ndb serve — resident HTTP daemon (third interface alongside CLI and the
+//! embeddable Rust crate).
 //!
 //! Design: docs/ndb-serve-design.md (issue #2).
 //! Hand-rolled HTTP/1.1 on std::net — zero new crates. Thread-per-connection
@@ -7,10 +8,7 @@
 
 use crate::bucket::mime_for_extension;
 use crate::report;
-use crate::{
-    ChangeEvent, ChangeKind, Database, Error, PatchOp, Persistence, QueryOptions, SortDir, TextMode,
-    TextQuery, TextSearch,
-};
+use crate::{ChangeEvent, ChangeKind, Database, Error, PatchOp, Persistence, QueryOptions, SortDir};
 use parking_lot::{Condvar, Mutex, RwLock};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -43,9 +41,6 @@ pub struct ServerConfig {
     /// Hard cap for an explicit `limit`. Larger values are rejected (400),
     /// never silently truncated.
     pub max_limit: usize,
-    /// Text fields to index at boot (cache-aware). Named like serve's
-    /// --text-index flag: one entry per field.
-    pub text_indexes: Vec<String>,
     /// Threads for index (re)builds. 0 = all logical cores.
     pub threads: usize,
 }
@@ -60,7 +55,6 @@ impl Default for ServerConfig {
             max_body: 64 * 1024 * 1024,
             default_limit: 1000,
             max_limit: 50_000,
-            text_indexes: Vec::new(),
             threads: 0,
         }
     }
@@ -827,15 +821,6 @@ fn serve_multi_listener_shutdown(
     config: ServerConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Error> {
-    // Boot indexes on every mounted database: cache hit → instant; miss →
-    // build + cache. A field with no documents is an empty index, not a
-    // failure, so a shared --text-index list works across databases.
-    for (name, db) in registry.entries() {
-        for field in &config.text_indexes {
-            db.create_text_index_with_threads(field, config.threads)?;
-            eprintln!("text index ready: {}/{}", name, field);
-        }
-    }
     let config = Arc::new(config);
     let workers = worker_count(&config);
     let queue = JobQueue::new(config.max_connections);
@@ -1175,7 +1160,6 @@ fn route(registry: &Arc<DbRegistry>, config: &ServerConfig, req: &Request) -> Re
 
         ("POST", ["query"]) => return respond_query(&db, config, req),
         ("POST", ["find"]) => handle_find(&db, req),
-        ("POST", ["search"]) => handle_search(&db, config, req),
         ("POST", ["facets"]) => handle_facets(&db, req),
 
         ("GET", ["doc", id]) => handle_get_doc(&db, req, id),
@@ -1243,27 +1227,8 @@ fn respond_query(db: &Database, config: &ServerConfig, req: &Request) -> Respons
         .and_then(|f| f.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
 
-    // Optional text constraint: filter ∩ full-text candidate set.
-    // Absent → no constraint, zero overhead.
-    let text_ids: Option<std::collections::HashSet<String>> = match body.get("text") {
-        Some(t) => {
-            let (tfield, tsearch) = match parse_text_search(t) {
-                Ok(v) => v,
-                Err((status, body)) => return Response::Json(status, body),
-            };
-            match db.text_search(&tfield, &tsearch) {
-                Ok(ids) => Some(ids.into_iter().collect()),
-                Err(e) => {
-                    let (status, body) = db_error(e);
-                    return Response::Json(status, body);
-                }
-            }
-        }
-        None => None,
-    };
-
     if fields.is_none() {
-        return match db.query_raw(filter, opts, text_ids.as_ref()) {
+        return match db.query_raw(filter, opts) {
             Ok((total, rows)) => Response::JsonRaw(200, query_raw_body(total, &rows, None)),
             Err(e) => {
                 let (status, body) = db_error(e);
@@ -1272,7 +1237,7 @@ fn respond_query(db: &Database, config: &ServerConfig, req: &Request) -> Respons
         };
     }
 
-    match db.query_projected(filter, opts, fields.as_deref(), text_ids.as_ref()) {
+    match db.query_projected(filter, opts, fields.as_deref()) {
         Ok((total, results)) => Response::Json(
             200,
             json!({
@@ -1323,135 +1288,6 @@ fn parse_query_options(body: &Value, config: &ServerConfig, limit_cap: usize) ->
     }
 
     Ok(opts)
-}
-
-/// Parse {field, mode, case_sensitive?, queries:[{type, value, exclude?}]} from a
-/// JSON object into a TextSearch. Shared by /search (body root) and /query (body["text"]).
-fn parse_text_search(obj: &Value) -> Result<(String, TextSearch), (u16, Value)> {
-    let field = match obj.get("field").and_then(|v| v.as_str()) {
-        Some(f) => f.to_string(),
-        None => return Err((400, json!({"error": "field required"}))),
-    };
-
-    let mode = match obj.get("mode").and_then(|v| v.as_str()).unwrap_or("and") {
-        "and" => TextMode::And,
-        "or" => TextMode::Or,
-        other => {
-            return Err((
-                400,
-                json!({"error": format!("mode must be 'and' or 'or', got '{}'", other)}),
-            ))
-        }
-    };
-
-    let case_sensitive = obj.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false);
-
-    let raw_queries = match obj.get("queries").and_then(|q| q.as_array()) {
-        Some(q) if !q.is_empty() => q,
-        _ => return Err((400, json!({"error": "queries: non-empty array required"}))),
-    };
-
-    let mut queries = Vec::with_capacity(raw_queries.len());
-    for q in raw_queries {
-        let qtype = q.get("type").and_then(|v| v.as_str()).unwrap_or("term");
-        let value = match q.get("value").and_then(|v| v.as_str()) {
-            Some(v) if !v.trim().is_empty() => v.to_string(),
-            _ => return Err((400, json!({"error": "each query needs a non-empty value"}))),
-        };
-        let inner = match qtype {
-            "term" => TextQuery::Term(value),
-            "phrase" => TextQuery::Phrase(value),
-            "prefix" => TextQuery::Prefix(value),
-            other => {
-                return Err((
-                    400,
-                    json!({"error": format!("query type must be term|phrase|prefix, got '{}'", other)}),
-                ))
-            }
-        };
-        if q.get("exclude").and_then(|v| v.as_bool()).unwrap_or(false) {
-            queries.push(TextQuery::Exclude(Box::new(inner)));
-        } else {
-            queries.push(inner);
-        }
-    }
-
-    let search = TextSearch { mode, case_sensitive, queries };
-    if let Err(e) = search.validate() {
-        return Err((400, json!({"error": e.to_string()})));
-    }
-    Ok((field, search))
-}
-
-/// POST /search — full-text search over a text-indexed field.
-/// Body: {field, mode: "and"|"or", case_sensitive?, queries: [{type, value, exclude?}],
-///         fields?, limit?, offset?}
-fn handle_search(db: &Database, config: &ServerConfig, req: &Request) -> (u16, Value) {
-    let body = match parse_body(req) {
-        Ok(b) => b,
-        Err(e) => return e,
-    };
-    do_search(db, config, &body)
-}
-
-fn do_search(db: &Database, config: &ServerConfig, body: &Value) -> (u16, Value) {
-    let (field, search) = match parse_text_search(body) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-
-    let ids = match db.text_search(&field, &search) {
-        Ok(ids) => ids,
-        Err(e) => {
-            let (status, body) = db_error(e);
-            return (status, body);
-        }
-    };
-    let total = ids.len();
-
-    // Hydrate results with optional projection, honoring limit/offset.
-    let limit = body
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(config.default_limit)
-        .min(config.default_limit);
-    let offset = body.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-
-    let fields: Option<Vec<String>> = body
-        .get("fields")
-        .and_then(|f| f.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
-
-    let page: Vec<Value> = ids
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .filter_map(|id| db.get(&id).ok())
-        .map(|doc| match &fields {
-            Some(fs) => {
-                let mut out = serde_json::Map::new();
-                for f in fs {
-                    if let Some(v) = crate::field_get(&doc, f) {
-                        out.insert(f.clone(), v.clone());
-                    }
-                }
-                out.insert("_id".to_string(), json!(doc["_id"]));
-                Value::Object(out)
-            }
-            None => doc,
-        })
-        .collect();
-
-    (
-        200,
-        json!({
-            "ok": true,
-            "count": page.len(),
-            "total": total,
-            "results": page,
-        }),
-    )
 }
 
 /// POST /facets — term counts per field. Array fields count per element,
@@ -1720,8 +1556,7 @@ fn handle_create_index(db: &Database, req: &Request) -> (u16, Value) {
     let result = match kind {
         "hash" => db.create_index(field),
         "btree" => db.create_btree_index(field),
-        "text" => db.create_text_index(field),
-        other => return (400, json!({"error": format!("type must be hash, btree or text, got '{}'", other)})),
+        other => return (400, json!({"error": format!("type must be hash or btree, got '{}'", other)})),
     };
     match result {
         Ok(()) => (201, json!({"ok": true, "index": field, "type": kind})),
@@ -2027,7 +1862,6 @@ fn route_v2(
         ("POST", ["query"]) => return respond_v2_query(&db, config, req),
         ("POST", ["find"]) => handle_v2_find(&db, req),
         ("POST", ["facets"]) => handle_v2_facets(&db, req),
-        ("POST", ["search"]) => handle_v2_search(&db, config, req),
 
         ("GET", ["doc", id]) => handle_v2_get_doc(&db, req, id),
         ("PUT", ["doc"]) => handle_v2_insert(&db, req),
@@ -2101,25 +1935,9 @@ fn respond_v2_query(db: &Database, config: &ServerConfig, req: &Request) -> Resp
     });
 
     let start = Instant::now();
-    let text_ids: Option<HashSet<String>> = match body.get("text") {
-        Some(t) => {
-            let (tfield, tsearch) = match parse_text_search(t) {
-                Ok(v) => v,
-                Err((status, body)) => return Response::Json(status, body),
-            };
-            match db.text_search(&tfield, &tsearch) {
-                Ok(ids) => Some(ids.into_iter().collect()),
-                Err(e) => {
-                    let (status, body) = map_db_error(e);
-                    return Response::Json(status, body);
-                }
-            }
-        }
-        None => None,
-    };
 
     if fields.is_none() {
-        return match db.query_raw(filter, opts, text_ids.as_ref()) {
+        return match db.query_raw(filter, opts) {
             Ok((total, rows)) => Response::JsonRaw(
                 200,
                 query_raw_body(total, &rows, Some(elapsed_ms(start))),
@@ -2131,7 +1949,7 @@ fn respond_v2_query(db: &Database, config: &ServerConfig, req: &Request) -> Resp
         };
     }
 
-    match db.query_projected(filter, opts, fields.as_deref(), text_ids.as_ref()) {
+    match db.query_projected(filter, opts, fields.as_deref()) {
         Ok((total, results)) => Response::Json(
             200,
             json!({
@@ -2241,19 +2059,6 @@ fn handle_v2_facets(db: &Database, req: &Request) -> (u16, Value) {
         facets.insert(field, Value::Object(m));
     }
     (200, json!({"ok": true, "facets": facets}))
-}
-
-fn handle_v2_search(db: &Database, config: &ServerConfig, req: &Request) -> (u16, Value) {
-    let body = match parse_body_v2(req) {
-        Ok(b) => b,
-        Err(e) => return e,
-    };
-    let start = Instant::now();
-    let (status, mut value) = do_search(db, config, &body);
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("took_ms".to_string(), json!(elapsed_ms(start)));
-    }
-    (status, value)
 }
 
 fn projection_from_params(params: &[(String, String)]) -> Option<Vec<String>> {
@@ -2486,21 +2291,11 @@ fn handle_v2_create_index(db: &Database, req: &Request) -> (u16, Value) {
                 }
             }
         }
-        "text" => {
-            if db.has_text_index(field) {
-                false
-            } else {
-                match db.create_text_index(field) {
-                    Ok(()) => true,
-                    Err(e) => return map_db_error(e),
-                }
-            }
-        }
         other => {
             return v2_error(
                 400,
                 "invalid_index_type",
-                format!("type must be hash, btree or text, got '{other}'"),
+                format!("type must be hash or btree, got '{other}'"),
             )
         }
     };

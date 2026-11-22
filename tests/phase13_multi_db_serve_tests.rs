@@ -566,14 +566,15 @@ fn crud_prefix_mget_patch_restore_and_query() {
     let (status, body) = post(
         p,
         "/v2/dbs/workshop/index",
-        &json!({"field": "name", "type": "text"}),
+        &json!({"field": "name", "type": "btree"}),
     );
     assert_eq!(status, 200, "{}", body);
     assert_eq!(body["created"], true);
+    assert_eq!(body["type"], "btree");
     let (status, body) = post(
         p,
         "/v2/dbs/workshop/index",
-        &json!({"field": "name", "type": "text"}),
+        &json!({"field": "name", "type": "btree"}),
     );
     assert_eq!(status, 200, "{}", body);
     assert_eq!(body["created"], false);
@@ -585,16 +586,20 @@ fn crud_prefix_mget_patch_restore_and_query() {
     );
     assert_eq!(status, 400);
 
-    // Full-text search + took_ms.
+    // Full-text belongs to nVDB: neither the index type nor the route exists.
     let (status, body) = post(
+        p,
+        "/v2/dbs/workshop/index",
+        &json!({"field": "name", "type": "text"}),
+    );
+    assert_eq!(status, 400, "{}", body);
+    assert_eq!(body["error"], "invalid_index_type");
+    let (status, _) = post(
         p,
         "/v2/dbs/workshop/search",
         &json!({"field": "name", "queries": [{"type": "term", "value": "dave"}]}),
     );
-    assert_eq!(status, 200, "{}", body);
-    assert_eq!(body["total"], 1);
-    assert_eq!(body["results"][0]["name"], "dave");
-    assert!(body["took_ms"].as_f64().is_some());
+    assert_eq!(status, 404, "/search is gone; nVDB owns full-text");
 
     // flush is a synchronous no-drama call.
     let (status, body) = post(p, "/v2/dbs/workshop/flush", &json!({}));
