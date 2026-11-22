@@ -1935,7 +1935,6 @@ impl V2Engine {
             state.manifest.indexes.push(spec.clone());
             state.lineage.last_seq = seq;
         }
-        self.push_change(seq, &spec.field, None);
         Ok(())
     }
 
@@ -1963,18 +1962,25 @@ impl V2Engine {
         self.btree_indexes.write().remove(field);
         self.wal_hash_indexes.write().remove(field);
         self.wal_btree_indexes.write().remove(field);
-        self.push_change(seq, field, None);
         Ok(())
     }
 
     pub(crate) fn has_index(&self, field: &str) -> bool {
-        {
-            let state = self.state.read();
-            if persisted_index(&state.base, &state.manifest, field).is_some() {
-                return true;
-            }
+        self.has_hash_index(field) || self.has_btree_index(field)
+    }
+
+    pub(crate) fn has_hash_index(&self, field: &str) -> bool {
+        if self.state.read().manifest.indexes.iter().any(|d| d.field == field && d.kind == V2IndexKind::Hash) {
+            return true;
         }
-        self.hash_indexes.read().contains_key(field) || self.btree_indexes.read().contains_key(field)
+        self.hash_indexes.read().contains_key(field)
+    }
+
+    pub(crate) fn has_btree_index(&self, field: &str) -> bool {
+        if self.state.read().manifest.indexes.iter().any(|d| d.field == field && d.kind == V2IndexKind::BTree) {
+            return true;
+        }
+        self.btree_indexes.read().contains_key(field)
     }
 
     // ─── Full-text indexes ──────────────────────────────────────────

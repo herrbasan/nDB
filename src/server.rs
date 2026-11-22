@@ -2467,24 +2467,33 @@ fn handle_v2_create_index(db: &Database, req: &Request) -> (u16, Value) {
     let kind = body.get("type").and_then(|v| v.as_str()).unwrap_or("hash");
     let created = match kind {
         "hash" => {
-            let had = db.has_index(field);
-            match db.create_index(field) {
-                Ok(()) => !had,
-                Err(e) => return map_db_error(e),
+            if db.has_hash_index(field) {
+                false
+            } else {
+                match db.create_index(field) {
+                    Ok(()) => true,
+                    Err(e) => return map_db_error(e),
+                }
             }
         }
         "btree" => {
-            let had = db.has_index(field);
-            match db.create_btree_index(field) {
-                Ok(()) => !had,
-                Err(e) => return map_db_error(e),
+            if db.has_btree_index(field) {
+                false
+            } else {
+                match db.create_btree_index(field) {
+                    Ok(()) => true,
+                    Err(e) => return map_db_error(e),
+                }
             }
         }
         "text" => {
-            let had = db.has_text_index(field);
-            match db.create_text_index(field) {
-                Ok(()) => !had,
-                Err(e) => return map_db_error(e),
+            if db.has_text_index(field) {
+                false
+            } else {
+                match db.create_text_index(field) {
+                    Ok(()) => true,
+                    Err(e) => return map_db_error(e),
+                }
             }
         }
         other => {

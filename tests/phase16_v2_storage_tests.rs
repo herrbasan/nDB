@@ -1013,6 +1013,21 @@ fn multi_db_v2_serve_http_end_to_end() {
         assert_eq!(db["db"]["documents"], json!(1));
     }
 
+    // Idempotent index creation (repeated calls return created:false without
+    // writing WAL frames or failing).
+    let (status, idx1) = http.json("POST", "/v2/dbs/alpha/index", &json!({"field": "n", "type": "hash"}));
+    assert_eq!(status, 200, "{idx1}");
+    assert_eq!(idx1["created"], json!(true));
+    let (status, idx2) = http.json("POST", "/v2/dbs/alpha/index", &json!({"field": "n", "type": "hash"}));
+    assert_eq!(status, 200, "{idx2}");
+    assert_eq!(idx2["created"], json!(false));
+    let (status, idx3) = http.json("POST", "/v2/dbs/alpha/index", &json!({"field": "score", "type": "btree"}));
+    assert_eq!(status, 200, "{idx3}");
+    assert_eq!(idx3["created"], json!(true));
+    let (status, idx4) = http.json("POST", "/v2/dbs/alpha/index", &json!({"field": "score", "type": "btree"}));
+    assert_eq!(status, 200, "{idx4}");
+    assert_eq!(idx4["created"], json!(false));
+
     // CRUD on alpha.
     let (status, created) = http.json("PUT", "/v2/dbs/alpha/doc", &json!({"n": 1, "kind": "a"}));
     assert_eq!(status, 201, "{created}");
@@ -1081,11 +1096,12 @@ fn multi_db_v2_serve_http_end_to_end() {
     assert_eq!(rows[0]["n"], json!(3));
     assert_eq!(rows[1]["n"], json!(2));
 
-    // Change feed from the beginning.
+    // Change feed from the beginning: 2 idempotent-checked IndexAdd frames
+    // advanced last_seq to 6 without emitting bogus document delete events.
     let (status, changes) = http.json("GET", "/v2/dbs/alpha/changes?since=0", &Value::Null);
     assert_eq!(status, 200);
     assert_eq!(changes["ok"], json!(true));
-    assert_eq!(changes["last_seq"], json!(4));
+    assert_eq!(changes["last_seq"], json!(6));
     assert_eq!(changes["changes"].as_array().unwrap().len(), 4);
 
     // Pinned snapshot pages come from one frozen state.
@@ -1169,7 +1185,7 @@ fn multi_db_v2_serve_http_end_to_end() {
     // writer lock the still-mounted registry holds).
     let alpha_report = fsck_clean(&root.path().join("alpha"));
     let beta_report = fsck_clean(&root.path().join("beta"));
-    assert_eq!(alpha_report.last_seq, 4);
+    assert_eq!(alpha_report.last_seq, 6);
     assert_eq!(beta_report.last_seq, 1);
     // The registry's own handle sees the final state, and the on-disk base +
     // WAL carry it: 3 live documents for alpha, 1 for beta.

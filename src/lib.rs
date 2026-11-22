@@ -3367,6 +3367,22 @@ impl Database {
             || self.btree_indexes.read().contains_key(field)
     }
 
+    /// Check if a hash index exists for a field.
+    pub fn has_hash_index(&self, field: &str) -> bool {
+        if let Some(v2) = &self.v2 {
+            return v2.has_hash_index(field);
+        }
+        self.hash_indexes.read().contains_key(field)
+    }
+
+    /// Check if a BTree index exists for a field.
+    pub fn has_btree_index(&self, field: &str) -> bool {
+        if let Some(v2) = &self.v2 {
+            return v2.has_btree_index(field);
+        }
+        self.btree_indexes.read().contains_key(field)
+    }
+
     /// Check if a full-text index exists for a field.
     pub fn has_text_index(&self, field: &str) -> bool {
         if let Some(v2) = &self.v2 {
