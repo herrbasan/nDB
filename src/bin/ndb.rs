@@ -133,6 +133,7 @@ fn main() {
 
     match command {
         "init" => handle_init(&args[2..]),
+        "migrate" => handle_migrate(&args[2..]),
         "destroy" | "drop" => handle_destroy(&args[2..]),
         "info" => handle_info(&args[2..]),
         "compact" => handle_compact(&args[2..]),
@@ -140,6 +141,7 @@ fn main() {
         "import" => handle_import(&args[2..]),
         "merge" => handle_merge(&args[2..]),
         "verify" | "check" => handle_verify(&args[2..]),
+        "fsck" => handle_fsck(&args[2..]),
         "repair" => handle_repair(&args[2..]),
         "recover" => handle_recover(&args[2..]),
         "dump" => handle_dump(&args[2..]),
@@ -159,15 +161,18 @@ fn print_usage() {
     eprintln!("Usage: ndb <command> [args...]");
     eprintln!("");
     eprintln!("Commands:");
-    eprintln!("  init <path> [--buckets a,b]   Initialize a new database");
+    eprintln!("  init <path> [--buckets a,b] [--v2]  Initialize a new database");
+    eprintln!("  migrate <path>                Migrate a v1 journal to the v2 binary backend");
     eprintln!("  destroy <path> --force        Safely delete a database");
     eprintln!("  info <path>                   Show database statistics");
     eprintln!("  compact <path>                Compact the database in-place");
     eprintln!("  export <path> <dest>          Create a portable snapshot");
+    eprintln!("  export <path> <out.jsonl> --jsonl   Export human-readable JSONL");
     eprintln!("  import <src> <path>           Restore a snapshot");
     eprintln!("  merge <base> <merge-in>       Combine databases");
     eprintln!("  verify <path>                 Check for corruptions");
-    eprintln!("  repair <path>                 Quarantine a corrupt journal and truncate at the last good line");
+    eprintln!("  fsck <path>                   Full integrity check (v1 journal or v2 generations)");
+    eprintln!("  repair <path>                 Quarantine/truncate a corrupt v1 journal or v2 WAL");
     eprintln!("  recover <src> <dest>          Recover corrupted data");
     eprintln!("  dump <path>                   Export JSON Lines to stdout");
     eprintln!("  config <get|set> ...          Manage metadata/config");
@@ -188,6 +193,7 @@ fn print_usage() {
     eprintln!("  --config <file>  JSON config (bind/port/token/persistence/scheduled_ms/");
     eprintln!("                     dir/max_limit/default_limit/dbs)");
     eprintln!("  --persistence <immediate|scheduled|lazy>  Service default (immediate)");
+    eprintln!("  --format <auto|v1|v2>       Format for databases created via POST /v2/dbs (default auto)");
     eprintln!("  --scheduled-ms <n>  Flush interval for persistence=scheduled (default 5000)");
     eprintln!("  --max-limit <n>     Hard cap for an explicit query limit (default 50000)");
     eprintln!("  --default-limit <n> Page size when a query omits limit (default 1000)");
@@ -212,6 +218,7 @@ fn handle_serve(args: &[String]) {
     let mut cli_scheduled_ms: Option<u64> = None;
     let mut cli_max_limit: Option<usize> = None;
     let mut cli_default_limit: Option<usize> = None;
+    let mut cli_format: Option<ndb::StorageFormat> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -233,6 +240,13 @@ fn handle_serve(args: &[String]) {
                 };
             }
             "--token" => config.token = Some(value("--token")),
+            "--format" => {
+                let raw = value("--format");
+                match ndb::StorageFormat::parse(&raw) {
+                    Ok(format) => cli_format = Some(format),
+                    Err(e) => fatal(&e.to_string()),
+                }
+            }
             "--text-index" => text_indexes.push(value("--text-index")),
             "--threads" => {
                 let raw = value("--threads");
@@ -302,6 +316,7 @@ fn handle_serve(args: &[String]) {
     let mut file_dir: Option<std::path::PathBuf> = None;
     let mut file_persistence: Option<PersistenceMode> = None;
     let mut file_scheduled_ms: Option<u64> = None;
+    let mut file_format: Option<ndb::StorageFormat> = None;
     if let Some(path) = &config_file {
         let loaded = ServiceConfig::load(path)
             .unwrap_or_else(|e| fatal(&format!("{}: {e}", path.display())));
@@ -313,6 +328,7 @@ fn handle_serve(args: &[String]) {
             .unwrap_or_else(|e| fatal(&e.to_string()));
         file_dir = loaded.dir.clone();
         file_scheduled_ms = loaded.scheduled_ms;
+        file_format = loaded.format().unwrap_or_else(|e| fatal(&e.to_string()));
     }
 
     if let Some(m) = cli_max_limit {
@@ -352,6 +368,7 @@ fn handle_serve(args: &[String]) {
     }
 
     let registry = DbRegistry::new(root_dir.clone(), persistence, scheduled_ms);
+    registry.set_create_format(cli_format.or(file_format).unwrap_or(ndb::StorageFormat::Auto));
 
     if let Some(path) = &positional {
         // Legacy contract: a positional database must already exist.
@@ -397,7 +414,10 @@ fn handle_serve(args: &[String]) {
             .collect();
         children.sort();
         for child in children {
-            if !(child.join("data.jsonl").exists() || child.join("meta.json").exists()) {
+            if !(child.join("data.jsonl").exists()
+                || child.join("manifest.json").exists()
+                || child.join("meta.json").exists())
+            {
                 continue;
             }
             let Some(name) = child.file_name().map(|n| n.to_string_lossy().to_string()) else {
@@ -430,7 +450,7 @@ fn handle_serve(args: &[String]) {
 
 fn handle_init(args: &[String]) {
     if args.is_empty() {
-        eprintln!("Usage: ndb init <path> [--buckets a,b]");
+        eprintln!("Usage: ndb init <path> [--buckets a,b] [--v2]");
         process::exit(EXIT_GENERAL_ERROR);
     }
     let path = Path::new(&args[0]);
@@ -439,15 +459,23 @@ fn handle_init(args: &[String]) {
         process::exit(EXIT_GENERAL_ERROR);
     }
     
-    // Parse buckets
+    // Parse buckets and the v2 flag
     let mut buckets = Vec::new();
+    let mut v2 = false;
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--buckets" && i + 1 < args.len() {
             buckets = args[i + 1].split(',').map(|s| s.trim().to_string()).collect();
-            break;
+            i += 2;
+            continue;
         }
-        i += 1;
+        if args[i] == "--v2" {
+            v2 = true;
+            i += 1;
+            continue;
+        }
+        eprintln!("Error: unknown init argument '{}'", args[i]);
+        process::exit(EXIT_GENERAL_ERROR);
     }
 
     // Create directory structure
@@ -495,7 +523,20 @@ fn handle_init(args: &[String]) {
     }
 
     // Write the empty journal with a lineage header: a new database gets a fresh
-    // epoch, nothing committed, full history.
+    // epoch, nothing committed, full history. A v2 database initialises a
+    // manifest + empty base/WAL generation instead; it never writes data.jsonl.
+    if v2 {
+        match ndb::Database::open_v2(path) {
+            Ok(db) => drop(db),
+            Err(e) => {
+                eprintln!("Failed to initialise the v2 database: {e}");
+                process::exit(EXIT_GENERAL_ERROR);
+            }
+        }
+        println!("Initialized v2 database at {}", path.display());
+        process::exit(EXIT_SUCCESS);
+    }
+
     if let Err(e) = ndb::storage::init_file(
         &path.join("data.jsonl"),
         &ndb::storage::SourceLineage::fresh(),
@@ -506,6 +547,319 @@ fn handle_init(args: &[String]) {
 
     println!("Initialized database at {}", path.display());
     process::exit(EXIT_SUCCESS);
+}
+
+/// `ndb migrate <path>` — convert a v1 JSONL database folder to v2.
+///
+/// Staged in `<dir>/.migrating/` so a crash mid-run leaves the live database
+/// untouched and a rerun starts clean. The source journal is renamed to
+/// `data.jsonl.v1.bak` only after the staged v2 generation has been verified
+/// byte-for-byte at the document level and moved into place.
+fn handle_migrate(args: &[String]) {
+    if args.len() != 1 {
+        eprintln!("Usage: ndb migrate <path>");
+        process::exit(EXIT_GENERAL_ERROR);
+    }
+    let input = Path::new(&args[0]);
+    let dir = if input.is_dir() {
+        input.to_path_buf()
+    } else {
+        input
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| Path::new(".").to_path_buf())
+    };
+    let journal = dir.join("data.jsonl");
+
+    if dir.join(ndb::MANIFEST_FILE).exists() {
+        fatal(&format!(
+            "{} is already a v2 database (manifest.json exists)",
+            dir.display()
+        ));
+    }
+    if !journal.exists() {
+        fatal(&format!("no v1 journal at {}", journal.display()));
+    }
+
+    // Opening takes the OS writer lock: a database served by another process
+    // is refused here, which is exactly the maintenance guarantee needed
+    // before rewriting any of its artefacts.
+    let db = match ndb::Database::open(&journal) {
+        Ok(db) => db,
+        Err(e) => fatal(&format!(
+            "cannot open {}: {e} (is a service still running on this database?)",
+            journal.display()
+        )),
+    };
+    let lineage = db.lineage();
+    let snapshot = db.snapshot_at();
+    let mut docs: Vec<(String, u64, Vec<u8>)> = Vec::with_capacity(snapshot.docs.len());
+    for (id, doc) in &snapshot.docs {
+        let doc_seq = db.doc_seq(id).unwrap_or(lineage.last_seq);
+        let bytes = match serde_json::to_vec(doc) {
+            Ok(bytes) => bytes,
+            Err(e) => fatal(&format!("serialize v1 document {id:?}: {e}")),
+        };
+        docs.push((id.clone(), doc_seq, bytes));
+    }
+    let v1_lineage = db.lineage();
+    drop(db);
+
+    let staging = dir.join(".migrating");
+    if staging.exists() {
+        if let Err(e) = fs::remove_dir_all(&staging) {
+            fatal(&format!(
+                "cannot clear the previous partial migration at {}: {e}",
+                staging.display()
+            ));
+        }
+    }
+    if let Err(e) = fs::create_dir_all(&staging) {
+        fatal(&format!("create {}: {e}", staging.display()));
+    }
+
+    let base_path = staging.join(ndb::base_file_name(1));
+    let wal_path = staging.join(ndb::wal_file_name(1));
+    let inputs: Vec<ndb::BaseDocInput<'_>> = docs
+        .iter()
+        .map(|(id, doc_seq, bytes)| ndb::BaseDocInput::new(id, *doc_seq, bytes))
+        .collect();
+    if let Err(e) = ndb::write_base_file(&base_path, v1_lineage.last_seq, &inputs, &[]) {
+        cleanup_staging(&staging);
+        fatal(&format!("write v2 base generation: {e}"));
+    }
+    if let Err(e) = ndb::WalWriter::create(&wal_path, 1, v1_lineage.last_seq) {
+        cleanup_staging(&staging);
+        fatal(&format!("write v2 WAL generation: {e}"));
+    }
+    let manifest = ndb::V2Manifest {
+        format_version: ndb::STORAGE_VERSION,
+        base_gen: 1,
+        wal_gen: 1,
+        source_epoch_uuid: v1_lineage.source_epoch_uuid.clone(),
+        base_seq: v1_lineage.last_seq,
+        min_available_seq: v1_lineage.last_seq.saturating_add(1),
+        doc_count: docs.len() as u64,
+        indexes: Vec::new(),
+    };
+    if let Err(e) = ndb::write_manifest_atomic(&staging, &manifest) {
+        cleanup_staging(&staging);
+        fatal(&format!("write v2 manifest: {e}"));
+    }
+
+    // Verify before publishing: the staged folder must open, carry every
+    // document, and reproduce each document's canonical JSON exactly.
+    let staged = match ndb::Database::open_v2(&staging) {
+        Ok(db) => db,
+        Err(e) => {
+            cleanup_staging(&staging);
+            fatal(&format!("staged v2 database does not open: {e}"));
+        }
+    };
+    if staged.len() != docs.len() {
+        let actual = staged.len();
+        drop(staged);
+        cleanup_staging(&staging);
+        fatal(&format!(
+            "staged v2 database holds {actual} documents, expected {}",
+            docs.len()
+        ));
+    }
+    if staged.lineage().source_epoch_uuid != v1_lineage.source_epoch_uuid
+        || staged.lineage().last_seq != v1_lineage.last_seq
+    {
+        drop(staged);
+        cleanup_staging(&staging);
+        fatal("staged v2 lineage does not match the v1 source");
+    }
+    for (id, _, bytes) in &docs {
+        let expected: serde_json::Value = match serde_json::from_slice(bytes) {
+            Ok(value) => value,
+            Err(e) => {
+                drop(staged);
+                cleanup_staging(&staging);
+                fatal(&format!("v1 document {id:?} is not valid JSON: {e}"));
+            }
+        };
+        match staged.get(id) {
+            Ok(actual) => {
+                if serde_json::to_string(&actual).ok() != serde_json::to_string(&expected).ok() {
+                    drop(staged);
+                    cleanup_staging(&staging);
+                    fatal(&format!(
+                        "document {id:?} does not round-trip through the v2 base"
+                    ));
+                }
+            }
+            Err(e) => {
+                drop(staged);
+                cleanup_staging(&staging);
+                fatal(&format!("staged v2 database is missing {id:?}: {e}"));
+            }
+        }
+    }
+    drop(staged);
+
+    // Publish: generations first, then the manifest (the sole authority),
+    // then retire the v1 journal.
+    for name in [ndb::base_file_name(1), ndb::wal_file_name(1)] {
+        let from = staging.join(&name);
+        let to = dir.join(&name);
+        if let Err(e) = fs::rename(&from, &to) {
+            cleanup_staging(&staging);
+            fatal(&format!("move {name} into {}: {e}", dir.display()));
+        }
+    }
+    if let Err(e) = ndb::write_manifest_atomic(&dir, &manifest) {
+        fatal(&format!("write {}: {e}", dir.join(ndb::MANIFEST_FILE).display()));
+    }
+    let backup = dir.join("data.jsonl.v1.bak");
+    if let Err(e) = fs::rename(&journal, &backup) {
+        fatal(&format!(
+            "rename {} to {}: {e}",
+            journal.display(),
+            backup.display()
+        ));
+    }
+    if let Err(e) = fs::remove_dir_all(&staging) {
+        eprintln!("warning: could not remove {}: {e}", staging.display());
+    }
+
+    let v2_bytes = fs::metadata(dir.join(ndb::base_file_name(1)))
+        .map(|m| m.len())
+        .unwrap_or(0)
+        + fs::metadata(dir.join(ndb::wal_file_name(1)))
+            .map(|m| m.len())
+            .unwrap_or(0);
+    let v1_bytes = fs::metadata(&backup).map(|m| m.len()).unwrap_or(0);
+    println!("Migrated {} to v2", dir.display());
+    println!("Documents: {}", docs.len());
+    println!("source_epoch_uuid: {}", v1_lineage.source_epoch_uuid);
+    println!("last_seq: {}", v1_lineage.last_seq);
+    println!("v1 journal: {v1_bytes} bytes (kept at data.jsonl.v1.bak)");
+    println!("v2 base + WAL: {v2_bytes} bytes");
+    process::exit(EXIT_SUCCESS);
+}
+
+fn cleanup_staging(staging: &Path) {
+    if let Err(e) = fs::remove_dir_all(staging) {
+        eprintln!(
+            "warning: could not remove the partial migration at {}: {e}",
+            staging.display()
+        );
+    }
+}
+
+/// `ndb fsck <path>` — full integrity audit of a v1 journal or a v2 folder.
+fn handle_fsck(args: &[String]) {
+    if args.len() != 1 {
+        eprintln!("Usage: ndb fsck <path>");
+        process::exit(EXIT_GENERAL_ERROR);
+    }
+    let input = Path::new(&args[0]);
+    let dir = if input.is_dir() {
+        input.to_path_buf()
+    } else {
+        input
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| Path::new(".").to_path_buf())
+    };
+
+    if dir.join(ndb::MANIFEST_FILE).exists() {
+        let report = match ndb::fsck_v2_dir(&dir) {
+            Ok(report) => report,
+            Err(e) => fatal(&format!("fsck {}: {e}", dir.display())),
+        };
+        println!("Database: {}", dir.display());
+        println!("Format: v2");
+        println!("base.gen_{}: {} documents, {} bytes", report.base_gen, report.doc_count, report.base_bytes);
+        println!(
+            "wal.gen_{}: {} frames, {} bytes",
+            report.wal_gen, report.wal_frames, report.wal_bytes
+        );
+        println!("base_seq: {}", report.base_seq);
+        println!("last_seq: {}", report.last_seq);
+        println!("min_available_seq: {}", report.min_available_seq);
+        println!("indexes: {}", report.index_count);
+        match check_bucket_files(&dir) {
+            Ok(count) => println!("bucket files: {count} verified"),
+            Err(e) => fatal(&format!("fsck {}: {e}", dir.display())),
+        }
+        println!("OK");
+        process::exit(EXIT_SUCCESS);
+    }
+
+    // v1: verify the journal and the doc trash without opening for write.
+    let journal = dir.join("data.jsonl");
+    if !journal.exists() {
+        fatal(&format!(
+            "{} holds neither manifest.json nor data.jsonl",
+            dir.display()
+        ));
+    }
+    let mut problems = 0usize;
+    match ndb::storage::read_all_with_meta(&journal) {
+        Ok((meta, docs)) => {
+            println!("Database: {}", dir.display());
+            println!("Format: v1");
+            println!("documents replayed: {}", docs.len());
+            if let Some(meta) = meta {
+                println!("source_epoch_uuid: {}", meta.source_epoch_uuid.as_deref().unwrap_or("<legacy>"));
+                println!("last_seq: {}", meta.last_seq);
+            }
+        }
+        Err(e) => {
+            eprintln!("journal {}: {e}", journal.display());
+            problems += 1;
+        }
+    }
+    let trash = dir.join("_trash").join("docs").join("data.jsonl");
+    if trash.exists() {
+        if let Err(e) = ndb::storage::read_trash(&trash) {
+            eprintln!("trash {}: {e}", trash.display());
+            problems += 1;
+        }
+    }
+    if problems > 0 {
+        eprintln!("fsck failed with {problems} problem(s)");
+        process::exit(EXIT_CORRUPTION);
+    }
+    println!("OK");
+    process::exit(EXIT_SUCCESS);
+}
+
+/// Stat every file under `_files/`; an unreadable or zero-length blob is a
+/// bucket-integrity failure (dedup never writes one).
+fn check_bucket_files(dir: &Path) -> Result<usize, String> {
+    let files = dir.join("_files");
+    if !files.exists() {
+        return Ok(0);
+    }
+    let mut count = 0usize;
+    let buckets = fs::read_dir(&files).map_err(|e| format!("{}: {e}", files.display()))?;
+    for bucket in buckets {
+        let bucket = bucket.map_err(|e| format!("{}: {e}", files.display()))?;
+        if !bucket.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let entries = fs::read_dir(bucket.path())
+            .map_err(|e| format!("{}: {e}", bucket.path().display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("{}: {e}", bucket.path().display()))?;
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let meta = entry
+                .metadata()
+                .map_err(|e| format!("{}: {e}", entry.path().display()))?;
+            if meta.len() == 0 {
+                return Err(format!("{} is a zero-length blob", entry.path().display()));
+            }
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 fn handle_destroy(args: &[String]) {
@@ -553,7 +907,43 @@ fn handle_info(args: &[String]) {
     
     let path = Path::new(&args[0]);
     let meta_path = path.join("meta.json");
-    
+
+    if path.join(ndb::MANIFEST_FILE).exists() {
+        let manifest = match ndb::read_manifest(path) {
+            Ok(manifest) => manifest,
+            Err(e) => fatal(&format!("read {}: {e}", path.display())),
+        };
+        let base_size = fs::metadata(ndb::base_file_path(path, manifest.base_gen))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let wal_size = fs::metadata(ndb::wal_file_path(path, manifest.wal_gen))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let meta: serde_json::Value = fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or(serde_json::Value::Null);
+        println!("Status: Valid");
+        println!("Format: v2");
+        println!("Database Path: {}", path.display());
+        println!("Schema Version: {}", meta.get("version").and_then(|v| v.as_i64()).unwrap_or(0));
+        println!("Active Documents: {}", manifest.doc_count);
+        println!("base.gen_{}: {} bytes", manifest.base_gen, base_size);
+        println!("wal.gen_{}: {} bytes", manifest.wal_gen, wal_size);
+        println!("base_seq: {}", manifest.base_seq);
+        println!("min_available_seq: {}", manifest.min_available_seq);
+        println!("source_epoch_uuid: {}", manifest.source_epoch_uuid);
+        if manifest.indexes.is_empty() {
+            println!("Indexes: None");
+        } else {
+            println!("Indexes:");
+            for spec in &manifest.indexes {
+                println!("  - {} ({:?})", spec.field, spec.kind);
+            }
+        }
+        process::exit(EXIT_SUCCESS);
+    }
+
     if !meta_path.exists() {
         eprintln!("Status: Invalid\nReason: Missing meta.json in {}", path.display());
         process::exit(EXIT_GENERAL_ERROR);
@@ -627,21 +1017,22 @@ fn handle_compact(args: &[String]) {
     let meta_path = path.join("meta.json");
     let db_path = path.join("data.jsonl");
 
-    if path.join(".lock").exists() && !path.join(".readonly").exists() {
-        eprintln!("Error: Database is actively locked. Cannot compact without a .readonly lock.");
-        process::exit(EXIT_LOCKED);
-    }
-
-    if !meta_path.exists() || !db_path.exists() {
+    if !meta_path.exists() || !(db_path.exists() || path.join(ndb::MANIFEST_FILE).exists()) {
         eprintln!("Error: Target is not a valid nDB folder.");
         process::exit(EXIT_GENERAL_ERROR);
     }
 
     eprintln!("[1/2] Connecting to database...");
     
-    // Explicit compilation fix using ndb core library!
-    let db = match ndb::Database::open(&db_path) {
+    // The folder path auto-detects v1 (data.jsonl) or v2 (manifest.json).
+    // Opening takes the OS writer lock, so a database served elsewhere is
+    // reported as locked rather than compacted underneath its writer.
+    let db = match ndb::Database::open(path) {
         Ok(db) => db,
+        Err(e @ ndb::Error::DatabaseLocked { .. }) => {
+            eprintln!("Error: database is in use: {e}");
+            process::exit(EXIT_LOCKED);
+        }
         Err(e) => {
             eprintln!("Failed to open database: {}", e);
             process::exit(EXIT_GENERAL_ERROR);
@@ -660,7 +1051,7 @@ fn handle_compact(args: &[String]) {
 
 fn handle_export(args: &[String]) {
     if args.len() < 2 {
-        eprintln!("Usage: ndb export <path> <dest> [--consistent]");
+        eprintln!("Usage: ndb export <path> <dest> [--consistent] [--jsonl]");
         process::exit(EXIT_GENERAL_ERROR);
     }
     
@@ -669,6 +1060,13 @@ fn handle_export(args: &[String]) {
     let db_path = src_path.join("data.jsonl");
 
     let consistent = args.iter().any(|a| a == "--consistent");
+    let jsonl = args.iter().any(|a| a == "--jsonl")
+        || (dest_path
+            .extension()
+            .map(|e| e.to_string_lossy().eq_ignore_ascii_case("jsonl"))
+            .unwrap_or(false)
+            && !dest_path.is_dir());
+
     if consistent {
         if !src_path.join(".readonly").exists() {
             eprintln!("Error: --consistent requested but .readonly marker not found. Database might be actively writing.");
@@ -679,6 +1077,30 @@ fn handle_export(args: &[String]) {
     if dest_path.exists() {
         eprintln!("Error: Destination path already exists. Must be empty.");
         process::exit(EXIT_GENERAL_ERROR);
+    }
+
+    if jsonl {
+        eprintln!("Exporting active documents as JSON Lines...");
+        let db = match ndb::Database::open(src_path) {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("Failed to open source database: {e}");
+                process::exit(EXIT_GENERAL_ERROR);
+            }
+        };
+        let count = match db.export_jsonl(dest_path, true) {
+            Ok(count) => count,
+            Err(e) => {
+                eprintln!("Export failed: {e}");
+                process::exit(EXIT_GENERAL_ERROR);
+            }
+        };
+        println!(
+            "Exported {} document(s) to {}",
+            count,
+            dest_path.display()
+        );
+        process::exit(EXIT_SUCCESS);
     }
 
     eprintln!("[1/4] Preparing snapshot directory...");
@@ -1010,6 +1432,10 @@ fn handle_verify(args: &[String]) {
         eprintln!("Usage: ndb verify <path>");
         process::exit(EXIT_GENERAL_ERROR);
     }
+    // A v2 folder has no JSONL journal: the full binary audit is `fsck`.
+    if Path::new(&args[0]).join(ndb::MANIFEST_FILE).exists() {
+        handle_fsck(args);
+    }
     
     let path = Path::new(&args[0]);
     let db_path = path.join("data.jsonl");
@@ -1109,6 +1535,53 @@ fn handle_repair(args: &[String]) {
         process::exit(EXIT_GENERAL_ERROR);
     }
     let input = Path::new(&args[0]);
+    let dir = if input.is_dir() {
+        input.to_path_buf()
+    } else {
+        input
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| Path::new(".").to_path_buf())
+    };
+
+    // v2: quarantine and truncate the WAL's bad tail under the maintenance lock.
+    if dir.join(ndb::MANIFEST_FILE).exists() {
+        let manifest = match ndb::read_manifest(&dir) {
+            Ok(manifest) => manifest,
+            Err(e) => fatal(&format!("read {}: {e}", dir.display())),
+        };
+        let journal = dir.join("data.jsonl");
+        let _lock = match ndb::MaintenanceLock::acquire(&journal) {
+            Ok(lock) => lock,
+            Err(e) => fatal(&format!(
+                "cannot repair {}: {e} (is a service still running on this database?)",
+                dir.display()
+            )),
+        };
+        let wal_path = ndb::wal_file_path(&dir, manifest.wal_gen);
+        let stats = match ndb::repair_wal_file(&wal_path, manifest.base_seq) {
+            Ok(stats) => stats,
+            Err(e) => fatal(&format!("repair {}: {e}", wal_path.display())),
+        };
+        println!("WAL: {}", wal_path.display());
+        println!(
+            "Preserved: {} frame(s), {} of {} byte(s)",
+            stats.frames_kept, stats.good_bytes, stats.total_bytes
+        );
+        match &stats.backup {
+            Some(backup) => {
+                println!(
+                    "Removed: {} byte(s) after frame {}",
+                    stats.truncated_bytes,
+                    stats.frames_kept
+                );
+                println!("Original preserved at: {}", backup.display());
+            }
+            None => println!("Nothing to repair: the WAL is intact."),
+        }
+        process::exit(EXIT_SUCCESS);
+    }
+
     let journal: std::path::PathBuf = if input.is_dir() {
         input.join("data.jsonl")
     } else if input.exists() {
@@ -1265,7 +1738,7 @@ fn handle_dump(args: &[String]) {
     let path = Path::new(&args[0]);
     let db_path = path.join("data.jsonl");
 
-    let db = match ndb::Database::open(&db_path) {
+    let db = match ndb::Database::open(if db_path.exists() { &db_path } else { path }) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("Failed to open database: {}", e);
@@ -1410,7 +1883,7 @@ fn handle_query(args: &[String]) {
     };
 
     let db_path = path.join("data.jsonl");
-    let db = match ndb::Database::open(&db_path) {
+    let db = match ndb::Database::open(if db_path.exists() { &db_path } else { path }) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("Failed to open database: {}", e);

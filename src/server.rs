@@ -136,6 +136,8 @@ pub struct DbRegistry {
     root_dir: Option<PathBuf>,
     default_persistence: PersistenceMode,
     scheduled_ms: u64,
+    /// Storage format used by `POST /v2/dbs` when the request names none.
+    create_format: RwLock<crate::StorageFormat>,
     /// Frozen snapshots pinned by `GET /v2/dbs/{name}/snapshot`, so pages of
     /// one read never drift under concurrent writes.
     snapshots: RwLock<HashMap<String, PinnedSnapshot>>,
@@ -163,8 +165,19 @@ impl DbRegistry {
             root_dir,
             default_persistence,
             scheduled_ms,
+            create_format: RwLock::new(crate::StorageFormat::Auto),
             snapshots: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Storage format `POST /v2/dbs` creates when the request names none.
+    pub fn create_format(&self) -> crate::StorageFormat {
+        *self.create_format.read()
+    }
+
+    /// Set the default creation format (from `ndb-serve.json` / `--format`).
+    pub fn set_create_format(&self, format: crate::StorageFormat) {
+        *self.create_format.write() = format;
     }
 
     /// Freeze `snapshot` under an id the caller can page through.
@@ -259,6 +272,18 @@ impl DbRegistry {
         path: impl AsRef<Path>,
         persistence: Persistence,
     ) -> Result<(), Error> {
+        self.mount_resolved_format(name, path, persistence, crate::StorageFormat::Auto)
+    }
+
+    /// Mount a database with an explicit storage format (used by creation:
+    /// a new folder asked to be v2 must initialise as v2).
+    pub fn mount_resolved_format(
+        &self,
+        name: &str,
+        path: impl AsRef<Path>,
+        persistence: Persistence,
+        format: crate::StorageFormat,
+    ) -> Result<(), Error> {
         Self::validate_name(name)?;
         let resolved = resolve_db_path(path.as_ref());
         let normalized = normalize_path(&resolved);
@@ -290,8 +315,13 @@ impl DbRegistry {
         // `Database::open` errors carry the path and context; a failed open is
         // a service fault (500 over HTTP, fatal in the CLI), not a caller
         // argument error, so the kind is preserved rather than flattened.
-        let db = Database::open(&normalized)?;
-        let db = db.with_persistence(persistence);
+        let db = Database::open_with_options(
+            &normalized,
+            crate::OpenOptions {
+                format,
+                persistence,
+            },
+        )?;
 
         // The file exists now, so the OS's own canonical form is checkable —
         // this catches case-folded and symlinked aliases lexical normalization
@@ -401,6 +431,16 @@ impl DbRegistry {
         name: &str,
         persistence: Option<PersistenceMode>,
     ) -> std::result::Result<Arc<Database>, CreateDbError> {
+        self.create_with_format(name, persistence, self.create_format())
+    }
+
+    /// Create `<root>/<name>` with an explicit storage format.
+    pub fn create_with_format(
+        &self,
+        name: &str,
+        persistence: Option<PersistenceMode>,
+        format: crate::StorageFormat,
+    ) -> std::result::Result<Arc<Database>, CreateDbError> {
         let root = self.root_dir.clone().ok_or(CreateDbError::Disabled)?;
         Self::validate_name(name).map_err(|e| CreateDbError::InvalidName(e.to_string()))?;
         if let Some(existing) = self
@@ -431,8 +471,13 @@ impl DbRegistry {
         }
 
         let path = dir_canon.join("data.jsonl");
-        self.mount_with(name, &path, persistence.unwrap_or(self.default_persistence))
-            .map_err(CreateDbError::Core)?;
+        self.mount_resolved_format(
+            name,
+            &path,
+            persistence.unwrap_or(self.default_persistence).to_persistence(self.scheduled_ms),
+            format,
+        )
+        .map_err(CreateDbError::Core)?;
         self.get(name).ok_or_else(|| {
             CreateDbError::Core(Error::invalid_arg(format!(
                 "database '{name}' vanished immediately after mounting"
@@ -501,6 +546,8 @@ pub struct ServiceConfig {
     pub dir: Option<PathBuf>,
     pub max_limit: Option<usize>,
     pub default_limit: Option<usize>,
+    /// Storage format new databases are created with (`auto` | `v1` | `v2`).
+    pub format: Option<String>,
     pub dbs: Option<HashMap<String, DbSpec>>,
 }
 
@@ -587,6 +634,14 @@ impl ServiceConfig {
     pub fn persistence(&self) -> Result<Option<PersistenceMode>, Error> {
         match &self.persistence {
             Some(p) => Ok(Some(PersistenceMode::parse(p)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The storage format new databases are created with, if declared.
+    pub fn format(&self) -> Result<Option<crate::StorageFormat>, Error> {
+        match &self.format {
+            Some(f) => Ok(Some(crate::StorageFormat::parse(f)?)),
             None => Ok(None),
         }
     }
@@ -1076,6 +1131,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 enum Response {
     Json(u16, Value),
+    /// A pre-serialized JSON body — the query fast path writes stored document
+    /// bytes straight into the response instead of re-encoding each hit.
+    JsonRaw(u16, Vec<u8>),
     /// Raw bytes with a real content type — bucket files never ride in JSON.
     Binary(u16, String, Vec<u8>),
 }
@@ -1115,7 +1173,7 @@ fn route(registry: &Arc<DbRegistry>, config: &ServerConfig, req: &Request) -> Re
     let (status, body) = match (req.method.as_str(), segments.as_slice()) {
         ("GET", ["stats"]) => handle_stats(&db),
 
-        ("POST", ["query"]) => handle_query(&db, config, req),
+        ("POST", ["query"]) => return respond_query(&db, config, req),
         ("POST", ["find"]) => handle_find(&db, req),
         ("POST", ["search"]) => handle_search(&db, config, req),
         ("POST", ["facets"]) => handle_facets(&db, req),
@@ -1161,20 +1219,23 @@ fn handle_stats(db: &Database) -> (u16, Value) {
     )
 }
 
-fn handle_query(db: &Database, config: &ServerConfig, req: &Request) -> (u16, Value) {
+fn respond_query(db: &Database, config: &ServerConfig, req: &Request) -> Response {
     let body = match parse_body(req) {
         Ok(b) => b,
-        Err(e) => return e,
+        Err((status, body)) => return Response::Json(status, body),
     };
 
     let filter = body.get("filter").cloned().unwrap_or_else(|| json!({}));
     if let Err(e) = crate::validate_query_ast(&filter) {
-        return (400, json!({"error": format!("invalid filter: {}", e)}));
+        return Response::Json(
+            400,
+            json!({"error": format!("invalid filter: {}", e)}),
+        );
     }
 
     let opts = match parse_query_options(&body, config, config.default_limit) {
         Ok(o) => o,
-        Err(e) => return (400, json!({"error": e})),
+        Err(e) => return Response::Json(400, json!({"error": e})),
     };
 
     let fields: Option<Vec<String>> = body
@@ -1188,31 +1249,46 @@ fn handle_query(db: &Database, config: &ServerConfig, req: &Request) -> (u16, Va
         Some(t) => {
             let (tfield, tsearch) = match parse_text_search(t) {
                 Ok(v) => v,
-                Err(e) => return e,
+                Err((status, body)) => return Response::Json(status, body),
             };
             match db.text_search(&tfield, &tsearch) {
                 Ok(ids) => Some(ids.into_iter().collect()),
-                Err(e) => return db_error(e),
+                Err(e) => {
+                    let (status, body) = db_error(e);
+                    return Response::Json(status, body);
+                }
             }
         }
         None => None,
     };
 
-    let (total, results) = match db.query_projected(filter, opts, fields.as_deref(), text_ids.as_ref()) {
-        Ok(r) => r,
+    if fields.is_none() {
+        return match db.query_raw(filter, opts, text_ids.as_ref()) {
+            Ok((total, rows)) => Response::JsonRaw(200, query_raw_body(total, &rows, None)),
+            Err(e) => {
+                let (status, body) = db_error(e);
+                Response::Json(status, body)
+            }
+        };
+    }
+
+    match db.query_projected(filter, opts, fields.as_deref(), text_ids.as_ref()) {
+        Ok((total, results)) => Response::Json(
+            200,
+            json!({
+                "ok": true,
+                "total": total,
+                "count": results.len(),
+                "results": results,
+            }),
+        ),
         // Unreachable for invalid ASTs — the pre-validation above already
         // returned 400. Kept as the loud net rather than an unwrap.
-        Err(e) => return db_error(e),
-    };
-    (
-        200,
-        json!({
-            "ok": true,
-            "total": total,
-            "count": results.len(),
-            "results": results,
-        }),
-    )
+        Err(e) => {
+            let (status, body) = db_error(e);
+            Response::Json(status, body)
+        }
+    }
 }
 
 fn parse_query_options(body: &Value, config: &ServerConfig, limit_cap: usize) -> Result<QueryOptions, String> {
@@ -1823,6 +1899,7 @@ fn db_descriptor(name: &str, db: &Database) -> Value {
     let lineage = db.lineage();
     json!({
         "name": name,
+        "format": if db.is_v2() { "v2" } else { "v1" },
         "documents": db.len(),
         "source_epoch_uuid": lineage.source_epoch_uuid,
         "last_seq": lineage.last_seq,
@@ -1859,6 +1936,9 @@ struct CreateDbRequest {
     name: String,
     #[serde(default)]
     persistence: Option<String>,
+    /// `auto` | `v1` | `v2`; `v2` initialises a binary/mmap folder database.
+    #[serde(default)]
+    format: Option<String>,
 }
 
 fn handle_create_db(registry: &DbRegistry, req: &Request) -> (u16, Value) {
@@ -1875,7 +1955,12 @@ fn handle_create_db(registry: &DbRegistry, req: &Request) -> (u16, Value) {
         Some(Err(e)) => return map_db_error(e),
         None => None,
     };
-    match registry.create(&request.name, persistence) {
+    let format = match request.format.as_deref().map(crate::StorageFormat::parse) {
+        Some(Ok(format)) => format,
+        Some(Err(e)) => return map_db_error(e),
+        None => registry.create_format(),
+    };
+    match registry.create_with_format(&request.name, persistence, format) {
         Ok(db) => (
             201,
             json!({"ok": true, "db": db_descriptor(&request.name, &db)}),
@@ -1939,7 +2024,7 @@ fn route_v2(
             json!({"ok": true, "documents": db.len(), "lineage": lineage_json(&db)}),
         ),
 
-        ("POST", ["query"]) => handle_v2_query(&db, config, req),
+        ("POST", ["query"]) => return respond_v2_query(&db, config, req),
         ("POST", ["find"]) => handle_v2_find(&db, req),
         ("POST", ["facets"]) => handle_v2_facets(&db, req),
         ("POST", ["search"]) => handle_v2_search(&db, config, req),
@@ -1988,19 +2073,25 @@ fn route_v2(
     Response::Json(status, body)
 }
 
-fn handle_v2_query(db: &Database, config: &ServerConfig, req: &Request) -> (u16, Value) {
+fn respond_v2_query(db: &Database, config: &ServerConfig, req: &Request) -> Response {
     let body = match parse_body_v2(req) {
         Ok(b) => b,
-        Err(e) => return e,
+        Err((status, body)) => return Response::Json(status, body),
     };
     let filter = body.get("filter").cloned().unwrap_or_else(|| json!({}));
     if let Err(e) = crate::validate_query_ast(&filter) {
-        return v2_error(400, "invalid_filter", format!("invalid filter: {e}"));
+        return Response::Json(
+            400,
+            json!({"ok": false, "error": "invalid_filter", "message": format!("invalid filter: {e}")}),
+        );
     }
 
     let opts = match parse_query_options(&body, config, config.max_limit) {
         Ok(o) => o,
-        Err(e) => return v2_error(400, "invalid_query", e),
+        Err(e) => {
+            let (status, body) = v2_error(400, "invalid_query", e);
+            return Response::Json(status, body);
+        }
     };
 
     let fields: Option<Vec<String>> = body.get("fields").and_then(|f| f.as_array()).map(|arr| {
@@ -2014,18 +2105,34 @@ fn handle_v2_query(db: &Database, config: &ServerConfig, req: &Request) -> (u16,
         Some(t) => {
             let (tfield, tsearch) = match parse_text_search(t) {
                 Ok(v) => v,
-                Err(e) => return e,
+                Err((status, body)) => return Response::Json(status, body),
             };
             match db.text_search(&tfield, &tsearch) {
                 Ok(ids) => Some(ids.into_iter().collect()),
-                Err(e) => return map_db_error(e),
+                Err(e) => {
+                    let (status, body) = map_db_error(e);
+                    return Response::Json(status, body);
+                }
             }
         }
         None => None,
     };
 
+    if fields.is_none() {
+        return match db.query_raw(filter, opts, text_ids.as_ref()) {
+            Ok((total, rows)) => Response::JsonRaw(
+                200,
+                query_raw_body(total, &rows, Some(elapsed_ms(start))),
+            ),
+            Err(e) => {
+                let (status, body) = map_db_error(e);
+                Response::Json(status, body)
+            }
+        };
+    }
+
     match db.query_projected(filter, opts, fields.as_deref(), text_ids.as_ref()) {
-        Ok((total, results)) => (
+        Ok((total, results)) => Response::Json(
             200,
             json!({
                 "ok": true,
@@ -2035,8 +2142,36 @@ fn handle_v2_query(db: &Database, config: &ServerConfig, req: &Request) -> (u16,
                 "took_ms": elapsed_ms(start),
             }),
         ),
-        Err(e) => map_db_error(e),
+        Err(e) => {
+            let (status, body) = map_db_error(e);
+            Response::Json(status, body)
+        }
     }
+}
+
+/// Build `{"ok":true,"total":N,"count":M,"results":[<raw>,<raw>]}` from
+/// pre-serialized document bytes.
+fn query_raw_body(total: usize, rows: &[Arc<[u8]>], took_ms: Option<f64>) -> Vec<u8> {
+    let payload: usize = rows.iter().map(|row| row.len() + 1).sum();
+    let mut body = Vec::with_capacity(payload + 96);
+    body.extend_from_slice(b"{\"ok\":true,\"total\":");
+    body.extend_from_slice(total.to_string().as_bytes());
+    body.extend_from_slice(b",\"count\":");
+    body.extend_from_slice(rows.len().to_string().as_bytes());
+    body.extend_from_slice(b",\"results\":[");
+    for (index, row) in rows.iter().enumerate() {
+        if index > 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(row);
+    }
+    body.push(b']');
+    if let Some(took) = took_ms {
+        body.extend_from_slice(b",\"took_ms\":");
+        body.extend_from_slice(format!("{took:.3}").as_bytes());
+    }
+    body.push(b'}');
+    body
 }
 
 fn handle_v2_find(db: &Database, req: &Request) -> (u16, Value) {
@@ -2695,6 +2830,7 @@ fn write_response(
             serde_json::to_vec(&body)
                 .unwrap_or_else(|_| b"{\"error\":\"serialization failed\"}".to_vec()),
         ),
+        Response::JsonRaw(status, body) => (status, "application/json".to_string(), body),
         Response::Binary(status, ctype, data) => (status, ctype, data),
     };
     let head = format!(

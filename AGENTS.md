@@ -29,6 +29,45 @@ nDB is an **embeddable in-memory document database** built in Rust with native N
 - **Database-as-a-Folder.** One directory per database: `data.jsonl` (documents — the file passed to `open()`), `_files/` (binary storage, created implicitly), `_trash/` (soft-deleted items), and `meta.json` (bucket declarations/policies — written by the CLI/migration, **read by the core at open**: `kind`, `onDocumentDelete`, `ttl_seconds`, `reserved_ttl_seconds`; the `schemas` block is still ignored).
 - **Zero dependencies beyond the Rust standard library plus `serde`, `serde_json`, `parking_lot`, `fastrand`, and `thiserror`.** No external crypto, no external DB engines. SHA-256 for file deduplication is hand-rolled.
 
+## Storage Backends (v1 JSONL / v2 binary)
+
+`Database::open` detects the backend from the folder: `manifest.json` → v2,
+`data.jsonl` → v1, empty → v1 (or v2 when `OpenOptions::format == V2`). The
+public API is identical on both.
+
+- **v2 files**: `manifest.json` (sole generation/lineage authority),
+  `base.gen_<N>.ndb` (immutable mmap'ed snapshot with persisted Hash/BTree
+  index sections), `wal.gen_<N>.ndb` (CRC-32 framed append log). Every parser
+  validates its CRC and structure; a torn WAL tail is truncated at open, any
+  other corruption fails loud.
+- **In-memory**: the mapping is the store. `V2State` holds `Arc<MmapBase>`, a
+  `superseded` bitset (one bit per base slot) and a `wal_overlay` of
+  post-compaction writes only — never a per-document map and never heap `Value`
+  trees. A cold open allocates nothing per document; reads binary-search the
+  mapped directory. Persisted indexes are probed in place (binary search over
+  encoded keys, `&[u32]` slot views); only the small WAL overlay carries an
+  in-memory index.
+- **Queries**: filters and sort keys are read from document bytes
+  (`src/v2_json_scan.rs`); `sort_by`+`limit` is a bounded top-K and only the
+  returned page (or its requested fields) is materialized. `/query` without
+  `fields` streams stored bytes into the response.
+- **Writes**: per-database leader/follower group commit coalesces concurrent
+  mutations into one `append_batch_and_sync`; RAM (overlay, bitset, indexes,
+  change ring, `last_seq`) is published only after the fsync, and a failed fsync
+  publishes nothing.
+- **Feed**: the RAM change ring is capped at 1024 events; older cursors are
+  answered by streaming the WAL from disk.
+- **Compaction** is non-blocking: freeze under a short lock (manifest + `Arc` +
+  bitset + overlay — a few KB, not the document set), write the new base with a
+  mirror WAL capturing concurrent writes, then swap the manifest and the live
+  mapping in a second short lock.
+
+Engine: `src/v2_engine.rs`; on-disk format: `src/v2_format.rs`, raw-JSON scan:
+`src/v2_json_scan.rs`, mapping: `src/mmap.rs`, checksums: `src/crc32.rs`.
+CLI: `ndb init --v2`, `migrate`, `fsck`, `repair`, `export --jsonl`. Full
+reference: `documentation/v2-storage.md`; benchmark and gate verdicts:
+`docs/phase3-benchmark-v1-vs-v2.md`.
+
 ## Query Layers
 
 1. **Layer 1 — O(1) CRUD:** `insert`, `get`, `update`, `delete`, `array_push`. Direct HashMap operations.
@@ -105,6 +144,7 @@ Powered by **napi-rs**. The `napi/` crate wraps the Rust `Database` type and exp
 | Item buckets (`kind: "items"`) | Complete — item folders + `items.jsonl` journal, reserve/commit/trash/restore, reserved sweep, `verify` integrity; napi + CLI wired |
 | Multi-DB HTTP service (`ndb serve`) | Complete (step 1) — `DbRegistry` mounts arbitrary DB paths by name, `--db`/`--dir`/`--config`, `/health` + `/v2/dbs` + per-DB CRUD/query/sync/bucket routes; `tests/phase13_multi_db_serve_tests.rs` |
 | Schema validation from `meta.json` | Not implemented (`meta.json` schemas block ignored) |
+| v2 binary/mmap storage backend (Phase 3, slice 3D) | Complete — `manifest.json` + mmap base generations + CRC32 WAL; zero-copy directory and persisted index sections (fixed-stride offset tables, O(1) slot access, O(log n) id lookup, `&[u32]` slot views); no per-document slot map (superseded bitset + WAL overlay, empty at cold boot); raw-JSON filter/sort-key scanning with bounded top-K and projected/raw materialization (`src/v2_json_scan.rs`); per-DB leader/follower group commit (one fsync per batch, RAM published only after fsync), bounded 1024-entry change ring with on-disk WAL fallback, non-blocking compaction with a mirror WAL and a few-KB freeze; `StorageFormat::{Auto,V1,V2}` gains `Database::open_v2*`; CLI `init --v2`, `migrate`, `fsck`, v2 `repair`, `export --jsonl`; `POST /v2/dbs` accepts `format: "v2"`. Reference: `documentation/v2-storage.md`; benchmark and gate verdicts: `docs/phase3-benchmark-v1-vs-v2.md`; tests: `tests/phase3_slice3b_v2_tests.rs`, `tests/phase16_v2_storage_tests.rs`, `tests/phase15_perf_and_planner_tests.rs` |
 | nURI `link` type enforcement | Not implemented (file refs detected heuristically by string match, not by schema) |
 | Bucket migration script for legacy data | Not bundled here (the consumer's `migrate-ndb-to-folder.js` was used in production) |
 

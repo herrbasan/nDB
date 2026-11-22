@@ -288,6 +288,117 @@ fn planner_keeps_indexes_in_sync_through_mutations() {
     );
 }
 
+#[test]
+fn planner_equals_full_scan_on_a_compacted_v2_database() {
+    use ndb::{OpenOptions, Persistence, StorageFormat};
+    use std::fs;
+
+    // The v1 reference: the same corpus with the same in-memory indexes.
+    let reference_dir = TempDir::new().unwrap();
+    let reference = seeded("v2-reference", &reference_dir);
+    for field in ["n", "s", "flag", "nil", "meta.score", "meta.kind"] {
+        reference.create_index(field).unwrap();
+        reference.create_btree_index(field).unwrap();
+    }
+    reference.create_index("tags").unwrap();
+    reference.create_btree_index("f").unwrap();
+
+    // The v2 leg: 500 documents, both index kinds, then compaction — so every
+    // index probed below is a zero-copy section read straight from the mmap.
+    let v2_root = TempDir::new().unwrap();
+    let v2_dir = v2_root.path().join("db");
+    fs::create_dir_all(&v2_dir).unwrap();
+    let v2 = Database::open_v2_with_options(
+        &v2_dir,
+        OpenOptions {
+            format: StorageFormat::V2,
+            persistence: Persistence::Immediate,
+        },
+    )
+    .unwrap();
+    for i in 0..500 {
+        v2.insert(corpus_doc(i)).unwrap();
+    }
+    // v2 declares one index kind per field: BTree where the probes exercise a
+    // range, Hash where they exercise equality/$in. Both kinds are therefore
+    // read zero-copy from the mapping.
+    for field in ["n", "f", "s", "meta.score"] {
+        v2.create_btree_index(field).unwrap();
+    }
+    for field in ["flag", "nil", "meta.kind", "tags"] {
+        v2.create_index(field).unwrap();
+    }
+    v2.compact().unwrap();
+    assert!(v2.is_v2());
+    assert!(v2.has_index("n") && v2.has_index("meta.score") && v2.has_index("f"));
+
+    for p in planner_probes() {
+        let expected = reference
+            .query_projected(p.filter.clone(), p.opts.clone(), p.fields.as_deref(), None)
+            .unwrap();
+        let actual = v2
+            .query_projected(p.filter.clone(), p.opts.clone(), p.fields.as_deref(), None)
+            .unwrap();
+        assert_eq!(expected.0, actual.0, "probe '{}': total mismatch", p.label);
+        assert_eq!(
+            fingerprint(expected.1),
+            fingerprint(actual.1.clone()),
+            "probe '{}': result set mismatch",
+            p.label
+        );
+
+        let reference_docs = reference
+            .query_with(p.filter.clone(), p.opts.clone())
+            .unwrap();
+        let v2_docs = v2.query_with(p.filter.clone(), p.opts.clone()).unwrap();
+        assert_eq!(
+            fingerprint(reference_docs),
+            fingerprint(v2_docs),
+            "probe '{}': query_with mismatch",
+            p.label
+        );
+
+        // The HTTP raw fast path must select exactly the same page as the
+        // unprojected query (projection is a separate path).
+        let (raw_total, raw_docs) = v2
+            .query_raw(p.filter.clone(), p.opts.clone(), None)
+            .unwrap();
+        let unprojected = v2
+            .query_projected(p.filter.clone(), p.opts.clone(), None, None)
+            .unwrap();
+        assert_eq!(raw_total, unprojected.0, "probe '{}': query_raw total", p.label);
+        let raw_values: Vec<Value> = raw_docs
+            .iter()
+            .map(|bytes| serde_json::from_slice(bytes).expect("raw hit is valid JSON"))
+            .collect();
+        assert_eq!(
+            fingerprint(raw_values),
+            fingerprint(unprojected.1),
+            "probe '{}': query_raw page mismatch",
+            p.label
+        );
+    }
+
+    // Indexed range + equality probes directly against the mapped sections.
+    let plain_range = reference.find_range("n", &json!(-5), &json!(10));
+    let v2_range = v2.find_range("n", &json!(-5), &json!(10));
+    assert_eq!(plain_range.len(), 16, "-5..=10 is 16 integers");
+    assert_eq!(fingerprint(plain_range), fingerprint(v2_range));
+    assert_eq!(
+        fingerprint(reference.find("meta.kind", &json!("beta"))),
+        fingerprint(v2.find("meta.kind", &json!("beta")))
+    );
+
+    // Writes after the compaction land in the WAL overlay and still resolve
+    // through both the mapped base index and the overlay index.
+    let id = v2.insert(json!({"n": 10_000, "s": "z"})).unwrap();
+    assert_eq!(v2.find("n", &json!(10_000)).len(), 1);
+    assert_eq!(v2.find_range("n", &json!(9_999), &json!(10_001)).len(), 1);
+    v2.delete(&id).unwrap();
+    assert_eq!(v2.find("n", &json!(10_000)).len(), 0);
+    assert!(v2.deleted_ids().contains(&id));
+}
+
 // ─── Indexed speed sanity ──────────────────────────────────────────
 
 #[test]

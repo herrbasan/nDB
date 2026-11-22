@@ -26,19 +26,35 @@
 //! ```
 
 pub mod bucket;
+pub mod crc32;
 pub mod error;
 pub mod id;
 pub mod item;
+pub mod mmap;
 pub mod report;
 pub mod search;
 pub mod server;
 pub mod storage;
+pub mod v2_format;
+mod v2_engine;
+mod v2_json_scan;
+
+pub use v2_engine::CHANGE_RING_CAP as V2_CHANGE_RING_CAP;
 
 pub use bucket::{FileBucket, FileMeta, FileRef};
+pub use crc32::{crc32, Crc32Hasher};
 pub use error::{Error, Result};
 pub use item::{ItemBucket, ItemRecord, ItemState};
+pub use mmap::MmapFile;
 pub use search::{TextMode, TextQuery, TextSearch};
 pub use storage::{ChangeBatch, ChangeEvent, ChangeKind, Snapshot, SourceLineage};
+pub use v2_format::{
+    base_file_name, base_file_path, fsck_v2_dir, manifest_path, read_manifest, repair_wal_file,
+    replay_wal, scan_wal_since, wal_file_name, wal_file_path, write_base_file,
+    write_manifest_atomic, BaseDirEntry, BaseDocInput, BaseHeader, BaseIndexEntry, FsckReport,
+    MmapBase, PersistedIndex, V2IndexKind, V2IndexSpec, V2Manifest, WalOp,
+    WalRecord, WalRepairStats, WalReplay, WalWriter, MANIFEST_FILE, STORAGE_VERSION,
+};
 
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
@@ -47,6 +63,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use id::{generate_checked, generate_checked_with_prefix};
@@ -68,6 +85,47 @@ pub enum Persistence {
 impl Default for Persistence {
     fn default() -> Self {
         Persistence::Lazy
+    }
+}
+
+// ─── Storage Format ─────────────────────────────────────────────────
+
+/// Which on-disk layout a database uses.
+///
+/// `Auto` is the default: a folder holding `manifest.json` opens on the v2
+/// binary/mmap backend, a folder holding `data.jsonl` opens on the v1 JSONL
+/// backend, and a brand-new folder initialises as v1 (backward compatible).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageFormat {
+    /// Detect from the folder contents.
+    #[default]
+    Auto,
+    /// JSON Lines journal (`data.jsonl`).
+    V1,
+    /// Binary base generations + CRC-framed WAL.
+    V2,
+}
+
+/// How a database is opened.
+#[derive(Debug, Clone, Default)]
+pub struct OpenOptions {
+    /// Storage format; `Auto` detects from the folder.
+    pub format: StorageFormat,
+    /// Persistence mode applied to the opened handle.
+    pub persistence: Persistence,
+}
+
+impl StorageFormat {
+    /// Parse `auto` / `v1` / `v2` (case-insensitive). Unknown values fail.
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.to_ascii_lowercase().as_str() {
+            "auto" => Ok(StorageFormat::Auto),
+            "v1" => Ok(StorageFormat::V1),
+            "v2" => Ok(StorageFormat::V2),
+            other => Err(Error::invalid_arg(format!(
+                "format must be auto | v1 | v2, got '{other}'"
+            ))),
+        }
     }
 }
 
@@ -142,7 +200,7 @@ pub struct ApplyOpsResult {
 /// `-5 < 2`), never as their decimal text, and arrays/objects sort after every
 /// scalar by canonical JSON.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum OrderedValue {
+pub(crate) enum OrderedValue {
     Null,
     Bool(bool),
     Number(OrderedF64),
@@ -195,6 +253,19 @@ fn ordered_value(value: &Value) -> OrderedValue {
     }
 }
 
+impl OrderedValue {
+    /// Convert to the on-disk `v2_format` key type used by base index sections.
+    pub(crate) fn to_v2(&self) -> v2_format::OrderedValue {
+        match self {
+            OrderedValue::Null => v2_format::OrderedValue::Null,
+            OrderedValue::Bool(b) => v2_format::OrderedValue::Bool(*b),
+            OrderedValue::Number(n) => v2_format::OrderedValue::Number(n.0),
+            OrderedValue::String(s) => v2_format::OrderedValue::String(s.clone()),
+            OrderedValue::Composite(s) => v2_format::OrderedValue::Composite(s.clone()),
+        }
+    }
+}
+
 /// The keys one indexed field value contributes.
 ///
 /// An array contributes its whole value **and** each element, exactly the way
@@ -216,7 +287,7 @@ fn index_keys(value: &Value) -> Vec<OrderedValue> {
 
 /// One end of an indexed range scan.
 #[derive(Clone, Copy)]
-enum KeyBound<'a> {
+pub(crate) enum KeyBound<'a> {
     Unbounded,
     Included(&'a Value),
     Excluded(&'a Value),
@@ -233,7 +304,7 @@ impl KeyBound<'_> {
 }
 
 /// Trait for secondary indexes.
-trait Index: Send + Sync {
+pub(crate) trait Index: Send + Sync {
     fn insert(&mut self, value: &Value, id: &str);
     fn remove(&mut self, value: &Value, id: &str);
     fn get(&self, value: &Value) -> Vec<String>;
@@ -243,15 +314,32 @@ trait Index: Send + Sync {
 }
 
 /// Hash index for O(1) equality lookups.
-struct HashIndex {
+pub(crate) struct HashIndex {
     map: HashMap<OrderedValue, HashSet<String>>,
 }
 
 impl HashIndex {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         HashIndex {
             map: HashMap::new(),
         }
+    }
+
+    /// The map as persisted-base index entries, sorted by key.
+    pub(crate) fn entries(&self) -> Vec<BaseIndexEntry> {
+        let mut out: Vec<(OrderedValue, Vec<String>)> = self
+            .map
+            .iter()
+            .map(|(key, ids)| {
+                let mut ids: Vec<String> = ids.iter().cloned().collect();
+                ids.sort();
+                (key.clone(), ids)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.into_iter()
+            .map(|(key, ids)| BaseIndexEntry::new(key.to_v2(), ids))
+            .collect()
     }
 }
 
@@ -294,15 +382,27 @@ impl Index for HashIndex {
 }
 
 /// BTree index for O(log n) lookups + exact ordered range scans.
-struct BTreeIndex {
+pub(crate) struct BTreeIndex {
     map: BTreeMap<OrderedValue, HashSet<String>>,
 }
 
 impl BTreeIndex {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         BTreeIndex {
             map: BTreeMap::new(),
         }
+    }
+
+    /// The map as persisted-base index entries, in key order.
+    pub(crate) fn entries(&self) -> Vec<BaseIndexEntry> {
+        self.map
+            .iter()
+            .map(|(key, ids)| {
+                let mut ids: Vec<String> = ids.iter().cloned().collect();
+                ids.sort();
+                BaseIndexEntry::new(key.to_v2(), ids)
+            })
+            .collect()
     }
 }
 
@@ -413,7 +513,7 @@ pub fn validate_query_ast(ast: &Value) -> Result<()> {
 }
 
 /// Build a projection of a document: only the requested dot-paths plus _id.
-fn project_doc(doc: &Value, fields: &[String]) -> Value {
+pub(crate) fn project_doc(doc: &Value, fields: &[String]) -> Value {
     let mut out = serde_json::Map::new();
     for f in fields {
         if let Some(v) = field_get(doc, f) {
@@ -427,7 +527,7 @@ fn project_doc(doc: &Value, fields: &[String]) -> Value {
 }
 
 /// Evaluate a JSON AST query against a document.
-fn query_matches(doc: &Value, ast: &Value) -> bool {
+pub(crate) fn query_matches(doc: &Value, ast: &Value) -> bool {
     match ast {
         Value::Object(map) => {
             // Check for logical combinators first
@@ -473,7 +573,7 @@ fn query_matches(doc: &Value, ast: &Value) -> bool {
 }
 
 /// Get a field value from a document. Supports dot notation.
-fn field_get<'a>(doc: &'a Value, field: &str) -> Option<&'a Value> {
+pub(crate) fn field_get<'a>(doc: &'a Value, field: &str) -> Option<&'a Value> {
     let parts: Vec<&str> = field.split('.').collect();
     let mut current = doc;
     for part in parts {
@@ -539,7 +639,7 @@ fn evaluate_condition(field_val: &Value, condition: &Value) -> bool {
 }
 
 /// Compare two JSON values for equality.
-fn values_equal(a: &Value, b: &Value) -> bool {
+pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(an), Value::Number(bn)) => {
             // Compare as f64 for cross-type number equality
@@ -554,13 +654,13 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 /// Uses the same total order the BTree index is keyed by, so a range scan and
 /// a linear scan agree on every pair — including mixed types, where the order
 /// is Null < Bool < Number < String < array/object.
-fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+pub(crate) fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     ordered_value(a).cmp(&ordered_value(b))
 }
 
 /// Tightest lower bound: the greatest value wins; on a tie the exclusive bound
 /// wins (it admits less).
-fn stronger_lower(current: Option<(Value, bool)>, value: &Value, inclusive: bool) -> Option<(Value, bool)> {
+pub(crate) fn stronger_lower(current: Option<(Value, bool)>, value: &Value, inclusive: bool) -> Option<(Value, bool)> {
     match current {
         None => Some((value.clone(), inclusive)),
         Some((bound, bound_inclusive)) => match value_cmp(&bound, value) {
@@ -575,7 +675,7 @@ fn stronger_lower(current: Option<(Value, bool)>, value: &Value, inclusive: bool
 
 /// Tightest upper bound: the smallest value wins; on a tie the exclusive bound
 /// wins.
-fn stronger_upper(current: Option<(Value, bool)>, value: &Value, inclusive: bool) -> Option<(Value, bool)> {
+pub(crate) fn stronger_upper(current: Option<(Value, bool)>, value: &Value, inclusive: bool) -> Option<(Value, bool)> {
     match current {
         None => Some((value.clone(), inclusive)),
         Some((bound, bound_inclusive)) => match value_cmp(&bound, value) {
@@ -590,7 +690,7 @@ fn stronger_upper(current: Option<(Value, bool)>, value: &Value, inclusive: bool
 
 /// Intersect candidate id sets smallest-first, short-circuiting the moment an
 /// empty one appears. `None` means nothing to intersect — no index applies.
-fn intersect_sets(sets: Vec<HashSet<String>>) -> Option<HashSet<String>> {
+pub(crate) fn intersect_sets(sets: Vec<HashSet<String>>) -> Option<HashSet<String>> {
     if sets.is_empty() {
         return None;
     }
@@ -621,7 +721,7 @@ fn intersect_sets(sets: Vec<HashSet<String>>) -> Option<HashSet<String>> {
 
 /// Returns true when the assignment landed (path resolved, value written).
 /// False is a no-op: the path could not be resolved, nothing changed.
-fn apply_path_set(doc: &mut Value, path: &str, value: Value) -> bool {
+pub(crate) fn apply_path_set(doc: &mut Value, path: &str, value: Value) -> bool {
     let segments: Vec<&str> = path.split('.').collect();
     if segments.is_empty() {
         return false;
@@ -662,7 +762,7 @@ fn walk_and_set(current: &mut Value, segments: &[&str], depth: usize, value: Val
 
 /// Returns true when something was removed, false when the path did not
 /// resolve (idempotent remove of a missing key is a no-op).
-fn apply_path_remove(doc: &mut Value, path: &str) -> bool {
+pub(crate) fn apply_path_remove(doc: &mut Value, path: &str) -> bool {
     let segments: Vec<&str> = path.split('.').collect();
     if segments.is_empty() {
         return false;
@@ -677,7 +777,7 @@ fn apply_path_remove(doc: &mut Value, path: &str) -> bool {
 /// Returns true when the push landed (existing array extended, or the
 /// array created). False is a no-op: path did not resolve, or the target
 /// exists but is not an array.
-fn apply_path_push(doc: &mut Value, path: &str, value: Value) -> bool {
+pub(crate) fn apply_path_push(doc: &mut Value, path: &str, value: Value) -> bool {
     let segments: Vec<&str> = path.split('.').collect();
     if segments.is_empty() {
         return false;
@@ -819,7 +919,7 @@ fn replay_journal_entry(
 /// What happens to a document's files when the document is deleted,
 /// declared per bucket in `meta.json` (#10).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OnDocumentDelete {
+pub(crate) enum OnDocumentDelete {
     /// Refuse the delete while the document references files in this bucket.
     Restrict,
     /// Release the document's refs; orphaned files move to trash.
@@ -839,10 +939,10 @@ enum BucketKind {
 
 /// Per-bucket policy parsed from `meta.json` (`buckets.<name>`, #9/#10).
 #[derive(Clone, Debug, Default)]
-struct BucketPolicy {
-    on_document_delete: Option<OnDocumentDelete>,
+pub(crate) struct BucketPolicy {
+    pub(crate) on_document_delete: Option<OnDocumentDelete>,
     /// Per-bucket trash TTL, overriding the database-wide one at purge.
-    ttl_seconds: Option<u64>,
+    pub(crate) ttl_seconds: Option<u64>,
     kind: Option<BucketKind>,
     /// Reserved-item TTL for `kind: "items"` buckets (default 30 min).
     reserved_ttl_seconds: Option<u64>,
@@ -1080,7 +1180,7 @@ impl Drop for DbLock {
     }
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1109,14 +1209,14 @@ impl MaintenanceLock {
 /// the store and the change log point at the same `Arc<Value>`, so a write
 /// materializes one document, not four.
 #[derive(Debug, Clone)]
-struct LoggedChange {
-    seq: u64,
-    id: String,
-    kind: LoggedKind,
+pub(crate) struct LoggedChange {
+    pub(crate) seq: u64,
+    pub(crate) id: String,
+    pub(crate) kind: LoggedKind,
 }
 
 #[derive(Debug, Clone)]
-enum LoggedKind {
+pub(crate) enum LoggedKind {
     Upsert(std::sync::Arc<Value>),
     Delete,
 }
@@ -1151,6 +1251,149 @@ impl serde::Serialize for JournalRecord<'_> {
         }
         map.serialize_entry(storage::SEQ_FIELD, &self.seq)?;
         map.end()
+    }
+}
+
+// ─── Shared Query Planner ──────────────────────────────────────────
+
+/// Index access the planner needs. Implemented by the v1 `Database` and by the
+/// v2 engine, so both run the *same* typed planner — never a second one.
+pub(crate) trait IndexAccess {
+    fn lookup(&self, field: &str, value: &Value) -> Option<HashSet<String>>;
+    fn range_scan(
+        &self,
+        field: &str,
+        min: KeyBound<'_>,
+        max: KeyBound<'_>,
+    ) -> Option<HashSet<String>>;
+    fn in_values(&self, field: &str, operand: &Value) -> Option<HashSet<String>>;
+}
+
+/// Candidate ids for `ast`, or `None` when no conjunct is indexable.
+///
+/// Every returned set is a **superset** of what `query_matches` would accept,
+/// which is the only property the caller needs: candidates are re-evaluated
+/// with `query_matches` before being returned. Combinators are mirrored
+/// exactly — `query_matches` returns early on `$and`/`$or`/`$not`, so sibling
+/// field keys of a combinator are not constraints and are not planned.
+pub(crate) fn plan_candidates<A: IndexAccess + ?Sized>(
+    ast: &Value,
+    access: &A,
+) -> Option<HashSet<String>> {
+    match ast {
+        Value::Object(map) => {
+            if let Some(and_expr) = map.get("$and") {
+                let children = and_expr.as_array()?;
+                return intersect_plans(children.iter(), access);
+            }
+            if map.contains_key("$or") || map.contains_key("$not") {
+                return None;
+            }
+            let mut sets = Vec::new();
+            for (field, condition) in map {
+                if let Some(set) = condition_candidates(field, condition, access) {
+                    sets.push(set);
+                }
+            }
+            intersect_sets(sets)
+        }
+        Value::Array(conditions) => intersect_plans(conditions.iter(), access),
+        _ => None,
+    }
+}
+
+fn intersect_plans<'a, I, A>(children: I, access: &A) -> Option<HashSet<String>>
+where
+    I: Iterator<Item = &'a Value>,
+    A: IndexAccess + ?Sized,
+{
+    let mut sets = Vec::new();
+    for child in children {
+        if let Some(set) = plan_candidates(child, access) {
+            sets.push(set);
+        }
+    }
+    intersect_sets(sets)
+}
+
+/// Index candidates for one field condition.
+///
+/// Every operator in the object is a necessary condition, so the per-operator
+/// candidate sets are intersected (not unioned) — a tighter, still-correct
+/// superset. Range bounds on the same field are merged into a single BTree
+/// scan first: intersecting interval scans one by one would materialize the
+/// widest set just to throw it away.
+fn condition_candidates<A: IndexAccess + ?Sized>(
+    field: &str,
+    condition: &Value,
+    access: &A,
+) -> Option<HashSet<String>> {
+    let Value::Object(ops) = condition else {
+        // Implicit `$eq`.
+        return access.lookup(field, condition);
+    };
+    let mut sets = Vec::new();
+    // (bound value, inclusive) — kept owned so a chosen bound outlives the
+    // loop that found it.
+    let mut lower: Option<(Value, bool)> = None;
+    let mut upper: Option<(Value, bool)> = None;
+
+    for (op, operand) in ops {
+        match op.as_str() {
+            "$eq" => {
+                if let Some(set) = access.lookup(field, operand) {
+                    sets.push(set);
+                }
+            }
+            "$in" => {
+                if let Some(set) = access.in_values(field, operand) {
+                    sets.push(set);
+                }
+            }
+            "$gt" => lower = stronger_lower(lower, operand, false),
+            "$gte" => lower = stronger_lower(lower, operand, true),
+            "$lt" => upper = stronger_upper(upper, operand, false),
+            "$lte" => upper = stronger_upper(upper, operand, true),
+            // $ne / $nin / $exists do not narrow a candidate set.
+            _ => {}
+        }
+    }
+
+    if lower.is_some() || upper.is_some() {
+        let min = match &lower {
+            None => KeyBound::Unbounded,
+            Some((v, true)) => KeyBound::Included(v),
+            Some((v, false)) => KeyBound::Excluded(v),
+        };
+        let max = match &upper {
+            None => KeyBound::Unbounded,
+            Some((v, true)) => KeyBound::Included(v),
+            Some((v, false)) => KeyBound::Excluded(v),
+        };
+        if let Some(set) = access.range_scan(field, min, max) {
+            sets.push(set);
+        }
+    }
+
+    intersect_sets(sets)
+}
+
+impl IndexAccess for Database {
+    fn lookup(&self, field: &str, value: &Value) -> Option<HashSet<String>> {
+        self.index_lookup(field, value)
+    }
+
+    fn range_scan(
+        &self,
+        field: &str,
+        min: KeyBound<'_>,
+        max: KeyBound<'_>,
+    ) -> Option<HashSet<String>> {
+        self.index_range(field, min, max)
+    }
+
+    fn in_values(&self, field: &str, operand: &Value) -> Option<HashSet<String>> {
+        self.index_in(field, operand)
     }
 }
 
@@ -1221,28 +1464,176 @@ pub struct Database {
     flush_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     /// Scheduled flush thread handle.
     flush_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The v2 backend, when this handle was opened on a binary/mmap database.
+    /// All document traffic is routed here; the v1 fields stay empty.
+    v2: Option<Arc<v2_engine::V2Engine>>,
 }
 
 impl Database {
     /// Open or create a database at the given path.
     ///
-    /// If the file exists, loads all documents into memory and rebuilds the
+    /// Format is detected unless [`OpenOptions::format`] forces one: a folder
+    /// holding `manifest.json` opens on the v2 binary/mmap backend, a folder
+    /// holding `data.jsonl` (or an empty one) opens on the v1 JSONL backend.
+    ///
+    /// If the v1 file exists, loads all documents into memory and rebuilds the
     /// change feed from the journal: lines carrying `_seq` become events,
     /// base-state lines of a compacted file do not, and a pre-lineage journal
     /// replays every line as a commit (its epoch is derived from `_meta.created`
     /// so the same uncompacted file keeps the same identity across boots).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let base_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        Self::open_with_options(path, OpenOptions::default())
+    }
+
+    /// Open a v2 binary/mmap database folder.
+    pub fn open_v2(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_v2_with_options(
+            path,
+            OpenOptions {
+                format: StorageFormat::V2,
+                persistence: Persistence::default(),
+            },
+        )
+    }
+
+    /// Open a v2 database with explicit options. `format` is forced to
+    /// [`StorageFormat::V2`]; every other field is honoured.
+    pub fn open_v2_with_options(
+        path: impl AsRef<Path>,
+        mut options: OpenOptions,
+    ) -> Result<Self> {
+        options.format = StorageFormat::V2;
+        Self::open_with_options(path, options)
+    }
+
+    /// Open a database with explicit options (format detection and
+    /// persistence selection).
+    pub fn open_with_options(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
+        let raw = path.as_ref().to_path_buf();
+        // A directory names a database folder; anything else names the journal
+        // (whose parent is the folder). A v2 folder that does not exist yet is
+        // still a folder — a v2 database is never a bare `.jsonl` file.
+        let treat_as_dir = raw.is_dir()
+            || (options.format == StorageFormat::V2
+                && !raw.exists()
+                && raw
+                    .extension()
+                    .map_or(true, |e| !e.to_string_lossy().eq_ignore_ascii_case("jsonl")));
+        let (journal, base_dir) = if treat_as_dir {
+            (raw.join("data.jsonl"), raw)
+        } else {
+            let base = raw
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .to_path_buf();
+            (raw, base)
+        };
 
         // The lock comes first: two processes must never both get as far as
-        // creating/appending to the same journal.
+        // creating/appending to the same database.
         if !base_dir.as_os_str().is_empty() {
             fs::create_dir_all(&base_dir)
                 .map_err(Error::io_err(&base_dir, "create database directory"))?;
         }
-        let lock = DbLock::acquire(&path)?;
+        let lock = DbLock::acquire(&journal)?;
 
+        let manifest = base_dir.join(v2_format::MANIFEST_FILE);
+        let format = match options.format {
+            StorageFormat::V1 => {
+                if manifest.exists() {
+                    return Err(Error::corruption(
+                        &manifest,
+                        "a v2 manifest exists but StorageFormat::V1 was requested",
+                    ));
+                }
+                StorageFormat::V1
+            }
+            StorageFormat::V2 => StorageFormat::V2,
+            StorageFormat::Auto if manifest.exists() => StorageFormat::V2,
+            StorageFormat::Auto => StorageFormat::V1,
+        };
+
+        match format {
+            StorageFormat::V2 => Self::open_v2_locked(journal, base_dir, lock, options.persistence),
+            _ => Self::open_v1_locked(journal, base_dir, lock, options.persistence),
+        }
+    }
+
+    /// Open a v2 database with the OS writer lock already held.
+    fn open_v2_locked(
+        journal: PathBuf,
+        base_dir: PathBuf,
+        lock: DbLock,
+        persistence: Persistence,
+    ) -> Result<Self> {
+        let bucket_policies = load_bucket_policies(&base_dir)?;
+        let trash_lock = Arc::new(Mutex::new(()));
+        let file_refs = Arc::new(RwLock::new(HashMap::new()));
+
+        let engine = Arc::new(v2_engine::V2Engine::open(
+            &base_dir,
+            bucket_policies.clone(),
+            Arc::clone(&trash_lock),
+            Arc::clone(&file_refs),
+        )?);
+
+        let mut item_buckets = HashMap::new();
+        for (name, policy) in &bucket_policies {
+            if policy.kind == Some(BucketKind::Items) {
+                let ttl = Duration::from_secs(
+                    policy
+                        .reserved_ttl_seconds
+                        .unwrap_or(item::DEFAULT_RESERVED_TTL_SECS),
+                );
+                item_buckets.insert(
+                    name.clone(),
+                    Arc::new(ItemBucket::open(name, &base_dir, ttl)?),
+                );
+            }
+        }
+
+        let mut db = Database {
+            path: journal,
+            base_dir,
+            docs: RwLock::new(HashMap::new()),
+            deleted: RwLock::new(HashSet::new()),
+            file_refs: RwLock::new((*file_refs.read()).clone()),
+            hash_indexes: RwLock::new(HashMap::new()),
+            btree_indexes: RwLock::new(HashMap::new()),
+            text_indexes: RwLock::new(HashMap::new()),
+            writer: Arc::new(Mutex::new(())),
+            trash_lock,
+            persistence,
+            trash_mode: TrashMode::Manual,
+            trash_ttl: None,
+            trash_purge_interval: None,
+            ttl_tx: Mutex::new(None),
+            ttl_thread: Mutex::new(None),
+            file_handle: Mutex::new(None),
+            bucket_policies,
+            item_buckets,
+            lineage: RwLock::new(engine.lineage()),
+            change_log: RwLock::new(Vec::new()),
+            doc_seq: RwLock::new(HashMap::new()),
+            _lock: Some(lock),
+            dirty: Arc::new(AtomicBool::new(false)),
+            flush_tx: Mutex::new(None),
+            flush_thread: Mutex::new(None),
+            v2: Some(engine),
+        };
+        db.apply_persistence(persistence);
+        db.start_flush_thread();
+        Ok(db)
+    }
+
+    /// Open a v1 JSONL database with the OS writer lock already held.
+    fn open_v1_locked(
+        path: PathBuf,
+        base_dir: PathBuf,
+        lock: DbLock,
+        persistence: Persistence,
+    ) -> Result<Self> {
         // Ensure file exists
         if !path.exists() {
             storage::init_file(&path, &SourceLineage::fresh())?;
@@ -1345,7 +1736,7 @@ impl Database {
             }
         }
 
-        Ok(Database {
+        let mut db = Database {
             path,
             base_dir,
             docs: RwLock::new(
@@ -1380,7 +1771,11 @@ impl Database {
             dirty: std::sync::Arc::new(AtomicBool::new(false)),
             flush_tx: Mutex::new(None),
             flush_thread: Mutex::new(None),
-        })
+            v2: None,
+        };
+        db.apply_persistence(persistence);
+        db.start_flush_thread();
+        Ok(db)
     }
 
     /// Open a purely in-memory database (no disk file).
@@ -1416,23 +1811,36 @@ impl Database {
             dirty: std::sync::Arc::new(AtomicBool::new(false)),
             flush_tx: Mutex::new(None),
             flush_thread: Mutex::new(None),
+            v2: None,
         })
     }
 
     /// Set persistence mode. Returns self for chaining.
     ///
     /// `Scheduled(d)` starts a real background flusher: every `d` it fsyncs the
-    /// journal if anything was written since the last flush (H2). It is not a
-    /// `Lazy` alias.
+    /// journal (v1) or the WAL (v2) if anything was written since the last
+    /// flush (H2). It is not a `Lazy` alias.
     pub fn with_persistence(mut self, mode: Persistence) -> Self {
         self.persistence = mode;
+        self.apply_persistence(mode);
         self.start_flush_thread();
         self
+    }
+
+    /// Push the persistence mode into the v2 backend (no-op for v1).
+    fn apply_persistence(&mut self, mode: Persistence) {
+        self.persistence = mode;
+        if let Some(v2) = &self.v2 {
+            v2.set_persistence(mode);
+        }
     }
 
     /// Set trash mode. Returns self for chaining.
     pub fn with_trash_mode(mut self, mode: TrashMode) -> Self {
         self.trash_mode = mode;
+        if let Some(v2) = &self.v2 {
+            v2.set_trash_mode(mode);
+        }
         self
     }
 
@@ -1446,6 +1854,17 @@ impl Database {
 
     /// Start the real background flusher for `Persistence::Scheduled`.
     fn start_flush_thread(&mut self) {
+        // A previous flusher (from an earlier `with_persistence`) must not be
+        // left running: two timers would race the same WAL.
+        if let Some(tx) = self.flush_tx.lock().take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.flush_thread.lock().take() {
+            if handle.join().is_err() {
+                report::detached("restart flush thread", "background thread panicked");
+            }
+        }
+
         let interval = match self.persistence {
             Persistence::Scheduled(d) => d,
             _ => return,
@@ -1465,7 +1884,24 @@ impl Database {
 
         let (tx, rx) = std::sync::mpsc::channel();
         *self.flush_tx.lock() = Some(tx);
-        let dirty = std::sync::Arc::clone(&self.dirty);
+
+        if let Some(engine) = &self.v2 {
+            let engine = Arc::clone(engine);
+            let handle = std::thread::spawn(move || loop {
+                match rx.recv_timeout(interval) {
+                    Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if let Err(e) = engine.flush() {
+                            report::detached("scheduled flush: fsync v2 WAL", e);
+                        }
+                    }
+                }
+            });
+            *self.flush_thread.lock() = Some(handle);
+            return;
+        }
+
+        let dirty = Arc::clone(&self.dirty);
         let path = self.path.clone();
         let handle = std::thread::spawn(move || loop {
             match rx.recv_timeout(interval) {
@@ -1726,6 +2162,9 @@ impl Database {
     /// Insert a document. Generates a NanoID `_id` and returns it.
     /// O(1) operation: one collision check + HashMap insert + file append.
     pub fn insert(&self, mut doc: Value) -> Result<String> {
+        if let Some(v2) = &self.v2 {
+            return v2.insert(doc, None);
+        }
         let _guard = self.writer.lock();
 
         // O(1) per attempt: no key enumeration. The check covers live *and*
@@ -1763,6 +2202,9 @@ impl Database {
 
     /// Insert a document with a prefixed ID.
     pub fn insert_with_prefix(&self, prefix: &str, mut doc: Value) -> Result<String> {
+        if let Some(v2) = &self.v2 {
+            return v2.insert(doc, Some(prefix.to_string()));
+        }
         let _guard = self.writer.lock();
 
         let id = generate_checked_with_prefix(prefix, |candidate| {
@@ -1794,6 +2236,9 @@ impl Database {
     /// Get a document by ID. O(1) HashMap lookup (one clone to hand out an
     /// owned value — the store itself is never copied).
     pub fn get(&self, id: &str) -> Result<Value> {
+        if let Some(v2) = &self.v2 {
+            return v2.get(id);
+        }
         let docs = self.docs.read();
         docs.get(id)
             .map(|doc| (**doc).clone())
@@ -1909,6 +2354,9 @@ impl Database {
     /// (re)build. `threads = 0` means all logical cores. Ignored when the
     /// disk cache is fresh.
     pub fn create_text_index_with_threads(&self, field: &str, threads: usize) -> Result<()> {
+        if let Some(v2) = &self.v2 {
+            return v2.create_text_index(field, threads);
+        }
         let _guard = self.writer.lock();
 
         // 1. Cache path: journal unchanged → load instead of building.
@@ -1959,6 +2407,9 @@ impl Database {
 
     /// Drop a full-text index (and its disk cache, if any).
     pub fn drop_text_index(&self, field: &str) -> Result<()> {
+        if let Some(v2) = &self.v2 {
+            return v2.drop_text_index(field);
+        }
         let _guard = self.writer.lock();
         self.text_indexes.write().remove(field);
         if !self.is_in_memory() {
@@ -1977,6 +2428,9 @@ impl Database {
     /// Run a full-text search over an indexed field. Returns matching _ids
     /// (unordered). The field must have a text index (fail loud otherwise).
     pub fn text_search(&self, field: &str, search: &TextSearch) -> Result<Vec<String>> {
+        if let Some(v2) = &self.v2 {
+            return v2.text_search(field, search);
+        }
         search.validate()?;
         let text_indexes = self.text_indexes.read();
         let tindex = text_indexes
@@ -2007,6 +2461,9 @@ impl Database {
     /// `Error::Conflict` (carrying the current document) unless the document
     /// is still at seq `n`. Checks and commit happen under one writer lock.
     pub fn update_if(&self, id: &str, mut new_doc: Value, if_seq: Option<u64>) -> Result<()> {
+        if let Some(v2) = &self.v2 {
+            return v2.update(id, new_doc, if_seq);
+        }
         let _guard = self.writer.lock();
 
         let old_doc = {
@@ -2064,6 +2521,9 @@ impl Database {
     /// failure: the path did not resolve (missing intermediate, out-of-bounds
     /// index, non-array at the target) — nothing changed, nothing journaled.
     pub fn array_push(&self, id: &str, field: &str, value: Value) -> Result<bool> {
+        if let Some(v2) = &self.v2 {
+            return v2.array_push(id, field, value);
+        }
         let _guard = self.writer.lock();
 
         let old_doc = {
@@ -2125,6 +2585,9 @@ impl Database {
     /// path did not resolve (missing intermediate segment, out-of-bounds
     /// index) — nothing changed, nothing journaled.
     pub fn set(&self, id: &str, path: &str, value: Value) -> Result<bool> {
+        if let Some(v2) = &self.v2 {
+            return v2.set(id, path, value);
+        }
         let _guard = self.writer.lock();
 
         let old_doc = {
@@ -2163,6 +2626,9 @@ impl Database {
     /// the path did not resolve (remove of a missing key is idempotent) —
     /// nothing changed, nothing journaled.
     pub fn remove(&self, id: &str, path: &str) -> Result<bool> {
+        if let Some(v2) = &self.v2 {
+            return v2.remove(id, path);
+        }
         let _guard = self.writer.lock();
 
         let old_doc = {
@@ -2193,6 +2659,9 @@ impl Database {
 
     /// The commit seq of a live document, `None` when it does not exist.
     pub fn doc_seq(&self, id: &str) -> Option<u64> {
+        if let Some(v2) = &self.v2 {
+            return v2.doc_seq(id);
+        }
         self.doc_seq.read().get(id).copied()
     }
 
@@ -2215,6 +2684,9 @@ impl Database {
     ) -> Result<ApplyOpsResult> {
         if ops.is_empty() {
             return Err(Error::invalid_arg("patch must contain at least one op"));
+        }
+        if let Some(v2) = &self.v2 {
+            return v2.apply_ops(id, ops.to_vec(), if_seq);
         }
         let _guard = self.writer.lock();
 
@@ -2285,6 +2757,9 @@ impl Database {
     /// Delete a document by ID. O(1) duration.
     /// In an on-disk database, writes a tombstone instead of deleting data.
     pub fn delete(&self, id: &str) -> Result<()> {
+        if let Some(v2) = &self.v2 {
+            return v2.delete(id);
+        }
         let _guard = self.writer.lock();
 
         let doc_to_trash = {
@@ -2427,22 +2902,36 @@ impl Database {
     /// Iterator over all non-deleted documents.
     /// Returns owned `Value`s (one clone per document) for thread safety.
     pub fn iter(&self) -> Vec<Value> {
+        if let Some(v2) = &self.v2 {
+            return v2
+                .iter()
+                .unwrap_or_else(|e| panic!("v2 iter: {e}"));
+        }
         let docs = self.docs.read();
         docs.values().map(|doc| (**doc).clone()).collect()
     }
 
     /// Number of active (non-deleted) documents.
     pub fn len(&self) -> usize {
+        if let Some(v2) = &self.v2 {
+            return v2.len();
+        }
         self.docs.read().len()
     }
 
     /// Check if database is empty.
     pub fn is_empty(&self) -> bool {
+        if let Some(v2) = &self.v2 {
+            return v2.is_empty();
+        }
         self.docs.read().is_empty()
     }
 
     /// Check if a document exists.
     pub fn contains(&self, id: &str) -> bool {
+        if let Some(v2) = &self.v2 {
+            return v2.contains(id);
+        }
         self.docs.read().contains_key(id)
     }
 
@@ -2453,6 +2942,9 @@ impl Database {
     /// narrows the candidates — every candidate is re-checked with the same
     /// whole-value equality the scan uses, so both paths return the same set.
     pub fn find(&self, field: &str, value: &Value) -> Vec<Value> {
+        if let Some(v2) = &self.v2 {
+            return v2.find(field, value).unwrap_or_else(|e| panic!("v2 find: {e}"));
+        }
         if let Some(ids) = self.index_lookup(field, value) {
             let docs = self.docs.read();
             let mut ids: Vec<String> = ids.into_iter().collect();
@@ -2486,6 +2978,11 @@ impl Database {
     where
         F: Fn(&Value) -> bool,
     {
+        if let Some(v2) = &self.v2 {
+            return v2
+                .find_where(field, predicate)
+                .unwrap_or_else(|e| panic!("v2 find_where: {e}"));
+        }
         let docs = self.docs.read();
         docs.values()
             .filter(|doc| {
@@ -2503,6 +3000,11 @@ impl Database {
     /// over the shared [`OrderedValue`] key order, which is exactly the
     /// comparison a linear scan applies, so both paths are equal sets.
     pub fn find_range(&self, field: &str, min: &Value, max: &Value) -> Vec<Value> {
+        if let Some(v2) = &self.v2 {
+            return v2
+                .find_range(field, min, max)
+                .unwrap_or_else(|e| panic!("v2 find_range: {e}"));
+        }
         let in_range = |doc: &Value| {
             doc.get(field)
                 .map(|v| {
@@ -2586,106 +3088,9 @@ impl Database {
         }
     }
 
-    /// Candidate ids for `ast`, or `None` when no conjunct is indexable.
-    ///
-    /// Every returned set is a **superset** of what `query_matches` would
-    /// accept, which is the only property the caller needs: candidates are
-    /// re-evaluated with `query_matches` before being returned. Combinators
-    /// are mirrored exactly — `query_matches` returns early on `$and`/`$or`/
-    /// `$not`, so sibling field keys of a combinator are not constraints and
-    /// are not planned.
+    /// Candidate ids for `ast` (the shared planner).
     fn plan_candidates(&self, ast: &Value) -> Option<HashSet<String>> {
-        match ast {
-            Value::Object(map) => {
-                if let Some(and_expr) = map.get("$and") {
-                    let children = and_expr.as_array()?;
-                    return self.intersect_plans(children.iter());
-                }
-                if map.contains_key("$or") || map.contains_key("$not") {
-                    return None;
-                }
-                let mut sets = Vec::new();
-                for (field, condition) in map {
-                    if let Some(set) = self.condition_candidates(field, condition) {
-                        sets.push(set);
-                    }
-                }
-                intersect_sets(sets)
-            }
-            Value::Array(conditions) => self.intersect_plans(conditions.iter()),
-            _ => None,
-        }
-    }
-
-    fn intersect_plans<'a, I>(&self, children: I) -> Option<HashSet<String>>
-    where
-        I: Iterator<Item = &'a Value>,
-    {
-        let mut sets = Vec::new();
-        for child in children {
-            if let Some(set) = self.plan_candidates(child) {
-                sets.push(set);
-            }
-        }
-        intersect_sets(sets)
-    }
-
-    /// Index candidates for one field condition.
-    ///
-    /// Every operator in the object is a necessary condition, so the
-    /// per-operator candidate sets are intersected (not unioned) — a tighter,
-    /// still-correct superset. Range bounds on the same field are merged into
-    /// a single BTree scan first: intersecting interval scans one by one would
-    /// materialize the widest set just to throw it away.
-    fn condition_candidates(&self, field: &str, condition: &Value) -> Option<HashSet<String>> {
-        let Value::Object(ops) = condition else {
-            // Implicit `$eq`.
-            return self.index_lookup(field, condition);
-        };
-        let mut sets = Vec::new();
-        // (bound value, inclusive) — kept owned so a chosen bound outlives the
-        // loop that found it.
-        let mut lower: Option<(Value, bool)> = None;
-        let mut upper: Option<(Value, bool)> = None;
-
-        for (op, operand) in ops {
-            match op.as_str() {
-                "$eq" => {
-                    if let Some(set) = self.index_lookup(field, operand) {
-                        sets.push(set);
-                    }
-                }
-                "$in" => {
-                    if let Some(set) = self.index_in(field, operand) {
-                        sets.push(set);
-                    }
-                }
-                "$gt" => lower = stronger_lower(lower, operand, false),
-                "$gte" => lower = stronger_lower(lower, operand, true),
-                "$lt" => upper = stronger_upper(upper, operand, false),
-                "$lte" => upper = stronger_upper(upper, operand, true),
-                // $ne / $nin / $exists do not narrow a candidate set.
-                _ => {}
-            }
-        }
-
-        if lower.is_some() || upper.is_some() {
-            let min = match &lower {
-                None => KeyBound::Unbounded,
-                Some((v, true)) => KeyBound::Included(v),
-                Some((v, false)) => KeyBound::Excluded(v),
-            };
-            let max = match &upper {
-                None => KeyBound::Unbounded,
-                Some((v, true)) => KeyBound::Included(v),
-                Some((v, false)) => KeyBound::Excluded(v),
-            };
-            if let Some(set) = self.index_range(field, min, max) {
-                sets.push(set);
-            }
-        }
-
-        intersect_sets(sets)
+        plan_candidates(ast, self)
     }
 
     /// Every document matching `ast`, as shared references: matching itself
@@ -2731,6 +3136,9 @@ impl Database {
     /// Indexable conjuncts narrow the scan first (the query planner); the
     /// result is identical to a full scan either way.
     pub fn query(&self, ast: Value) -> Result<Vec<Value>> {
+        if let Some(v2) = &self.v2 {
+            return v2.query(ast);
+        }
         validate_query_ast(&ast)?;
         Ok(self
             .collect_matches(&ast, None)
@@ -2742,6 +3150,9 @@ impl Database {
     /// Execute a JSON AST query with options (limit, sort, offset).
     /// Validated like `query` (G4).
     pub fn query_with(&self, ast: Value, opts: QueryOptions) -> Result<Vec<Value>> {
+        if let Some(v2) = &self.v2 {
+            return v2.query_with(ast, opts);
+        }
         let mut results = self.query(ast)?;
 
         // Sort (dot-notation aware — "meta.views" resolves, not just top-level)
@@ -2791,6 +3202,9 @@ impl Database {
         fields: Option<&[String]>,
         text_ids: Option<&HashSet<String>>,
     ) -> Result<(usize, Vec<Value>)> {
+        if let Some(v2) = &self.v2 {
+            return v2.query_projected(ast, opts, fields, text_ids);
+        }
         validate_query_ast(&ast)?;
         let sort_field = opts.sort_by.as_ref().map(|(f, _)| f.clone());
         let matches = self.collect_matches(&ast, text_ids);
@@ -2830,12 +3244,40 @@ impl Database {
         Ok((total, rows.into_iter().map(|(_, proj)| proj).collect()))
     }
 
+    /// The selected page as pre-serialized JSON bytes, for the HTTP layer.
+    ///
+    /// On v2 the bytes come straight from the store (or the mapping) instead
+    /// of being parsed into a `Value` and re-serialized per hit; on v1 the
+    /// documents are serialized once. Same selection, sort and pagination as
+    /// [`Database::query_projected`].
+    pub fn query_raw(
+        &self,
+        ast: Value,
+        opts: QueryOptions,
+        text_ids: Option<&HashSet<String>>,
+    ) -> Result<(usize, Vec<std::sync::Arc<[u8]>>)> {
+        if let Some(v2) = &self.v2 {
+            return v2.query_raw(ast, opts, text_ids);
+        }
+        let (total, docs) = self.query_projected(ast, opts, None, text_ids)?;
+        let mut out = Vec::with_capacity(docs.len());
+        for doc in docs {
+            out.push(std::sync::Arc::from(serde_json::to_vec(&doc)?));
+        }
+        Ok((total, out))
+    }
+
     /// Term counts per field, single O(n) scan. Array fields count per element
     /// (each category in `categories` counts once); scalar fields count per
     /// value. Only string values are counted (numbers/bools are skipped).
     /// Returns (field, counts) pairs in input order; counts are in BTreeMap
     /// (sorted) order for deterministic output.
     pub fn facet_counts(&self, fields: &[String]) -> Vec<(String, BTreeMap<String, usize>)> {
+        if let Some(v2) = &self.v2 {
+            return v2
+                .facet_counts(fields)
+                .unwrap_or_else(|e| panic!("v2 facet_counts: {e}"));
+        }
         let mut counts: Vec<(String, BTreeMap<String, usize>)> =
             fields.iter().map(|f| (f.clone(), BTreeMap::new())).collect();
         {
@@ -2862,6 +3304,9 @@ impl Database {
     /// Create a hash index on a field (one scan of the store). Dot-notation
     /// paths resolve exactly like `field_get`, so `meta.score` is indexable.
     pub fn create_index(&self, field: &str) -> Result<()> {
+        if let Some(v2) = &self.v2 {
+            return v2.create_index(field, V2IndexKind::Hash);
+        }
         let _guard = self.writer.lock();
 
         let mut index = HashIndex::new();
@@ -2881,6 +3326,9 @@ impl Database {
     /// Create a BTree index on a field (ordered equality + range scans).
     /// A field may carry a hash index and a BTree index at the same time.
     pub fn create_btree_index(&self, field: &str) -> Result<()> {
+        if let Some(v2) = &self.v2 {
+            return v2.create_index(field, V2IndexKind::BTree);
+        }
         let _guard = self.writer.lock();
 
         let mut index = BTreeIndex::new();
@@ -2899,6 +3347,9 @@ impl Database {
 
     /// Drop every index on a field, freeing memory.
     pub fn drop_index(&self, field: &str) -> Result<()> {
+        if let Some(v2) = &self.v2 {
+            return v2.drop_index(field);
+        }
         let hash = self.hash_indexes.write().remove(field).is_some();
         let btree = self.btree_indexes.write().remove(field).is_some();
         if !hash && !btree {
@@ -2909,12 +3360,18 @@ impl Database {
 
     /// Check if any index exists for a field.
     pub fn has_index(&self, field: &str) -> bool {
+        if let Some(v2) = &self.v2 {
+            return v2.has_index(field);
+        }
         self.hash_indexes.read().contains_key(field)
             || self.btree_indexes.read().contains_key(field)
     }
 
     /// Check if a full-text index exists for a field.
     pub fn has_text_index(&self, field: &str) -> bool {
+        if let Some(v2) = &self.v2 {
+            return v2.has_text_index(field);
+        }
         self.text_indexes.read().contains_key(field)
     }
 
@@ -2926,6 +3383,9 @@ impl Database {
     /// `min_available_seq` advances to `last_seq + 1`: everything before it was
     /// rewritten as base state and can no longer be replayed as events.
     pub fn compact(&self) -> Result<()> {
+        if let Some(v2) = &self.v2 {
+            return v2.compact();
+        }
         let _guard = self.writer.lock();
 
         let lineage = self.lineage.read().clone();
@@ -2967,6 +3427,9 @@ impl Database {
 
     /// Current journal identity and seq watermarks.
     pub fn lineage(&self) -> SourceLineage {
+        if let Some(v2) = &self.v2 {
+            return v2.lineage();
+        }
         self.lineage.read().clone()
     }
 
@@ -2974,6 +3437,11 @@ impl Database {
     /// lock, so no commit can land between the watermark and the document set.
     /// Documents are sorted by id.
     pub fn snapshot_at(&self) -> Snapshot {
+        if let Some(v2) = &self.v2 {
+            return v2
+                .snapshot_at()
+                .unwrap_or_else(|e| panic!("v2 snapshot_at: {e}"));
+        }
         let _guard = self.writer.lock();
         let lineage = self.lineage.read().clone();
         let docs = self.docs.read();
@@ -2992,6 +3460,9 @@ impl Database {
     /// events after `since_seq` were rewritten away by a compaction and the
     /// caller must resync from a fresh snapshot.
     pub fn changes_since(&self, since_seq: u64) -> Result<ChangeBatch> {
+        if let Some(v2) = &self.v2 {
+            return v2.changes_since(since_seq);
+        }
         let _guard = self.writer.lock();
         let lineage = self.lineage.read().clone();
 
@@ -3129,6 +3600,14 @@ impl Database {
         let target = target_dir.as_ref();
         fs::create_dir_all(target).map_err(Error::io_err(target, "create snapshot directory"))?;
 
+        if let Some(v2) = &self.v2 {
+            // The engine writes the clean `data.jsonl`; meta.json and buckets
+            // are format-agnostic and shared with the v1 path below.
+            v2.export_snapshot(target)?;
+            self.copy_snapshot_extras(target)?;
+            return Ok(());
+        }
+
         let docs = self.docs.read();
         let active: Vec<&Value> = docs.values().map(|doc| doc.as_ref()).collect();
         
@@ -3149,36 +3628,51 @@ impl Database {
                 last_seq: lineage.last_seq,
             },
         )?;
-        
-        // 2. Copy the meta.json across
+        drop(docs);
+
+        // 2 + 3. meta.json and the active bucket files.
+        self.copy_snapshot_extras(target)?;
+
+        Ok(())
+    }
+
+    /// Copy `meta.json` and the live bucket files into an exported snapshot.
+    fn copy_snapshot_extras(&self, target: &Path) -> Result<()> {
         let meta_src = self.base_dir.join("meta.json");
         let meta_dst = target.join("meta.json");
         if meta_src.exists() {
-            fs::copy(&meta_src, &meta_dst).map_err(Error::io_err(&meta_dst, "copy meta.json for snapshot"))?;
+            fs::copy(&meta_src, &meta_dst)
+                .map_err(Error::io_err(&meta_dst, "copy meta.json for snapshot"))?;
         }
-        
-        // 3. Create the clean buckets folder & stream the active files
+
         let buckets_src = self.base_dir.join("_files");
         let buckets_dst = target.join("_files");
         if buckets_src.exists() {
             // Find only buckets natively active in this DB
-            for entry in fs::read_dir(&buckets_src).map_err(Error::io_err(&buckets_src, "read buckets dir"))? {
+            for entry in
+                fs::read_dir(&buckets_src).map_err(Error::io_err(&buckets_src, "read buckets dir"))?
+            {
                 let entry = entry.map_err(Error::io_err(&buckets_src, "read bucket entry"))?;
                 if entry.file_type().map_or(false, |t| t.is_dir()) {
                     let bucket_name = entry.file_name();
                     let dst_bucket = buckets_dst.join(&bucket_name);
-                    fs::create_dir_all(&dst_bucket).map_err(Error::io_err(&dst_bucket, "create snapshot bucket"))?;
-                    
+                    fs::create_dir_all(&dst_bucket)
+                        .map_err(Error::io_err(&dst_bucket, "create snapshot bucket"))?;
+
                     // Copy non-trash binaries; item buckets (#9) store one
                     // folder per item, copied whole.
-                    for file_entry in fs::read_dir(entry.path()).map_err(Error::io_err(&entry.path(), "read bucket files"))? {
-                        let f = file_entry.map_err(Error::io_err(&entry.path(), "read active binary"))?;
+                    for file_entry in fs::read_dir(entry.path())
+                        .map_err(Error::io_err(&entry.path(), "read bucket files"))?
+                    {
+                        let f = file_entry
+                            .map_err(Error::io_err(&entry.path(), "read active binary"))?;
                         let file_name = f.file_name();
                         if file_name == "_trash" {
                             continue;
                         }
                         if f.file_type().map_or(false, |t| t.is_file()) {
-                            fs::copy(f.path(), dst_bucket.join(&file_name)).map_err(Error::io_err(f.path(), "copy file to snapshot"))?;
+                            fs::copy(f.path(), dst_bucket.join(&file_name))
+                                .map_err(Error::io_err(f.path(), "copy file to snapshot"))?;
                         } else if f.file_type().map_or(false, |t| t.is_dir()) {
                             copy_dir_recursive(&f.path(), &dst_bucket.join(&file_name))?;
                         }
@@ -3186,8 +3680,58 @@ impl Database {
                 }
             }
         }
-        
         Ok(())
+    }
+
+    /// Every live document as an owned `(id, doc)` pair.
+    pub fn all_docs(&self) -> Result<Vec<(String, Value)>> {
+        if let Some(v2) = &self.v2 {
+            return v2.all_docs();
+        }
+        let docs = self.docs.read();
+        Ok(docs
+            .iter()
+            .map(|(id, doc)| (id.clone(), (**doc).clone()))
+            .collect())
+    }
+
+    /// Write the database as human-readable JSON Lines (a `_meta` header when
+    /// `with_meta`), sorted by id. Returns the number of documents written.
+    pub fn export_jsonl<P: AsRef<Path>>(&self, out: P, with_meta: bool) -> Result<usize> {
+        if let Some(v2) = &self.v2 {
+            return v2.export_jsonl(out.as_ref(), with_meta);
+        }
+        let out = out.as_ref();
+        let lineage = self.lineage();
+        let mut docs = self.all_docs()?;
+        docs.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut buf = String::new();
+        if with_meta {
+            let meta = serde_json::json!({
+                "_meta": {
+                    "version": 1,
+                    "created": now_secs(),
+                    "source_epoch_uuid": lineage.source_epoch_uuid,
+                    "last_seq": lineage.last_seq,
+                    "min_available_seq": lineage.last_seq.saturating_add(1),
+                }
+            });
+            buf.push_str(&meta.to_string());
+            buf.push('\n');
+        }
+        for (_, doc) in &docs {
+            buf.push_str(&serde_json::to_string(doc)?);
+            buf.push('\n');
+        }
+        if let Some(parent) = out.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)
+                    .map_err(Error::io_err(parent, "create export directory"))?;
+            }
+        }
+        fs::write(out, buf).map_err(Error::io_err(out, "write JSONL export"))?;
+        Ok(docs.len())
     }
 
     /// Get the trash directory path.
@@ -3197,16 +3741,25 @@ impl Database {
 
     /// List deleted document IDs.
     pub fn deleted_ids(&self) -> Vec<String> {
+        if let Some(v2) = &self.v2 {
+            return v2.deleted_ids();
+        }
         self.deleted.read().iter().cloned().collect()
     }
 
     /// Get all active document IDs.
     pub fn get_all_ids(&self) -> Vec<String> {
+        if let Some(v2) = &self.v2 {
+            return v2.get_all_ids();
+        }
         self.docs.read().keys().cloned().collect()
     }
 
     /// Restore a deleted document from trash by ID.
     pub fn restore(&self, id: &str) -> Result<()> {
+        if let Some(v2) = &self.v2 {
+            return self.restore_v2(v2, id);
+        }
         let _guard = self.writer.lock();
 
         if self.is_in_memory() {
@@ -3289,10 +3842,62 @@ impl Database {
         Ok(())
     }
 
+    /// Restore a deleted document from the v2 trash file.
+    fn restore_v2(&self, v2: &Arc<v2_engine::V2Engine>, id: &str) -> Result<()> {
+        let _guard = self.writer.lock();
+
+        if !v2.is_deleted(id) {
+            return Err(Error::invalid_arg(format!("restore: {id} is not deleted")));
+        }
+
+        let trash_docs = storage::read_trash(&self.trash_doc_path())?;
+        let mut last_trash_entry: Option<Value> = None;
+        for doc in trash_docs.into_iter().rev() {
+            if doc.get("_id").and_then(|v| v.as_str()) == Some(id) {
+                last_trash_entry = Some(doc);
+                break;
+            }
+        }
+        let mut trash_doc = last_trash_entry.ok_or_else(|| Error::not_found(id))?;
+
+        let trashed_files: Vec<String> = trash_doc
+            .get("_trashed_files")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if let Some(obj) = trash_doc.as_object_mut() {
+            obj.remove("_deleted");
+            obj.remove("_trashed_files");
+        }
+
+        // Journal (the WAL put) first: a failed commit leaves the document
+        // deleted and the restore retryable.
+        v2.restore(id, trash_doc)?;
+
+        for s in &trashed_files {
+            if let Some(file_ref) = FileRef::from_compact(s) {
+                let bucket = self.bucket(&file_ref.bucket);
+                if let Err(e) = bucket.restore(&file_ref.id, &file_ref.ext) {
+                    report::suppressed("restore: return file from trash", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     // ─── Persistence ───────────────────────────────────────────────
 
     /// Explicitly flush pending writes to disk.
     pub fn flush(&self) -> Result<()> {
+        if let Some(v2) = &self.v2 {
+            return v2.flush();
+        }
         if self.is_in_memory() {
             return Ok(());
         }
@@ -3316,6 +3921,16 @@ impl Database {
         self.dirty.store(false, Ordering::SeqCst);
 
         Ok(())
+    }
+
+    /// Whether this handle is backed by the v2 binary/mmap engine.
+    pub fn is_v2(&self) -> bool {
+        self.v2.is_some()
+    }
+
+    /// The live v2 manifest, when this is a v2 database.
+    pub fn v2_manifest(&self) -> Option<V2Manifest> {
+        self.v2.as_ref().map(|engine| engine.manifest())
     }
 
     /// Get the database file path.
@@ -3494,11 +4109,7 @@ impl Database {
             // form counts as a reference rather than only the exact spelling
             // stored.
             {
-                let docs = self.docs.read();
-                let mut live = HashSet::new();
-                for val in docs.values() {
-                    Self::extract_file_refs(val, &mut live);
-                }
+                let live = self.collect_live_file_refs()?;
                 if live.contains(&compact) {
                     return Ok(false);
                 }
@@ -3535,15 +4146,8 @@ impl Database {
         // correct trade.
         let _guard = self.writer.lock();
 
-        let mut active_refs = HashSet::new();
-        
         // 1. Mark phase: extract all possible `{bucket}:{hash}.{ext}` strings
-        {
-            let docs = self.docs.read();
-            for val in docs.values() {
-                Self::extract_file_refs(val, &mut active_refs);
-            }
-        }
+        let active_refs = self.collect_live_file_refs()?;
 
         let mut trashed_count = 0;
         let files_base = self.base_dir.join("_files");
@@ -3650,7 +4254,22 @@ impl Database {
         None
     }
 
-    fn extract_file_refs(value: &Value, refs: &mut HashSet<String>) {
+    /// Every nURI file reference held by a live document, whichever backend
+    /// owns the document store.
+    fn collect_live_file_refs(&self) -> Result<HashSet<String>> {
+        let mut refs = HashSet::new();
+        if let Some(v2) = &self.v2 {
+            v2.for_each_doc(|_, doc| Self::extract_file_refs(doc, &mut refs))?;
+            return Ok(refs);
+        }
+        let docs = self.docs.read();
+        for val in docs.values() {
+            Self::extract_file_refs(val, &mut refs);
+        }
+        Ok(refs)
+    }
+
+    pub(crate) fn extract_file_refs(value: &Value, refs: &mut HashSet<String>) {
         match value {
             Value::String(s) => {
                 if let Some(compact) = Self::normalize_file_ref(s) {

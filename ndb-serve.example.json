@@ -2,6 +2,7 @@
   "bind": "127.0.0.1",
   "port": 8323,
   "persistence": "immediate",
+  "format": "auto",
   "default_limit": 1000,
   "max_limit": 50000,
   "dbs": {
