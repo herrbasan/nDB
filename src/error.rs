@@ -70,6 +70,24 @@ pub enum Error {
     /// without a second round trip.
     #[error("conflict: document is at seq {current_seq}")]
     Conflict { current_seq: u64, doc: Value },
+
+    /// The database is poisoned: a WAL write or fsync failed in a way that
+    /// leaves the durable tail's state unknown. Nothing was published, and
+    /// every later mutation is refused until the database is reopened and
+    /// recovered. Reads keep working — RAM is authoritative up to `last_seq`.
+    #[error("database is poisoned after an uncertain durable write ({reason}); reopen and recover before writing again")]
+    Poisoned { reason: String },
+
+    /// A write would cross the database's own RAM budget. Nothing was staged
+    /// and nothing was written: the caller may retry after freeing room.
+    #[error(
+        "memory limit exceeded: {current_bytes} bytes in use, limit {limit_bytes}, this write needs {needed_bytes} more"
+    )]
+    MemoryLimitExceeded {
+        current_bytes: usize,
+        limit_bytes: usize,
+        needed_bytes: usize,
+    },
 }
 
 impl Error {
@@ -108,6 +126,13 @@ impl Error {
     /// Create a bucket-policy violation error.
     pub fn policy_violation(reason: impl Into<String>) -> Self {
         Error::PolicyViolation {
+            reason: reason.into(),
+        }
+    }
+
+    /// Create a poisoned-database error.
+    pub fn poisoned(reason: impl Into<String>) -> Self {
+        Error::Poisoned {
             reason: reason.into(),
         }
     }

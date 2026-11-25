@@ -68,13 +68,14 @@ CLI: `ndb init --v2`, `migrate`, `fsck`, `repair`, `export --jsonl`. Full
 reference: `documentation/v2-storage.md`; benchmark and gate verdicts:
 `docs/phase3-benchmark-v1-vs-v2.md`.
 
-### RAM-first engine (Phase 0 contracts)
+### RAM-first engine (Phase 1, slice 1C landed)
 
 The v2 mmap backend is the baseline being replaced by a RAM-first engine
 (authoritative `DocVal`/`DocRecord` in RAM, op-level WAL with group commit,
 single visibility lock, bounded change ring, non-blocking compaction). Phase 0
-freezes the contracts and builds the trust harness; **no engine behaviour has
-changed yet**.
+froze the contracts and built the trust harness; **slice 1C adds the engine as a
+third storage format** — v1 and v2 are untouched and still the default for
+existing folders.
 
 - `docs/contract_ram-first-engine.md` — normative: RAM state, durability and
   group commit, failure/poison rules, the recovery+compaction crash matrix,
@@ -84,11 +85,39 @@ changed yet**.
 - `src/io.rs` — `Io` trait (`RealIo`; `FaultIo` under `#[cfg(any(test, feature =
   "fault-io"))]`) covering every durable step, so the fault matrix can fail or
   kill the process at an exact operation.
+- `src/ram_format.rs` — RAM-first format **v3** (`manifest.json`, streamed
+  `base.gen_<N>.ndb`, op-level `wal.gen_<N>.ndb` with a trailing `Commit`
+  frame): manifest/base writers and the WAL writer go through `Io` at every
+  mutation; `scan_ram_wal` is read-only and separates a torn tail (`R0`) from
+  mid-log corruption; `repair_ram_wal` / `fsck_ram_dir` for recovery.
+- `src/ram_engine.rs` — the engine. `RwLock<RamState>` is the one visibility
+  boundary (`docs`, `deleted`, indexes, lineage, manifest, change ring,
+  pins); a per-DB FIFO queue with a single commit leader validates a batch
+  against current RAM + earlier staged jobs, appends op-level frames
+  (`Insert`/`Replace`/`Patch`/`Delete`/`Restore`) plus one `Commit` in a single
+  `write_all` + `sync_all`, and only then publishes. Transient I/O
+  (`Interrupted`, Windows 32) retries after truncating the batch back to its
+  start offset; anything else poisons the DB (`Error::Poisoned`, HTTP 503) with
+  nothing published. Index DDL is a schema-only batch that consumes **no**
+  document seq (#17); `offset` is honoured without `limit` (#15); the fsync is
+  unconditional (#16). Memory is governed by `RamConfig` (unpinned ring
+  eviction first, then `Error::MemoryLimitExceeded` / HTTP 507 before the WAL is
+  touched).
+- `StorageFormat::{Auto,V1,V2,Ram}` — `ram`/`v3` parse; `Auto` routes a folder
+  whose `manifest.json` is version 3 to the engine (v2 manifests carry
+  `format_version`); `Database::open_ram`, `open_ram_with_config`,
+  `open_ram_with_io` (test/`fault-io`), `is_ram`, `ram_stats`.
+  `GET /stats` and `GET /v2/dbs/{name}/stats` add a `ram` block
+  (live/index/ring bytes, oldest retained seq, expired cursors, pins, poison,
+  WAL bytes, stage timings); `/v2/dbs` reports `"format": "ram"`.
 - `tests/support/refdb.rs` — `RefDb`, a sequential reference model used as the
   differential oracle; `tests/support/crash_child.rs` — out-of-process crash
   runner (`current_exe()` + `NDB_CRASH_CHILD_ROLE`).
-- Tests: `cargo test --features fault-io --test refdb_oracle_tests --test
-  phase17_fault_injection_tests`; `cargo test --features fault-io --lib io::tests`.
+- Tests: `cargo test --features fault-io --test phase18_ram_engine_tests` (the
+  10 000-op differential oracle, the three fix regressions, 4 MB structural
+  sharing/WAL growth, 8-writer/4-reader group commit, poison injection, memory
+  budget); `--test refdb_oracle_tests --test phase17_fault_injection_tests`;
+  `cargo test --features fault-io --lib io::tests`.
 - Baseline: `cargo run --release --example corpus_baseline -- [--corpus
   memories|chat|all]` (default `all`) measures the Phase 0 workloads — warm
   `get`/mget/`$eq`/scan, durable `set`/`update`/`array_push` under

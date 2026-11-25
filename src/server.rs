@@ -1194,13 +1194,14 @@ fn handle_stats(db: &Database) -> (u16, Value) {
     // O(1): the store knows its own size. Counting by materializing every
     // document (the old `db.iter().len()`) deep-cloned the entire database.
     let count = db.len();
-    (
-        200,
-        json!({
-            "ok": true,
-            "documents": count,
-        }),
-    )
+    let mut body = json!({
+        "ok": true,
+        "documents": count,
+    });
+    if let Some(stats) = ram_stats_json(db) {
+        body["ram"] = stats;
+    }
+    (200, body)
 }
 
 fn respond_query(db: &Database, config: &ServerConfig, req: &Request) -> Response {
@@ -1663,6 +1664,8 @@ fn map_db_error(e: Error) -> (u16, Value) {
                 "doc": doc,
             }),
         ),
+        Error::Poisoned { .. } => v2_error(503, "db_poisoned", e.to_string()),
+        Error::MemoryLimitExceeded { .. } => v2_error(507, "memory_limit_exceeded", e.to_string()),
         _ => v2_error(500, "internal_error", e.to_string()),
     }
 }
@@ -1732,13 +1735,43 @@ fn elapsed_ms(start: Instant) -> f64 {
 
 fn db_descriptor(name: &str, db: &Database) -> Value {
     let lineage = db.lineage();
+    let format = if db.is_ram() {
+        "ram"
+    } else if db.is_v2() {
+        "v2"
+    } else {
+        "v1"
+    };
     json!({
         "name": name,
-        "format": if db.is_v2() { "v2" } else { "v1" },
+        "format": format,
         "documents": db.len(),
         "source_epoch_uuid": lineage.source_epoch_uuid,
         "last_seq": lineage.last_seq,
         "min_available_seq": lineage.min_available_seq,
+    })
+}
+
+/// The RAM-first counters as JSON, or `None` for a v1/v2 database.
+fn ram_stats_json(db: &Database) -> Option<Value> {
+    db.ram_stats().map(|stats| {
+        json!({
+            "live_doc_bytes": stats.live_doc_bytes,
+            "index_bytes": stats.index_bytes,
+            "ring_bytes": stats.ring_bytes,
+            "oldest_retained_seq": stats.oldest_retained_seq,
+            "expired_cursors": stats.expired_cursors,
+            "active_pins": stats.active_pins,
+            "poisoned": stats.poisoned,
+            "wal_bytes": stats.wal_bytes,
+            "stage_us": {
+                "validate": stats.validate_us,
+                "queue_wait": stats.queue_wait_us,
+                "fsync": stats.fsync_us,
+                "publish": stats.publish_us,
+                "batches": stats.batch_count,
+            },
+        })
     })
 }
 
@@ -1771,7 +1804,8 @@ struct CreateDbRequest {
     name: String,
     #[serde(default)]
     persistence: Option<String>,
-    /// `auto` | `v1` | `v2`; `v2` initialises a binary/mmap folder database.
+    /// `auto` | `v1` | `v2` | `ram` (`v3`); `v2` initialises a binary/mmap
+    /// folder database, `ram` a RAM-first v3 folder.
     #[serde(default)]
     format: Option<String>,
 }
@@ -1854,10 +1888,17 @@ fn route_v2(
     }
 
     let (status, body) = match (req.method.as_str(), &segments[3..]) {
-        ("GET", ["stats"]) => (
-            200,
-            json!({"ok": true, "documents": db.len(), "lineage": lineage_json(&db)}),
-        ),
+        ("GET", ["stats"]) => {
+            let mut body = json!({
+                "ok": true,
+                "documents": db.len(),
+                "lineage": lineage_json(&db),
+            });
+            if let Some(stats) = ram_stats_json(&db) {
+                body["ram"] = stats;
+            }
+            (200, body)
+        }
 
         ("POST", ["query"]) => return respond_v2_query(&db, config, req),
         ("POST", ["find"]) => handle_v2_find(&db, req),

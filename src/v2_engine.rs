@@ -618,6 +618,18 @@ fn duplicate_error(error: &Error) -> Error {
             current_seq: *current_seq,
             doc: doc.clone(),
         },
+        Error::Poisoned { reason } => Error::Poisoned {
+            reason: reason.clone(),
+        },
+        Error::MemoryLimitExceeded {
+            current_bytes,
+            limit_bytes,
+            needed_bytes,
+        } => Error::MemoryLimitExceeded {
+            current_bytes: *current_bytes,
+            limit_bytes: *limit_bytes,
+            needed_bytes: *needed_bytes,
+        },
     }
 }
 

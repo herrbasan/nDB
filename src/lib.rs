@@ -27,11 +27,14 @@
 
 pub mod bucket;
 pub mod crc32;
+pub mod docval;
 pub mod error;
 pub mod id;
 pub mod io;
 pub mod item;
 pub mod mmap;
+pub mod ram_engine;
+pub mod ram_format;
 pub mod report;
 pub mod server;
 pub mod storage;
@@ -47,6 +50,7 @@ pub use error::{Error, Result};
 pub use item::{ItemBucket, ItemRecord, ItemState};
 pub use mmap::MmapFile;
 pub use storage::{ChangeBatch, ChangeEvent, ChangeKind, Snapshot, SourceLineage};
+pub use ram_engine::{RamConfig, RamStats};
 pub use v2_format::{
     base_file_name, base_file_path, fsck_v2_dir, manifest_path, read_manifest, repair_wal_file,
     replay_wal, scan_wal_since, wal_file_name, wal_file_path, write_base_file,
@@ -91,8 +95,9 @@ impl Default for Persistence {
 
 /// Which on-disk layout a database uses.
 ///
-/// `Auto` is the default: a folder holding `manifest.json` opens on the v2
-/// binary/mmap backend, a folder holding `data.jsonl` opens on the v1 JSONL
+/// `Auto` is the default: a folder holding a `manifest.json` whose `version`
+/// is 3 opens on the RAM-first engine, one holding a v2 manifest opens on the
+/// v2 binary/mmap backend, a folder holding `data.jsonl` opens on the v1 JSONL
 /// backend, and a brand-new folder initialises as v1 (backward compatible).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StorageFormat {
@@ -103,6 +108,8 @@ pub enum StorageFormat {
     V1,
     /// Binary base generations + CRC-framed WAL.
     V2,
+    /// RAM-first engine (`manifest.json` version 3).
+    Ram,
 }
 
 /// How a database is opened.
@@ -115,15 +122,27 @@ pub struct OpenOptions {
 }
 
 impl StorageFormat {
-    /// Parse `auto` / `v1` / `v2` (case-insensitive). Unknown values fail.
+    /// Parse `auto` / `v1` / `v2` / `ram` (alias `v3`), case-insensitive.
+    /// Unknown values fail.
     pub fn parse(text: &str) -> Result<Self> {
         match text.to_ascii_lowercase().as_str() {
             "auto" => Ok(StorageFormat::Auto),
             "v1" => Ok(StorageFormat::V1),
             "v2" => Ok(StorageFormat::V2),
+            "ram" | "v3" => Ok(StorageFormat::Ram),
             other => Err(Error::invalid_arg(format!(
-                "format must be auto | v1 | v2, got '{other}'"
+                "format must be auto | v1 | v2 | ram (v3), got '{other}'"
             ))),
+        }
+    }
+
+    /// The name `/v2/dbs` reports for this layout.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StorageFormat::Auto => "auto",
+            StorageFormat::V1 => "v1",
+            StorageFormat::V2 => "v2",
+            StorageFormat::Ram => "ram",
         }
     }
 }
@@ -292,6 +311,19 @@ pub(crate) enum KeyBound<'a> {
     Excluded(&'a Value),
 }
 
+/// Approximate heap cost of one index key, for the RAM engine's accounting.
+pub(crate) fn ordered_key_bytes(key: &OrderedValue) -> usize {
+    match key {
+        OrderedValue::Null | OrderedValue::Bool(_) | OrderedValue::Number(_) => 24,
+        OrderedValue::String(text) => 32 + text.len(),
+        OrderedValue::Composite(text) => 32 + text.len(),
+    }
+}
+
+/// Approximate heap cost one indexed `(key, id)` pair adds: the key, the id
+/// string and the set slot holding it.
+pub(crate) const INDEX_ENTRY_COST: usize = 40;
+
 impl KeyBound<'_> {
     fn ordered(self) -> std::ops::Bound<OrderedValue> {
         match self {
@@ -322,6 +354,50 @@ impl HashIndex {
         HashIndex {
             map: HashMap::new(),
         }
+    }
+
+    /// Insert `id` under pre-computed keys (the RAM engine derives them from
+    /// the document tree without materialising a `Value`).
+    pub(crate) fn insert_keys(&mut self, keys: &[OrderedValue], id: &str) {
+        for key in keys {
+            self.map.entry(key.clone()).or_default().insert(id.to_string());
+        }
+    }
+
+    /// Remove `id` from pre-computed keys.
+    pub(crate) fn remove_keys(&mut self, keys: &[OrderedValue], id: &str) {
+        for key in keys {
+            if let Some(set) = self.map.get_mut(key) {
+                set.remove(id);
+                if set.is_empty() {
+                    self.map.remove(key);
+                }
+            }
+        }
+    }
+
+    /// Ids stored under any of `keys`, deduplicated.
+    pub(crate) fn lookup_keys(&self, keys: &[OrderedValue]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: HashSet<&String> = HashSet::new();
+        for key in keys {
+            if let Some(set) = self.map.get(key) {
+                for id in set {
+                    if seen.insert(id) {
+                        out.push(id.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Approximate heap footprint of the index.
+    pub(crate) fn approx_bytes(&self) -> usize {
+        self.map
+            .iter()
+            .map(|(key, ids)| ordered_key_bytes(key) + ids.len() * INDEX_ENTRY_COST)
+            .sum()
     }
 
     /// The map as persisted-base index entries, sorted by key.
@@ -390,6 +466,67 @@ impl BTreeIndex {
         BTreeIndex {
             map: BTreeMap::new(),
         }
+    }
+
+    /// Insert `id` under pre-computed keys.
+    pub(crate) fn insert_keys(&mut self, keys: &[OrderedValue], id: &str) {
+        for key in keys {
+            self.map.entry(key.clone()).or_default().insert(id.to_string());
+        }
+    }
+
+    /// Remove `id` from pre-computed keys.
+    pub(crate) fn remove_keys(&mut self, keys: &[OrderedValue], id: &str) {
+        for key in keys {
+            if let Some(set) = self.map.get_mut(key) {
+                set.remove(id);
+                if set.is_empty() {
+                    self.map.remove(key);
+                }
+            }
+        }
+    }
+
+    /// Ids stored under any of `keys`, deduplicated.
+    pub(crate) fn lookup_keys(&self, keys: &[OrderedValue]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: HashSet<&String> = HashSet::new();
+        for key in keys {
+            if let Some(set) = self.map.get(key) {
+                for id in set {
+                    if seen.insert(id) {
+                        out.push(id.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Ids in the ordered key range, deduplicated.
+    pub(crate) fn range_keys(
+        &self,
+        min: std::ops::Bound<OrderedValue>,
+        max: std::ops::Bound<OrderedValue>,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: HashSet<&String> = HashSet::new();
+        for (_, ids) in self.map.range((min, max)) {
+            for id in ids {
+                if seen.insert(id) {
+                    out.push(id.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Approximate heap footprint of the index.
+    pub(crate) fn approx_bytes(&self) -> usize {
+        self.map
+            .iter()
+            .map(|(key, ids)| ordered_key_bytes(key) + ids.len() * INDEX_ENTRY_COST)
+            .sum()
     }
 
     /// The map as persisted-base index entries, in key order.
@@ -1043,6 +1180,27 @@ fn load_bucket_policies(base_dir: &Path) -> Result<HashMap<String, BucketPolicy>
     Ok(policies)
 }
 
+/// The format version of a `manifest.json`, read without binding to either
+/// manifest schema: v2 names the field `format_version`, v3 names it `version`.
+/// Used only to route an auto-detected folder to the right backend; the chosen
+/// backend then validates the whole file itself.
+fn read_manifest_version(path: &Path) -> Result<u32> {
+    let bytes = fs::read(path).map_err(Error::io_err(path, "read manifest version"))?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| Error::corruption(path, format!("manifest is not valid JSON: {e}")))?;
+    value
+        .get("version")
+        .or_else(|| value.get("format_version"))
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| {
+            Error::corruption(
+                path,
+                "manifest has neither a usable `version` nor `format_version` field",
+            )
+        })
+}
+
 /// An OS-enforced exclusive lock on one database.
 ///
 /// Held for the whole `Database` lifetime; released by `Drop` or by the OS when
@@ -1465,6 +1623,9 @@ pub struct Database {
     /// The v2 backend, when this handle was opened on a binary/mmap database.
     /// All document traffic is routed here; the v1 fields stay empty.
     v2: Option<Arc<v2_engine::V2Engine>>,
+    /// The RAM-first backend, when this handle was opened on a v3 database.
+    /// All document traffic is routed here; both v1 and v2 fields stay empty.
+    ram: Option<Arc<ram_engine::RamEngine>>,
 }
 
 impl Database {
@@ -1494,6 +1655,62 @@ impl Database {
         )
     }
 
+    /// Open (or initialise) a RAM-first (v3) database folder.
+    pub fn open_ram(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_ram_with_config(path, RamConfig::default())
+    }
+
+    /// Open a RAM-first database with an explicit memory/change-ring budget.
+    pub fn open_ram_with_config(
+        path: impl AsRef<Path>,
+        config: RamConfig,
+    ) -> Result<Self> {
+        Self::open_ram_at(
+            path.as_ref(),
+            config,
+            Arc::new(crate::io::RealIo::new()),
+        )
+    }
+
+    /// Open a RAM-first database over a caller-supplied [`crate::io::Io`].
+    ///
+    /// Production opens use [`crate::io::RealIo`]; tests arm `FaultIo` here so
+    /// the engine's single durable path is the one exercised.
+    #[cfg(any(test, feature = "fault-io"))]
+    pub fn open_ram_with_io(
+        path: impl AsRef<Path>,
+        config: RamConfig,
+        io: Arc<dyn crate::io::Io>,
+    ) -> Result<Self> {
+        Self::open_ram_at(path.as_ref(), config, io)
+    }
+
+    fn open_ram_at(
+        raw: &Path,
+        config: RamConfig,
+        io: Arc<dyn crate::io::Io>,
+    ) -> Result<Self> {
+        let base_dir = if raw.is_dir()
+            || raw
+                .extension()
+                .map_or(true, |e| !e.to_string_lossy().eq_ignore_ascii_case("jsonl"))
+        {
+            raw.to_path_buf()
+        } else {
+            raw.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .to_path_buf()
+        };
+        if !base_dir.as_os_str().is_empty() {
+            fs::create_dir_all(&base_dir)
+                .map_err(Error::io_err(&base_dir, "create database directory"))?;
+        }
+        let journal = base_dir.join("data.jsonl");
+        let lock = DbLock::acquire(&journal)?;
+        Self::open_ram_locked(journal, base_dir, lock, config, io)
+    }
+
     /// Open a v2 database with explicit options. `format` is forced to
     /// [`StorageFormat::V2`]; every other field is honoured.
     pub fn open_v2_with_options(
@@ -1512,7 +1729,7 @@ impl Database {
         // (whose parent is the folder). A v2 folder that does not exist yet is
         // still a folder — a v2 database is never a bare `.jsonl` file.
         let treat_as_dir = raw.is_dir()
-            || (options.format == StorageFormat::V2
+            || (matches!(options.format, StorageFormat::V2 | StorageFormat::Ram)
                 && !raw.exists()
                 && raw
                     .extension()
@@ -1542,25 +1759,117 @@ impl Database {
                 if manifest.exists() {
                     return Err(Error::corruption(
                         &manifest,
-                        "a v2 manifest exists but StorageFormat::V1 was requested",
+                        "a v2/v3 manifest exists but StorageFormat::V1 was requested",
                     ));
                 }
                 StorageFormat::V1
             }
-            StorageFormat::V2 => StorageFormat::V2,
-            StorageFormat::Auto if manifest.exists() => StorageFormat::V2,
+            StorageFormat::V2 => {
+                if manifest.exists() && read_manifest_version(&manifest)? == ram_format::RAM_STORAGE_VERSION {
+                    return Err(Error::corruption(
+                        &manifest,
+                        "a v3 (RAM-first) manifest exists but StorageFormat::V2 was requested",
+                    ));
+                }
+                StorageFormat::V2
+            }
+            StorageFormat::Ram => {
+                if manifest.exists() && read_manifest_version(&manifest)? != ram_format::RAM_STORAGE_VERSION {
+                    return Err(Error::corruption(
+                        &manifest,
+                        "a v2 manifest exists but StorageFormat::Ram was requested",
+                    ));
+                }
+                StorageFormat::Ram
+            }
+            StorageFormat::Auto if manifest.exists() => {
+                if read_manifest_version(&manifest)? == ram_format::RAM_STORAGE_VERSION {
+                    StorageFormat::Ram
+                } else {
+                    StorageFormat::V2
+                }
+            }
             StorageFormat::Auto => StorageFormat::V1,
         };
 
         match format {
+            StorageFormat::Ram => Self::open_ram_locked(
+                journal,
+                base_dir,
+                lock,
+                RamConfig::default(),
+                Arc::new(crate::io::RealIo::new()),
+            ),
             StorageFormat::V2 => Self::open_v2_locked(journal, base_dir, lock, options.persistence),
             _ => Self::open_v1_locked(journal, base_dir, lock, options.persistence),
         }
     }
 
-    /// Open a v2 database with the OS writer lock already held.
-    fn open_v2_locked(
+    /// Open a RAM-first (v3) database with the OS writer lock already held.
+    fn open_ram_locked(
         journal: PathBuf,
+        base_dir: PathBuf,
+        lock: DbLock,
+        config: RamConfig,
+        io: Arc<dyn crate::io::Io>,
+    ) -> Result<Self> {
+        let bucket_policies = load_bucket_policies(&base_dir)?;
+        let trash_lock = Arc::new(Mutex::new(()));
+        let engine = Arc::new(ram_engine::RamEngine::open_with_io(
+            &base_dir,
+            config,
+            io,
+            lock,
+        )?);
+
+        let mut item_buckets = HashMap::new();
+        for (name, policy) in &bucket_policies {
+            if policy.kind == Some(BucketKind::Items) {
+                let ttl = Duration::from_secs(
+                    policy
+                        .reserved_ttl_seconds
+                        .unwrap_or(item::DEFAULT_RESERVED_TTL_SECS),
+                );
+                item_buckets.insert(
+                    name.clone(),
+                    Arc::new(ItemBucket::open(name, &base_dir, ttl)?),
+                );
+            }
+        }
+
+        Ok(Database {
+            path: journal,
+            base_dir,
+            docs: RwLock::new(HashMap::new()),
+            deleted: RwLock::new(HashSet::new()),
+            file_refs: RwLock::new(HashMap::new()),
+            hash_indexes: RwLock::new(HashMap::new()),
+            btree_indexes: RwLock::new(HashMap::new()),
+            writer: Arc::new(Mutex::new(())),
+            trash_lock,
+            persistence: Persistence::Immediate,
+            trash_mode: TrashMode::Manual,
+            trash_ttl: None,
+            trash_purge_interval: None,
+            ttl_tx: Mutex::new(None),
+            ttl_thread: Mutex::new(None),
+            file_handle: Mutex::new(None),
+            bucket_policies,
+            item_buckets,
+            lineage: RwLock::new(engine.lineage()),
+            change_log: RwLock::new(Vec::new()),
+            doc_seq: RwLock::new(HashMap::new()),
+            _lock: None,
+            dirty: Arc::new(AtomicBool::new(false)),
+            flush_tx: Mutex::new(None),
+            flush_thread: Mutex::new(None),
+            v2: None,
+            ram: Some(engine),
+        })
+    }
+
+    /// Open a v2 database with the OS writer lock already held.
+    fn open_v2_locked(        journal: PathBuf,
         base_dir: PathBuf,
         lock: DbLock,
         persistence: Persistence,
@@ -1618,6 +1927,7 @@ impl Database {
             flush_tx: Mutex::new(None),
             flush_thread: Mutex::new(None),
             v2: Some(engine),
+            ram: None,
         };
         db.apply_persistence(persistence);
         db.start_flush_thread();
@@ -1768,6 +2078,7 @@ impl Database {
             flush_tx: Mutex::new(None),
             flush_thread: Mutex::new(None),
             v2: None,
+            ram: None,
         };
         db.apply_persistence(persistence);
         db.start_flush_thread();
@@ -1807,6 +2118,7 @@ impl Database {
             flush_tx: Mutex::new(None),
             flush_thread: Mutex::new(None),
             v2: None,
+            ram: None,
         })
     }
 
@@ -1828,6 +2140,9 @@ impl Database {
         if let Some(v2) = &self.v2 {
             v2.set_persistence(mode);
         }
+        // The RAM-first engine is unconditionally durable: every acknowledged
+        // batch was fsynced before it was published, so there is no lazy mode
+        // to configure and no "scheduled" flush to schedule.
     }
 
     /// Set trash mode. Returns self for chaining.
@@ -1864,7 +2179,7 @@ impl Database {
             Persistence::Scheduled(d) => d,
             _ => return,
         };
-        if self.is_in_memory() {
+        if self.is_in_memory() || self.ram.is_some() {
             return;
         }
         let interval = if interval.is_zero() {
@@ -2157,6 +2472,9 @@ impl Database {
     /// Insert a document. Generates a NanoID `_id` and returns it.
     /// O(1) operation: one collision check + HashMap insert + file append.
     pub fn insert(&self, mut doc: Value) -> Result<String> {
+        if let Some(ram) = &self.ram {
+            return ram.insert(doc, None);
+        }
         if let Some(v2) = &self.v2 {
             return v2.insert(doc, None);
         }
@@ -2194,6 +2512,9 @@ impl Database {
 
     /// Insert a document with a prefixed ID.
     pub fn insert_with_prefix(&self, prefix: &str, mut doc: Value) -> Result<String> {
+        if let Some(ram) = &self.ram {
+            return ram.insert(doc, Some(prefix.to_string()));
+        }
         if let Some(v2) = &self.v2 {
             return v2.insert(doc, Some(prefix.to_string()));
         }
@@ -2225,6 +2546,9 @@ impl Database {
     /// Get a document by ID. O(1) HashMap lookup (one clone to hand out an
     /// owned value — the store itself is never copied).
     pub fn get(&self, id: &str) -> Result<Value> {
+        if let Some(ram) = &self.ram {
+            return ram.get(id);
+        }
         if let Some(v2) = &self.v2 {
             return v2.get(id);
         }
@@ -2324,6 +2648,9 @@ impl Database {
     /// `Error::Conflict` (carrying the current document) unless the document
     /// is still at seq `n`. Checks and commit happen under one writer lock.
     pub fn update_if(&self, id: &str, mut new_doc: Value, if_seq: Option<u64>) -> Result<()> {
+        if let Some(ram) = &self.ram {
+            return ram.update(id, new_doc, if_seq);
+        }
         if let Some(v2) = &self.v2 {
             return v2.update(id, new_doc, if_seq);
         }
@@ -2381,6 +2708,9 @@ impl Database {
     /// failure: the path did not resolve (missing intermediate, out-of-bounds
     /// index, non-array at the target) — nothing changed, nothing journaled.
     pub fn array_push(&self, id: &str, field: &str, value: Value) -> Result<bool> {
+        if let Some(ram) = &self.ram {
+            return ram.array_push(id, field, value);
+        }
         if let Some(v2) = &self.v2 {
             return v2.array_push(id, field, value);
         }
@@ -2445,6 +2775,9 @@ impl Database {
     /// path did not resolve (missing intermediate segment, out-of-bounds
     /// index) — nothing changed, nothing journaled.
     pub fn set(&self, id: &str, path: &str, value: Value) -> Result<bool> {
+        if let Some(ram) = &self.ram {
+            return ram.set(id, path, value);
+        }
         if let Some(v2) = &self.v2 {
             return v2.set(id, path, value);
         }
@@ -2486,6 +2819,9 @@ impl Database {
     /// the path did not resolve (remove of a missing key is idempotent) —
     /// nothing changed, nothing journaled.
     pub fn remove(&self, id: &str, path: &str) -> Result<bool> {
+        if let Some(ram) = &self.ram {
+            return ram.remove(id, path);
+        }
         if let Some(v2) = &self.v2 {
             return v2.remove(id, path);
         }
@@ -2519,6 +2855,9 @@ impl Database {
 
     /// The commit seq of a live document, `None` when it does not exist.
     pub fn doc_seq(&self, id: &str) -> Option<u64> {
+        if let Some(ram) = &self.ram {
+            return ram.doc_seq(id);
+        }
         if let Some(v2) = &self.v2 {
             return v2.doc_seq(id);
         }
@@ -2544,6 +2883,9 @@ impl Database {
     ) -> Result<ApplyOpsResult> {
         if ops.is_empty() {
             return Err(Error::invalid_arg("patch must contain at least one op"));
+        }
+        if let Some(ram) = &self.ram {
+            return ram.apply_ops(id, ops.to_vec(), if_seq);
         }
         if let Some(v2) = &self.v2 {
             return v2.apply_ops(id, ops.to_vec(), if_seq);
@@ -2617,6 +2959,9 @@ impl Database {
     /// Delete a document by ID. O(1) duration.
     /// In an on-disk database, writes a tombstone instead of deleting data.
     pub fn delete(&self, id: &str) -> Result<()> {
+        if let Some(ram) = &self.ram {
+            return self.delete_ram(ram, id);
+        }
         if let Some(v2) = &self.v2 {
             return v2.delete(id);
         }
@@ -2750,9 +3095,90 @@ impl Database {
         Ok(())
     }
 
+    /// Delete a document on the RAM-first backend.
+    ///
+    /// The durable order is the contract's: the restorable trash record is
+    /// written *first*, the WAL delete commit second, and only then are the
+    /// file counters retired and orphaned files moved aside. Every prefix of a
+    /// failure therefore leaves at worst an under-cleaned state — never a
+    /// document that is gone while its restorable copy was never written.
+    fn delete_ram(&self, ram: &Arc<ram_engine::RamEngine>, id: &str) -> Result<()> {
+        let _guard = self.writer.lock();
+        let doc_to_trash = ram.get(id)?;
+
+        let mut extracted_file_refs = HashSet::new();
+        Self::extract_file_refs(&doc_to_trash, &mut extracted_file_refs);
+        let orphaned_files: Vec<String> = {
+            let file_refs = self.file_refs.read();
+            extracted_file_refs
+                .iter()
+                .filter(|r| file_refs.get(*r).map_or(false, |count| *count <= 1))
+                .cloned()
+                .collect()
+        };
+
+        for r in &extracted_file_refs {
+            if let Some(file_ref) = FileRef::from_compact(r) {
+                if let Some(policy) = self.bucket_policies.get(&file_ref.bucket) {
+                    if policy.on_document_delete == Some(OnDocumentDelete::Restrict) {
+                        return Err(Error::policy_violation(format!(
+                            "delete refused: bucket '{}' declares onDocumentDelete=restrict; reassign or release {} first",
+                            file_ref.bucket, r
+                        )));
+                    }
+                }
+            }
+        }
+
+        if self.trash_mode != TrashMode::Off {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let mut trash_doc = doc_to_trash.clone();
+            if let Some(obj) = trash_doc.as_object_mut() {
+                obj.insert("_deleted".to_string(), serde_json::json!(now));
+                if !orphaned_files.is_empty() {
+                    obj.insert(
+                        "_trashed_files".to_string(),
+                        serde_json::to_value(&orphaned_files)?,
+                    );
+                }
+            }
+            let _trash_guard = self.trash_lock.lock();
+            storage::append_doc_trash(&self.trash_doc_path(), &trash_doc)?;
+        }
+
+        ram.delete(id)?;
+
+        {
+            let mut file_refs = self.file_refs.write();
+            for r in &extracted_file_refs {
+                if let Some(count) = file_refs.get_mut(r) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        file_refs.remove(r);
+                    }
+                }
+            }
+        }
+        for f in &orphaned_files {
+            if let Some(file_ref) = FileRef::from_compact(f) {
+                let bucket = self.bucket(&file_ref.bucket);
+                if let Err(e) = bucket.delete(&file_ref) {
+                    report::suppressed("delete: move orphaned file to trash", e);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Iterator over all non-deleted documents.
     /// Returns owned `Value`s (one clone per document) for thread safety.
     pub fn iter(&self) -> Vec<Value> {
+        if let Some(ram) = &self.ram {
+            return ram.iter();
+        }
         if let Some(v2) = &self.v2 {
             return v2
                 .iter()
@@ -2764,6 +3190,9 @@ impl Database {
 
     /// Number of active (non-deleted) documents.
     pub fn len(&self) -> usize {
+        if let Some(ram) = &self.ram {
+            return ram.len();
+        }
         if let Some(v2) = &self.v2 {
             return v2.len();
         }
@@ -2772,6 +3201,9 @@ impl Database {
 
     /// Check if database is empty.
     pub fn is_empty(&self) -> bool {
+        if let Some(ram) = &self.ram {
+            return ram.is_empty();
+        }
         if let Some(v2) = &self.v2 {
             return v2.is_empty();
         }
@@ -2780,6 +3212,9 @@ impl Database {
 
     /// Check if a document exists.
     pub fn contains(&self, id: &str) -> bool {
+        if let Some(ram) = &self.ram {
+            return ram.contains(id);
+        }
         if let Some(v2) = &self.v2 {
             return v2.contains(id);
         }
@@ -2793,6 +3228,9 @@ impl Database {
     /// narrows the candidates — every candidate is re-checked with the same
     /// whole-value equality the scan uses, so both paths return the same set.
     pub fn find(&self, field: &str, value: &Value) -> Vec<Value> {
+        if let Some(ram) = &self.ram {
+            return ram.find(field, value);
+        }
         if let Some(v2) = &self.v2 {
             return v2.find(field, value).unwrap_or_else(|e| panic!("v2 find: {e}"));
         }
@@ -2829,6 +3267,9 @@ impl Database {
     where
         F: Fn(&Value) -> bool,
     {
+        if let Some(ram) = &self.ram {
+            return ram.find_where(field, predicate);
+        }
         if let Some(v2) = &self.v2 {
             return v2
                 .find_where(field, predicate)
@@ -2851,6 +3292,9 @@ impl Database {
     /// over the shared [`OrderedValue`] key order, which is exactly the
     /// comparison a linear scan applies, so both paths are equal sets.
     pub fn find_range(&self, field: &str, min: &Value, max: &Value) -> Vec<Value> {
+        if let Some(ram) = &self.ram {
+            return ram.find_range(field, min, max);
+        }
         if let Some(v2) = &self.v2 {
             return v2
                 .find_range(field, min, max)
@@ -2980,6 +3424,9 @@ impl Database {
     /// Indexable conjuncts narrow the scan first (the query planner); the
     /// result is identical to a full scan either way.
     pub fn query(&self, ast: Value) -> Result<Vec<Value>> {
+        if let Some(ram) = &self.ram {
+            return ram.query(ast);
+        }
         if let Some(v2) = &self.v2 {
             return v2.query(ast);
         }
@@ -2994,6 +3441,9 @@ impl Database {
     /// Execute a JSON AST query with options (limit, sort, offset).
     /// Validated like `query` (G4).
     pub fn query_with(&self, ast: Value, opts: QueryOptions) -> Result<Vec<Value>> {
+        if let Some(ram) = &self.ram {
+            return ram.query_with(ast, opts);
+        }
         if let Some(v2) = &self.v2 {
             return v2.query_with(ast, opts);
         }
@@ -3042,6 +3492,9 @@ impl Database {
         opts: QueryOptions,
         fields: Option<&[String]>,
     ) -> Result<(usize, Vec<Value>)> {
+        if let Some(ram) = &self.ram {
+            return ram.query_projected(ast, opts, fields);
+        }
         if let Some(v2) = &self.v2 {
             return v2.query_projected(ast, opts, fields);
         }
@@ -3095,6 +3548,9 @@ impl Database {
         ast: Value,
         opts: QueryOptions,
     ) -> Result<(usize, Vec<std::sync::Arc<[u8]>>)> {
+        if let Some(ram) = &self.ram {
+            return ram.query_raw(ast, opts);
+        }
         if let Some(v2) = &self.v2 {
             return v2.query_raw(ast, opts);
         }
@@ -3112,6 +3568,9 @@ impl Database {
     /// Returns (field, counts) pairs in input order; counts are in BTreeMap
     /// (sorted) order for deterministic output.
     pub fn facet_counts(&self, fields: &[String]) -> Vec<(String, BTreeMap<String, usize>)> {
+        if let Some(ram) = &self.ram {
+            return ram.facet_counts(fields);
+        }
         if let Some(v2) = &self.v2 {
             return v2
                 .facet_counts(fields)
@@ -3143,6 +3602,9 @@ impl Database {
     /// Create a hash index on a field (one scan of the store). Dot-notation
     /// paths resolve exactly like `field_get`, so `meta.score` is indexable.
     pub fn create_index(&self, field: &str) -> Result<()> {
+        if let Some(ram) = &self.ram {
+            return ram.create_index(field, V2IndexKind::Hash);
+        }
         if let Some(v2) = &self.v2 {
             return v2.create_index(field, V2IndexKind::Hash);
         }
@@ -3165,6 +3627,9 @@ impl Database {
     /// Create a BTree index on a field (ordered equality + range scans).
     /// A field may carry a hash index and a BTree index at the same time.
     pub fn create_btree_index(&self, field: &str) -> Result<()> {
+        if let Some(ram) = &self.ram {
+            return ram.create_index(field, V2IndexKind::BTree);
+        }
         if let Some(v2) = &self.v2 {
             return v2.create_index(field, V2IndexKind::BTree);
         }
@@ -3186,6 +3651,9 @@ impl Database {
 
     /// Drop every index on a field, freeing memory.
     pub fn drop_index(&self, field: &str) -> Result<()> {
+        if let Some(ram) = &self.ram {
+            return ram.drop_index(field);
+        }
         if let Some(v2) = &self.v2 {
             return v2.drop_index(field);
         }
@@ -3199,6 +3667,9 @@ impl Database {
 
     /// Check if any index exists for a field.
     pub fn has_index(&self, field: &str) -> bool {
+        if let Some(ram) = &self.ram {
+            return ram.has_index(field);
+        }
         if let Some(v2) = &self.v2 {
             return v2.has_index(field);
         }
@@ -3208,6 +3679,9 @@ impl Database {
 
     /// Check if a hash index exists for a field.
     pub fn has_hash_index(&self, field: &str) -> bool {
+        if let Some(ram) = &self.ram {
+            return ram.has_hash_index(field);
+        }
         if let Some(v2) = &self.v2 {
             return v2.has_hash_index(field);
         }
@@ -3216,6 +3690,9 @@ impl Database {
 
     /// Check if a BTree index exists for a field.
     pub fn has_btree_index(&self, field: &str) -> bool {
+        if let Some(ram) = &self.ram {
+            return ram.has_btree_index(field);
+        }
         if let Some(v2) = &self.v2 {
             return v2.has_btree_index(field);
         }
@@ -3230,6 +3707,9 @@ impl Database {
     /// `min_available_seq` advances to `last_seq + 1`: everything before it was
     /// rewritten as base state and can no longer be replayed as events.
     pub fn compact(&self) -> Result<()> {
+        if let Some(ram) = &self.ram {
+            return ram.compact();
+        }
         if let Some(v2) = &self.v2 {
             return v2.compact();
         }
@@ -3274,6 +3754,9 @@ impl Database {
 
     /// Current journal identity and seq watermarks.
     pub fn lineage(&self) -> SourceLineage {
+        if let Some(ram) = &self.ram {
+            return ram.lineage();
+        }
         if let Some(v2) = &self.v2 {
             return v2.lineage();
         }
@@ -3284,6 +3767,9 @@ impl Database {
     /// lock, so no commit can land between the watermark and the document set.
     /// Documents are sorted by id.
     pub fn snapshot_at(&self) -> Snapshot {
+        if let Some(ram) = &self.ram {
+            return ram.snapshot_at();
+        }
         if let Some(v2) = &self.v2 {
             return v2
                 .snapshot_at()
@@ -3307,6 +3793,9 @@ impl Database {
     /// events after `since_seq` were rewritten away by a compaction and the
     /// caller must resync from a fresh snapshot.
     pub fn changes_since(&self, since_seq: u64) -> Result<ChangeBatch> {
+        if let Some(ram) = &self.ram {
+            return ram.changes_since(since_seq);
+        }
         if let Some(v2) = &self.v2 {
             return v2.changes_since(since_seq);
         }
@@ -3455,6 +3944,29 @@ impl Database {
             return Ok(());
         }
 
+        if let Some(ram) = &self.ram {
+            // A v3 folder exports as the portable v1 layout: the same clean
+            // JSONL contract every other backend produces.
+            let target_db = target.join(
+                self.path
+                    .file_name()
+                    .ok_or_else(|| Error::invalid_arg("database path has no file name"))?,
+            );
+            let snapshot = ram.snapshot_at();
+            let active: Vec<&Value> = snapshot.docs.iter().map(|(_, doc)| doc).collect();
+            storage::rewrite_atomic_with_meta(
+                &target_db,
+                &active,
+                &SourceLineage {
+                    source_epoch_uuid: snapshot.lineage.source_epoch_uuid,
+                    min_available_seq: snapshot.lineage.last_seq.saturating_add(1),
+                    last_seq: snapshot.lineage.last_seq,
+                },
+            )?;
+            self.copy_snapshot_extras(target)?;
+            return Ok(());
+        }
+
         let docs = self.docs.read();
         let active: Vec<&Value> = docs.values().map(|doc| doc.as_ref()).collect();
         
@@ -3532,6 +4044,9 @@ impl Database {
 
     /// Every live document as an owned `(id, doc)` pair.
     pub fn all_docs(&self) -> Result<Vec<(String, Value)>> {
+        if let Some(ram) = &self.ram {
+            return Ok(ram.all_docs());
+        }
         if let Some(v2) = &self.v2 {
             return v2.all_docs();
         }
@@ -3548,8 +4063,7 @@ impl Database {
         if let Some(v2) = &self.v2 {
             return v2.export_jsonl(out.as_ref(), with_meta);
         }
-        let out = out.as_ref();
-        let lineage = self.lineage();
+        let out = out.as_ref();        let lineage = self.lineage();
         let mut docs = self.all_docs()?;
         docs.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -3588,6 +4102,9 @@ impl Database {
 
     /// List deleted document IDs.
     pub fn deleted_ids(&self) -> Vec<String> {
+        if let Some(ram) = &self.ram {
+            return ram.deleted_ids();
+        }
         if let Some(v2) = &self.v2 {
             return v2.deleted_ids();
         }
@@ -3596,6 +4113,9 @@ impl Database {
 
     /// Get all active document IDs.
     pub fn get_all_ids(&self) -> Vec<String> {
+        if let Some(ram) = &self.ram {
+            return ram.get_all_ids();
+        }
         if let Some(v2) = &self.v2 {
             return v2.get_all_ids();
         }
@@ -3604,6 +4124,9 @@ impl Database {
 
     /// Restore a deleted document from trash by ID.
     pub fn restore(&self, id: &str) -> Result<()> {
+        if let Some(ram) = &self.ram {
+            return self.restore_ram(ram, id);
+        }
         if let Some(v2) = &self.v2 {
             return self.restore_v2(v2, id);
         }
@@ -3690,8 +4213,7 @@ impl Database {
     }
 
     /// Restore a deleted document from the v2 trash file.
-    fn restore_v2(&self, v2: &Arc<v2_engine::V2Engine>, id: &str) -> Result<()> {
-        let _guard = self.writer.lock();
+    fn restore_v2(&self, v2: &Arc<v2_engine::V2Engine>, id: &str) -> Result<()> {        let _guard = self.writer.lock();
 
         if !v2.is_deleted(id) {
             return Err(Error::invalid_arg(format!("restore: {id} is not deleted")));
@@ -3738,10 +4260,77 @@ impl Database {
         Ok(())
     }
 
+    /// Restore a deleted document from the RAM-first trash file.
+    ///
+    /// Same durable order as the other backends: the WAL `Restore` commit comes
+    /// first, so a failed commit leaves the document deleted and the restore
+    /// retryable; file returns and counter rebuilds follow, and their failures
+    /// are named rather than hidden.
+    fn restore_ram(&self, ram: &Arc<ram_engine::RamEngine>, id: &str) -> Result<()> {
+        let _guard = self.writer.lock();
+
+        if !ram.is_deleted(id) {
+            return Err(Error::invalid_arg(format!("restore: {id} is not deleted")));
+        }
+
+        let trash_docs = storage::read_trash(&self.trash_doc_path())?;
+        let mut last_trash_entry: Option<Value> = None;
+        for doc in trash_docs.into_iter().rev() {
+            if doc.get("_id").and_then(|v| v.as_str()) == Some(id) {
+                last_trash_entry = Some(doc);
+                break;
+            }
+        }
+        let mut trash_doc = last_trash_entry.ok_or_else(|| Error::not_found(id))?;
+
+        let trashed_files: Vec<String> = trash_doc
+            .get("_trashed_files")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if let Some(obj) = trash_doc.as_object_mut() {
+            obj.remove("_deleted");
+            obj.remove("_trashed_files");
+        }
+
+        ram.restore(id, trash_doc.clone())?;
+
+        for s in &trashed_files {
+            if let Some(file_ref) = FileRef::from_compact(s) {
+                let bucket = self.bucket(&file_ref.bucket);
+                if let Err(e) = bucket.restore(&file_ref.id, &file_ref.ext) {
+                    report::suppressed("restore: return file from trash", e);
+                }
+            }
+        }
+
+        let mut extracted_file_refs = HashSet::new();
+        Self::extract_file_refs(&trash_doc, &mut extracted_file_refs);
+        {
+            let mut file_refs = self.file_refs.write();
+            for r in extracted_file_refs {
+                *file_refs.entry(r).or_insert(0) += 1;
+            }
+        }
+
+        Ok(())
+    }
+
     // ─── Persistence ───────────────────────────────────────────────
 
     /// Explicitly flush pending writes to disk.
     pub fn flush(&self) -> Result<()> {
+        if let Some(ram) = &self.ram {
+            // Every acknowledged batch was already fsynced; this re-syncs the
+            // generation so an explicit flush is honest rather than a no-op
+            // that pretends to be one.
+            return ram.flush();
+        }
         if let Some(v2) = &self.v2 {
             return v2.flush();
         }
@@ -3773,6 +4362,16 @@ impl Database {
     /// Whether this handle is backed by the v2 binary/mmap engine.
     pub fn is_v2(&self) -> bool {
         self.v2.is_some()
+    }
+
+    /// Whether this handle is backed by the RAM-first (v3) engine.
+    pub fn is_ram(&self) -> bool {
+        self.ram.is_some()
+    }
+
+    /// Live RAM-first counters, or `None` for a v1/v2 database.
+    pub fn ram_stats(&self) -> Option<RamStats> {
+        self.ram.as_ref().map(|engine| engine.ram_stats())
     }
 
     /// The live v2 manifest, when this is a v2 database.
@@ -4105,6 +4704,10 @@ impl Database {
     /// owns the document store.
     fn collect_live_file_refs(&self) -> Result<HashSet<String>> {
         let mut refs = HashSet::new();
+        if let Some(ram) = &self.ram {
+            ram.for_each_doc(|_, doc| Self::extract_file_refs(doc, &mut refs));
+            return Ok(refs);
+        }
         if let Some(v2) = &self.v2 {
             v2.for_each_doc(|_, doc| Self::extract_file_refs(doc, &mut refs))?;
             return Ok(refs);
