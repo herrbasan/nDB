@@ -14,6 +14,12 @@ rust-version = "1.75"
 # `benches/` as a bench, putting the probes in two targets at once.
 autobenches = false
 
+[features]
+# Compiles the fault-injecting `io::FaultIo` into the library so integration
+# tests (and the Phase 17 crash matrix) can drive the durable write path at
+# every step. Never enabled for a release build.
+fault-io = []
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -45,3 +51,7 @@ path = "benches/doc_perf.rs"
 [[example]]
 name = "phase3_corpus_bench"
 path = "benches/phase3_corpus_bench.rs"
+
+[[example]]
+name = "corpus_baseline"
+path = "benches/corpus_baseline.rs"

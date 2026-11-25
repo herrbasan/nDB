@@ -68,6 +68,35 @@ CLI: `ndb init --v2`, `migrate`, `fsck`, `repair`, `export --jsonl`. Full
 reference: `documentation/v2-storage.md`; benchmark and gate verdicts:
 `docs/phase3-benchmark-v1-vs-v2.md`.
 
+### RAM-first engine (Phase 0 contracts)
+
+The v2 mmap backend is the baseline being replaced by a RAM-first engine
+(authoritative `DocVal`/`DocRecord` in RAM, op-level WAL with group commit,
+single visibility lock, bounded change ring, non-blocking compaction). Phase 0
+freezes the contracts and builds the trust harness; **no engine behaviour has
+changed yet**.
+
+- `docs/contract_ram-first-engine.md` — normative: RAM state, durability and
+  group commit, failure/poison rules, the recovery+compaction crash matrix,
+  change-feed and memory governance.
+- `docs/contract_http-api.md` — frozen `ndb serve` HTTP surface derived from
+  `src/server.rs` (routes, shapes, status codes, reserved 503/507 codes).
+- `src/io.rs` — `Io` trait (`RealIo`; `FaultIo` under `#[cfg(any(test, feature =
+  "fault-io"))]`) covering every durable step, so the fault matrix can fail or
+  kill the process at an exact operation.
+- `tests/support/refdb.rs` — `RefDb`, a sequential reference model used as the
+  differential oracle; `tests/support/crash_child.rs` — out-of-process crash
+  runner (`current_exe()` + `NDB_CRASH_CHILD_ROLE`).
+- Tests: `cargo test --features fault-io --test refdb_oracle_tests --test
+  phase17_fault_injection_tests`; `cargo test --features fault-io --lib io::tests`.
+- Baseline: `cargo run --release --example corpus_baseline -- [--corpus
+  memories|chat|all]` (default `all`) measures the Phase 0 workloads — warm
+  `get`/mget/`$eq`/scan, durable `set`/`update`/`array_push` under
+  `Persistence::Immediate`, and 4 readers under a writer — against **read-only
+  copies** of `D:\DEV\mcp_server\data\memories` and
+  `D:\SRV\LLM-Gateway-Chat\server\data\herrbasan` made in a `tempfile::tempdir()`.
+  Frozen numbers, hardware and reproduction: `docs/phase0-baseline.md`.
+
 ## Query Layers
 
 1. **Layer 1 — O(1) CRUD:** `insert`, `get`, `update`, `delete`, `array_push`. Direct HashMap operations.

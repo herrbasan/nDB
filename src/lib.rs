@@ -29,6 +29,7 @@ pub mod bucket;
 pub mod crc32;
 pub mod error;
 pub mod id;
+pub mod io;
 pub mod item;
 pub mod mmap;
 pub mod report;
