@@ -1,40 +1,56 @@
-//! Phase 0 baseline — real-corpus workloads for the RAM-first refactor.
+//! Real-corpus workloads for the RAM-first refactor — v2 mmap vs v3 RAM-first.
 //!
-//!     cargo run --release --example corpus_baseline
+//!     cargo run --release --example corpus_baseline -- --engine both --corpus all
+//!     cargo run --release --example corpus_baseline -- --engine ram  --corpus chat
 //!     cargo run --release --example corpus_baseline -- --corpus memories
-//!     cargo run --release --example corpus_baseline -- --corpus chat
+//!
+//! `--engine v2|ram|both` (default `both`) selects the backend, `--corpus
+//! memories|chat|all` (default `all`) the corpus. The flags compose, and every
+//! engine runs the *identical* workload set so the rows are comparable.
 //!
 //! Every measurement runs against a **copy** of a live production database made
-//! into a `tempfile::tempdir()` that is deleted on exit. Only the v2 database
-//! files are copied (`manifest.json`, `base.gen_*.ndb`, `wal.gen_*.ndb`,
-//! `meta.json`); the source folder is only ever read, and `.lock` is never
-//! copied. The live folders are production state — this program cannot write to
-//! them.
+//! into a `tempfile::tempdir()` that is deleted on exit. Only the database files
+//! are copied (`manifest.json`, `base.gen_*.ndb`, `wal.gen_*.ndb`, `meta.json`);
+//! the source folder is only ever read, and `.lock` is never copied. The live
+//! folders are production state — this program cannot write to them.
 //!
-//! Both corpora open through `Persistence::Immediate`, so every `set`, `update`
+//! `--engine ram` copies the corpus a second time and converts *that* copy with
+//! the shipped CLI, `ndb migrate <copy> --ram`, which verifies document-by-
+//! document parity against the source twice (staged, then published) before it
+//! exits 0. Only then is the copy opened with `Database::open_ram`.
+//!
+//! Every corpus opens through `Persistence::Immediate`, so every `set`, `update`
 //! and `array_push` here pays the real durable-before-ack cost: the call returns
 //! only after the WAL fsync. (The Phase 0 plan names
 //! `Database::open_v2_with_persistence`; the shipped API is
 //! `Database::open_v2_with_options` with `Persistence::Immediate` in
-//! `OpenOptions` — the same handle behaviour.)
+//! `OpenOptions` — the same handle behaviour. The RAM engine is always durable
+//! per commit; the v3 API has no other mode.)
 //!
 //! Workloads (all warm, after an untimed warm-up):
 //!
 //!   memories (5k docs)   get (5,000), mget-style batch of 20 (500),
 //!                        hash-indexed `$eq` (200), unindexed scan+sort+limit20
 //!                        (200), durable `set` / `update` (50 each)
-//!   chat (907 docs)      largest-5 get (200), random get (500), 20 durable
-//!                        `array_push` on the largest conversation (+ RSS
-//!                        delta), then 4 reader threads on large docs while one
-//!                        writer pushes 20 more.
+//!   chat (907 docs)      largest-5 get (200), largest-5 get_raw — the HTTP
+//!                        JSON-bytes path (200), random get (500), 20 durable
+//!                        `array_push` on the largest conversation (+ RSS,
+//!                        WAL-growth and `live_doc_bytes`/`ring_bytes` deltas),
+//!                        4 reader threads on large docs while one writer pushes
+//!                        20 more, then 4 readers + 1 writer *while
+//!                        `compact()` runs*, and a 100-push churn soak followed
+//!                        by one compaction (start/peak/end RSS, memory and WAL).
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ndb::{Database, OpenOptions, Persistence, QueryOptions, SortDir, StorageFormat};
+use ndb::{
+    ram_format, Database, OpenOptions, Persistence, QueryOptions, RamStats, SortDir, StorageFormat,
+};
 use serde_json::{json, Value};
 
 const MEM_SRC: &str = r"D:\DEV\mcp_server\data\memories";
@@ -48,9 +64,54 @@ const MEM_WRITE_OPS: usize = 50;
 
 const CHAT_TOP_DOCS: usize = 5;
 const CHAT_TOP_GET_OPS: usize = 200;
+/// The pre-`get_raw` HTTP path re-encodes a whole `Value` per hit — a fifth of
+/// the samples is enough to rank it.
+const CHAT_VALUE_PATH_OPS: usize = 40;
 const CHAT_RANDOM_GET_OPS: usize = 500;
 const CHAT_PUSH_OPS: usize = 20;
 const CHAT_READERS: usize = 4;
+const SOAK_PUSHES: usize = 100;
+/// Minimum reader observation window for the concurrency rows. A v2 writer needs
+/// ~1.5 s for its 20 pushes, but a RAM writer finishes in ~60 ms — too short to
+/// rank a p99 over. Readers therefore keep sampling to this floor on both
+/// engines; the v2 window already exceeds it, so its numbers stay as measured.
+const READER_WINDOW_FLOOR_MS: u64 = 500;
+
+// ─── Engine selection ───────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Engine {
+    /// v2 binary generations behind an mmap base + WAL overlay.
+    V2,
+    /// v3 RAM-first: documents live in RAM, the WAL is an op log.
+    Ram,
+}
+
+impl Engine {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "v2" => Some(Engine::V2),
+            "ram" => Some(Engine::Ram),
+            _ => None,
+        }
+    }
+
+    /// Short tag used in paths and prose.
+    fn tag(self) -> &'static str {
+        match self {
+            Engine::V2 => "v2",
+            Engine::Ram => "ram",
+        }
+    }
+
+    /// Human label for the report header.
+    fn label(self) -> &'static str {
+        match self {
+            Engine::V2 => "v2 (mmap + WAL overlay, Imm)",
+            Engine::Ram => "v3 (RAM-first, Imm)",
+        }
+    }
+}
 
 // ─── Deterministic RNG (std only) ───────────────────────────────────────────
 
@@ -292,21 +353,107 @@ fn copy_database(src: &Path, dst: &Path) -> Vec<(String, u64)> {
     copied
 }
 
-fn open_immediate(dir: &Path) -> Database {
-    Database::open_v2_with_options(
-        dir,
-        OpenOptions {
-            format: StorageFormat::V2,
-            persistence: Persistence::Immediate,
-        },
-    )
-    .unwrap_or_else(|e| panic!("open v2 corpus '{}': {e}", dir.display()))
+fn open_corpus(dir: &Path, engine: Engine) -> Database {
+    match engine {
+        Engine::V2 => Database::open_v2_with_options(
+            dir,
+            OpenOptions {
+                format: StorageFormat::V2,
+                persistence: Persistence::Immediate,
+            },
+        )
+        .unwrap_or_else(|e| panic!("open v2 corpus '{}': {e}", dir.display())),
+        Engine::Ram => Database::open_ram(dir)
+            .unwrap_or_else(|e| panic!("open v3 corpus '{}': {e}", dir.display())),
+    }
 }
 
-fn prepare_corpus(label: &str, src: &Path) -> (tempfile::TempDir, PathBuf) {
+/// The `ndb` binary the example must migrate with: same cargo profile as this
+/// example, so `--engine ram` never tests a different build than the one built.
+fn ndb_exe() -> PathBuf {
+    let exe = std::env::current_exe().expect("resolve the running example path");
+    let examples = exe
+        .parent()
+        .unwrap_or_else(|| panic!("example path '{}' has no parent", exe.display()));
+    let profile = examples
+        .parent()
+        .unwrap_or_else(|| panic!("'{}' has no profile directory", examples.display()));
+    let name = if cfg!(windows) { "ndb.exe" } else { "ndb" };
+    let path = profile.join(name);
+    assert!(
+        path.is_file(),
+        "'{}' does not exist — build it with: cargo build --release --bin ndb --example corpus_baseline",
+        path.display()
+    );
+    path
+}
+
+/// Convert the copied corpus with the shipped CLI, which is also the migration
+/// path a production folder takes. It verifies document-by-document parity
+/// (ids, every JSON value, lineage, every index declaration) against the source
+/// on the staged folder *and* again after publication, so a zero exit status is
+/// the parity verdict — there is no separate check this program could strengthen.
+fn migrate_to_ram(dir: &Path) -> f64 {
+    let exe = ndb_exe();
+    let started = Instant::now();
+    let output = Command::new(&exe)
+        .arg("migrate")
+        .arg(dir)
+        .arg("--ram")
+        .output()
+        .unwrap_or_else(|e| panic!("spawn '{} migrate --ram': {e}", exe.display()));
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        println!("    migrate: {line}");
+    }
+    assert!(
+        output.status.success(),
+        "'{} migrate {} --ram' failed (exit {:?}): {stderr}",
+        exe.display(),
+        dir.display(),
+        output.status.code(),
+    );
+    println!(
+        "  migrate {elapsed_ms:.0} ms   parity: PASS (ndb migrate verified staged + live copies document-by-document)"
+    );
+    elapsed_ms
+}
+
+/// Total bytes of the WAL generations sitting in `dir`, by filename.
+///
+/// Both engines name their active log `wal.gen_<N>.ndb`, so this measures the
+/// same thing on both sides of the comparison without trusting engine internals.
+fn wal_file_bytes(dir: &Path) -> u64 {
+    fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("list '{}': {e}", dir.display()))
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.starts_with("wal.gen_") && name.ends_with(".ndb")
+        })
+        .map(|entry| entry.metadata().map(|meta| meta.len()).unwrap_or(0))
+        .sum()
+}
+
+fn print_ram_stats(when: &str, stats: &RamStats) {
+    println!(
+        "    ram {when:<18} live_doc {:>8.2} MB   index {:>7.2} MB   ring {:>7.2} MB   wal {:>8.2} MB   batches {:>5}   fsync {:>7.1} ms   publish {:>7.1} ms",
+        mb(stats.live_doc_bytes as f64),
+        mb(stats.index_bytes as f64),
+        mb(stats.ring_bytes as f64),
+        mb(stats.wal_bytes as f64),
+        stats.batch_count,
+        stats.fsync_us as f64 / 1000.0,
+        stats.publish_us as f64 / 1000.0,
+    );
+}
+
+fn prepare_corpus(label: &str, src: &Path, engine: Engine) -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir()
         .unwrap_or_else(|e| panic!("create tempdir for '{label}': {e}"));
-    let dir = tmp.path().join("db");
+    let dir = tmp.path().join(format!("db-{}", engine.tag()));
     let started = Instant::now();
     let copied = copy_database(src, &dir);
     let copy_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -352,16 +499,25 @@ fn most_common_scalar(sample: &[Value], field: &str) -> Option<Value> {
         .map(|(value, _)| value)
 }
 
-fn run_memories() {
-    println!("═══ memories ({MEM_SRC}) ═══");
-    let (_tmp, dir) = prepare_corpus("memories", Path::new(MEM_SRC));
+fn run_memories(engine: Engine) {
+    println!("═══ memories — engine {} ({MEM_SRC}) ═══", engine.label());
+    let (_tmp, dir) = prepare_corpus("memories", Path::new(MEM_SRC), engine);
+    if engine == Engine::Ram {
+        migrate_to_ram(&dir);
+    }
     let rss_before_open = rss_bytes().expect("RSS before open");
 
     let started = Instant::now();
-    let db = open_immediate(&dir);
+    let db = open_corpus(&dir, engine);
     let open_ms = started.elapsed().as_secs_f64() * 1000.0;
     let docs = db.len();
-    let ids = db.get_all_ids();
+    let ids = {
+        // Sorted so the sampled `$eq` category and the random-get id set are the
+        // same on both engines — `get_all_ids` order is an engine detail.
+        let mut ids = db.get_all_ids();
+        ids.sort();
+        ids
+    };
     assert_eq!(ids.len(), docs, "id list and document count disagree");
     println!(
         "  open {:.0} ms   docs {docs}   rss {:.1} MB (+{:.1} MB over pre-open)",
@@ -369,22 +525,29 @@ fn run_memories() {
         rss_mb(),
         rss_delta(rss_before_open, rss_bytes().expect("RSS after open")),
     );
-    let manifest = ndb::read_manifest(&dir).expect("read the copied manifest");
+    let indexes = match engine {
+        Engine::V2 => ndb::read_manifest(&dir).expect("read the copied v2 manifest").indexes,
+        Engine::Ram => ram_format::read_ram_manifest(&dir)
+            .expect("read the migrated v3 manifest")
+            .indexes,
+    };
     println!(
         "  indexes: {}",
-        manifest
-            .indexes
+        indexes
             .iter()
             .map(|spec| format!("{} {:?}", spec.field, spec.kind))
             .collect::<Vec<_>>()
             .join(", ")
     );
-    for spec in &manifest.indexes {
+    for spec in &indexes {
         assert!(
             db.has_index(&spec.field),
             "manifest declares an index on '{}' the open handle does not have",
             spec.field
         );
+    }
+    if let Some(stats) = db.ram_stats() {
+        print_ram_stats("after open", &stats);
     }
     println!();
 
@@ -478,7 +641,14 @@ fn run_memories() {
     update.print("durable update (Immediate)");
 
     println!();
-    println!("  memories rss after run: {:.1} MB", rss_mb());
+    println!(
+        "  memories rss after run: {:.1} MB   wal {:.2} MB on disk",
+        rss_mb(),
+        mb(wal_file_bytes(&dir) as f64),
+    );
+    if let Some(stats) = db.ram_stats() {
+        print_ram_stats("after run", &stats);
+    }
     println!();
 }
 
@@ -492,13 +662,16 @@ fn chat_message(i: usize) -> Value {
     })
 }
 
-fn run_chat() {
-    println!("═══ chat_herrbasan ({CHAT_SRC}) ═══");
-    let (_tmp, dir) = prepare_corpus("chat_herrbasan", Path::new(CHAT_SRC));
+fn run_chat(engine: Engine) {
+    println!("═══ chat_herrbasan — engine {} ({CHAT_SRC}) ═══", engine.label());
+    let (_tmp, dir) = prepare_corpus("chat_herrbasan", Path::new(CHAT_SRC), engine);
+    if engine == Engine::Ram {
+        migrate_to_ram(&dir);
+    }
     let rss_before_open = rss_bytes().expect("RSS before open");
 
     let started = Instant::now();
-    let db = Arc::new(open_immediate(&dir));
+    let db = Arc::new(open_corpus(&dir, engine));
     let open_ms = started.elapsed().as_secs_f64() * 1000.0;
     let docs = db.len();
     let ids = db.get_all_ids();
@@ -509,6 +682,9 @@ fn run_chat() {
         rss_mb(),
         rss_delta(rss_before_open, rss_open),
     );
+    if let Some(stats) = db.ram_stats() {
+        print_ram_stats("after open", &stats);
+    }
 
     let sized_started = Instant::now();
     let mut sized: Vec<(String, usize)> = ids
@@ -556,6 +732,39 @@ fn run_chat() {
     });
     top_get.print("warm get, largest 5 docs");
 
+    // The HTTP serialization path itself: v2 copies the stored bytes out of the
+    // mapping, v3 writes the DocVal tree into a pre-sized buffer. No `Value`
+    // exists on either side, so this isolates encode cost from materialisation.
+    let mut raw_rng = Rng::new(0x0C4A_75EE_D001);
+    for _ in 0..8 {
+        let id = &top_ids[raw_rng.below(top_ids.len())];
+        let _ = db.get_raw_json(id).expect("top get_raw warm-up");
+    }
+    let top_get_raw = measure(CHAT_TOP_GET_OPS, 1, |_| {
+        let bytes = db
+            .get_raw_json(&top_ids[raw_rng.below(top_ids.len())])
+            .expect("get_raw on a largest chat doc");
+        std::hint::black_box(&bytes);
+    });
+    top_get_raw.print("warm get_raw (JSON bytes), largest 5 docs");
+
+    // The HTTP path as it was before the raw surface existed: build a Value,
+    // then hand it to serde_json. This is the number `get_raw` replaces.
+    let mut value_rng = Rng::new(0x0C4A_75EE_D001);
+    for _ in 0..4 {
+        let id = &top_ids[value_rng.below(top_ids.len())];
+        let doc = db.get(id).expect("value-path warm-up");
+        let _ = serde_json::to_vec(&doc).expect("value-path warm-up encode");
+    }
+    let top_get_value = measure(CHAT_VALUE_PATH_OPS, 1, |_| {
+        let doc = db
+            .get(&top_ids[value_rng.below(top_ids.len())])
+            .expect("get on a largest chat doc");
+        let bytes = serde_json::to_vec(&doc).expect("encode a largest chat doc");
+        std::hint::black_box(&bytes);
+    });
+    top_get_value.print("warm get + to_vec (previous HTTP path), largest 5 docs");
+
     for _ in 0..32 {
         let _ = db.get(&ids[rng.below(ids.len())]).expect("random get warm-up");
     }
@@ -567,6 +776,8 @@ fn run_chat() {
     println!();
 
     let rss_before_pushes = rss_bytes().expect("RSS before pushes");
+    let wal_before_pushes = wal_file_bytes(&dir);
+    let stats_before_pushes = db.ram_stats();
     let push = measure(CHAT_PUSH_OPS, 1, |i| {
         let appended = db
             .array_push(&largest_id, "messages", chat_message(i))
@@ -574,6 +785,7 @@ fn run_chat() {
         assert!(appended, "array_push {i} did not resolve 'messages'");
     });
     let rss_after_pushes = rss_bytes().expect("RSS after pushes");
+    let wal_after_pushes = wal_file_bytes(&dir);
     push.print("durable array_push (Immediate)");
     println!(
         "    largest doc {:.2} MB × {} pushes   rss delta {:+.1} MB ({:.1} → {:.1} MB)",
@@ -583,6 +795,21 @@ fn run_chat() {
         mb(rss_before_pushes as f64),
         mb(rss_after_pushes as f64),
     );
+    println!(
+        "    wal growth {:+} bytes ({:.0} B/op)   wal now {:.2} MB on disk",
+        wal_after_pushes as i64 - wal_before_pushes as i64,
+        (wal_after_pushes as i64 - wal_before_pushes as i64) as f64 / CHAT_PUSH_OPS as f64,
+        mb(wal_after_pushes as f64),
+    );
+    if let (Some(before), Some(after)) = (stats_before_pushes, db.ram_stats()) {
+        println!(
+            "    live_doc_bytes {:+} B   ring_bytes {:+} B   (live {:.2} MB, ring {:.2} MB)",
+            after.live_doc_bytes as i64 - before.live_doc_bytes as i64,
+            after.ring_bytes as i64 - before.ring_bytes as i64,
+            mb(after.live_doc_bytes as f64),
+            mb(after.ring_bytes as f64),
+        );
+    }
     let post_len = db
         .get(&largest_id)
         .expect("read back the largest chat doc")
@@ -629,6 +856,11 @@ fn run_chat() {
         assert!(appended, "concurrent array_push {i} did not resolve 'messages'");
     }
     let writer_wall = writer_started.elapsed();
+    let floor = Duration::from_millis(READER_WINDOW_FLOOR_MS);
+    if writer_wall < floor {
+        std::thread::sleep(floor - writer_wall);
+    }
+    let window_wall = writer_started.elapsed();
     stop.store(true, Ordering::Relaxed);
 
     let mut reader_samples = Vec::new();
@@ -642,8 +874,9 @@ fn run_chat() {
     let reader_count = reader_samples.len();
     let reader_dist = dist(reader_samples);
     println!(
-        "  4 readers + 1 writer, writer wall {:.0} ms, {} reader gets:",
+        "  4 readers + 1 writer, writer wall {:.0} ms (reader window {:.0} ms), {} reader gets:",
         writer_wall.as_secs_f64() * 1000.0,
+        window_wall.as_secs_f64() * 1000.0,
         reader_count
     );
     println!(
@@ -653,7 +886,7 @@ fn run_chat() {
         reader_dist.p95,
         reader_dist.p99,
         reader_dist.max,
-        reader_count as f64 / writer_wall.as_secs_f64(),
+        reader_count as f64 / window_wall.as_secs_f64(),
     );
     Measured {
         ops: CHAT_PUSH_OPS,
@@ -662,9 +895,224 @@ fn run_chat() {
         dist: dist(writer_samples),
     }
     .print("writer array_push (Immediate)");
+    if let Some(stats) = db.ram_stats() {
+        print_ram_stats("after concurrent", &stats);
+    }
     println!();
-    println!("  chat rss after run: {:.1} MB", rss_mb());
+
+    // Compaction under load: the same 4 readers + 1 writer, with `compact()`
+    // itself running in this thread while they work.
+    let mut message_index = CHAT_PUSH_OPS * 2;
+    let under_load = compact_under_load(&db, &largest_id, &top_ids, message_index);
+    message_index += CHAT_PUSH_OPS;
+    println!("  compaction under load (4 readers + 1 writer, compact() in flight):");
+    println!(
+        "    compact() wall           {:.0} ms   (writer window {:.0} ms)",
+        under_load.compact_ms,
+        under_load.writer_wall.as_secs_f64() * 1000.0
+    );
+    let during = &under_load.reader_compact;
+    println!(
+        "    reader get, in compact   n={:<6} p50 {:>9.2} µs  p95 {:>9.2} µs  p99 {:>9.2} µs  max {:>9.2} µs",
+        under_load.reader_n_compact, during.p50, during.p95, during.p99, during.max,
+    );
+    let all = &under_load.reader_all;
+    println!(
+        "    reader get, whole window n={:<6} p50 {:>9.2} µs  p95 {:>9.2} µs  p99 {:>9.2} µs  max {:>9.2} µs",
+        under_load.reader_n, all.p50, all.p95, all.p99, all.max,
+    );
+    let writer_under = &under_load.writer;
+    println!(
+        "    writer array_push        n={:<6} p50 {:>9.2} ms  p95 {:>9.2} ms  p99 {:>9.2} ms  max {:>9.2} ms",
+        CHAT_PUSH_OPS,
+        writer_under.p50 / 1000.0,
+        writer_under.p95 / 1000.0,
+        writer_under.p99 / 1000.0,
+        writer_under.max / 1000.0,
+    );
+    if let Some(stats) = db.ram_stats() {
+        print_ram_stats("after compact", &stats);
+    }
     println!();
+
+    run_soak(&dir, &db, &largest_id, message_index);
+
+    println!();
+    println!(
+        "  chat rss after run: {:.1} MB   wal {:.2} MB on disk",
+        rss_mb(),
+        mb(wal_file_bytes(&dir) as f64),
+    );
+    if let Some(stats) = db.ram_stats() {
+        print_ram_stats("after run", &stats);
+    }
+    println!();
+}
+
+// ─── Chat: compaction under load & churn soak ──────────────────────────────
+
+struct LoadWindow {
+    compact_ms: f64,
+    writer_wall: Duration,
+    /// Reader samples taken while the compaction was underway (flag read at
+    /// the start of each get, so a sample belongs to the window it entered).
+    reader_compact: Dist,
+    reader_n_compact: usize,
+    /// Every reader sample collected from warm-up start to writer finish.
+    reader_all: Dist,
+    reader_n: usize,
+    writer: Dist,
+}
+
+fn compact_under_load(
+    db: &Arc<Database>,
+    largest_id: &str,
+    top_ids: &[String],
+    message_base: usize,
+) -> LoadWindow {
+    let stop = Arc::new(AtomicBool::new(false));
+    let compacting = Arc::new(AtomicBool::new(false));
+    let window_started = Instant::now();
+
+    let mut readers = Vec::with_capacity(CHAT_READERS);
+    for t in 0..CHAT_READERS {
+        let db = Arc::clone(db);
+        let stop = Arc::clone(&stop);
+        let compacting = Arc::clone(&compacting);
+        let top_ids = top_ids.to_vec();
+        readers.push(std::thread::spawn(move || -> Vec<(bool, f64)> {
+            let mut rng = Rng::new(0xC0FF_1E00 + t as u64);
+            let mut samples: Vec<(bool, f64)> = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                let id = &top_ids[rng.below(top_ids.len())];
+                let during = compacting.load(Ordering::Relaxed);
+                let t0 = Instant::now();
+                let doc = db.get(id).expect("compaction reader get");
+                samples.push((during, t0.elapsed().as_secs_f64() * 1e6));
+                std::hint::black_box(&doc);
+            }
+            samples
+        }));
+    }
+
+    let writer = {
+        let db = Arc::clone(db);
+        let largest_id = largest_id.to_string();
+        std::thread::spawn(move || -> (Vec<f64>, Duration) {
+            let mut samples = Vec::with_capacity(CHAT_PUSH_OPS);
+            let started = Instant::now();
+            for i in 0..CHAT_PUSH_OPS {
+                let t0 = Instant::now();
+                let appended = db
+                    .array_push(&largest_id, "messages", chat_message(message_base + i))
+                    .expect("durable array_push while compacting");
+                samples.push(t0.elapsed().as_secs_f64() * 1e6);
+                assert!(
+                    appended,
+                    "array_push {i} under compaction did not resolve 'messages'"
+                );
+            }
+            (samples, started.elapsed())
+        })
+    };
+
+    compacting.store(true, Ordering::Relaxed);
+    let started = Instant::now();
+    db.compact().expect("compact under concurrent load");
+    let compact_ms = started.elapsed().as_secs_f64() * 1000.0;
+    compacting.store(false, Ordering::Relaxed);
+
+    let (writer_samples, writer_wall) = writer.join().expect("compaction writer panicked");
+    let floor = Duration::from_millis(READER_WINDOW_FLOOR_MS);
+    let elapsed = window_started.elapsed();
+    if elapsed < floor {
+        std::thread::sleep(floor - elapsed);
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    let mut all = Vec::new();
+    let mut during = Vec::new();
+    for handle in readers {
+        for (sampled_during, micros) in handle.join().expect("compaction reader panicked") {
+            if sampled_during {
+                during.push(micros);
+            }
+            all.push(micros);
+        }
+    }
+    assert!(
+        !during.is_empty(),
+        "no reader get completed while compaction was in flight"
+    );
+
+    LoadWindow {
+        compact_ms,
+        writer_wall,
+        reader_n_compact: during.len(),
+        reader_compact: dist(during),
+        reader_n: all.len(),
+        reader_all: dist(all),
+        writer: dist(writer_samples),
+    }
+}
+
+/// Churn soak: `SOAK_PUSHES` consecutive durable pushes on the largest doc,
+/// then one compaction — the shape of a long-lived chat session.
+fn run_soak(dir: &Path, db: &Arc<Database>, largest_id: &str, message_base: usize) {
+    println!("  churn soak — {SOAK_PUSHES} consecutive durable array_push on the largest doc:");
+    let rss_start = rss_bytes().expect("RSS before soak");
+    let before = db.ram_stats();
+    let wal_before = wal_file_bytes(dir);
+
+    let mut peak = rss_start;
+    let pushes = measure(SOAK_PUSHES, 1, |i| {
+        let appended = db
+            .array_push(largest_id, "messages", chat_message(message_base + i))
+            .expect("durable array_push during soak");
+        assert!(appended, "soak array_push {i} did not resolve 'messages'");
+        peak = peak.max(rss_bytes().expect("RSS sample during soak"));
+    });
+    let rss_end = rss_bytes().expect("RSS after soak pushes");
+    let mid = db.ram_stats();
+    let wal_mid = wal_file_bytes(dir);
+
+    let compact_started = Instant::now();
+    db.compact().expect("compact after the soak");
+    let compact_ms = compact_started.elapsed().as_secs_f64() * 1000.0;
+    let rss_after_compact = rss_bytes().expect("RSS after soak compact");
+    let after = db.ram_stats();
+    let wal_after = wal_file_bytes(dir);
+
+    pushes.print("soak array_push (Immediate)");
+    println!(
+        "    rss start {:.1} MB   peak {:.1} MB ({:+.1} MB)   end {:.1} MB ({:+.1} MB)   after compact {:.1} MB ({:+.1} MB)",
+        mb(rss_start as f64),
+        mb(peak as f64),
+        rss_delta(rss_start, peak),
+        mb(rss_end as f64),
+        rss_delta(rss_start, rss_end),
+        mb(rss_after_compact as f64),
+        rss_delta(rss_start, rss_after_compact),
+    );
+    println!(
+        "    wal {:.2} MB → {:.2} MB ({:+} B) → {:.2} MB after compact   compact {:.0} ms",
+        mb(wal_before as f64),
+        mb(wal_mid as f64),
+        wal_mid as i64 - wal_before as i64,
+        mb(wal_after as f64),
+        compact_ms,
+    );
+    if let (Some(before), Some(mid), Some(after)) = (before, mid, after) {
+        println!(
+            "    live_doc_bytes {:.2} → {:.2} → {:.2} MB   ring_bytes {:.2} → {:.2} → {:.2} MB",
+            mb(before.live_doc_bytes as f64),
+            mb(mid.live_doc_bytes as f64),
+            mb(after.live_doc_bytes as f64),
+            mb(before.ring_bytes as f64),
+            mb(mid.ring_bytes as f64),
+            mb(after.ring_bytes as f64),
+        );
+    }
 }
 
 // ─── Entry ──────────────────────────────────────────────────────────────────
@@ -678,27 +1126,42 @@ fn main() {
             .unwrap_or_else(|| panic!("--corpus needs a value: memories | chat | all"))
             .clone(),
     };
+    let engine_arg = match args.iter().position(|a| a == "--engine") {
+        None => "both".to_string(),
+        Some(p) => args
+            .get(p + 1)
+            .unwrap_or_else(|| panic!("--engine needs a value: v2 | ram | both"))
+            .clone(),
+    };
     let run_memories_corpus = match corpus.as_str() {
-        "all" => true,
-        "memories" => true,
+        "all" | "memories" => true,
         "chat" => false,
         other => panic!("unknown --corpus '{other}' (want memories | chat | all)"),
     };
     let run_chat_corpus = match corpus.as_str() {
-        "all" => true,
-        "chat" => true,
+        "all" | "chat" => true,
         "memories" => false,
         other => panic!("unknown --corpus '{other}' (want memories | chat | all)"),
     };
+    let engines: Vec<Engine> = match engine_arg.as_str() {
+        "both" => vec![Engine::V2, Engine::Ram],
+        other => vec![Engine::parse(other).unwrap_or_else(|| {
+            panic!("unknown --engine '{other}' (want v2 | ram | both)")
+        })],
+    };
 
-    println!("nDB Phase 0 baseline — real-corpus RAM-first workloads (release)");
+    println!("nDB real-corpus workloads — v2 mmap vs v3 RAM-first (release)");
     println!("source folders are opened read-only; every copy lives in a tempdir deleted on exit");
     println!();
-    if run_memories_corpus {
-        run_memories();
+    for engine in engines {
+        println!("############ engine {} ############", engine.tag());
+        println!();
+        if run_memories_corpus {
+            run_memories(engine);
+        }
+        if run_chat_corpus {
+            run_chat(engine);
+        }
     }
-    if run_chat_corpus {
-        run_chat();
-    }
-    println!("done ({corpus})");
+    println!("done (corpus {corpus}, engine {engine_arg})");
 }

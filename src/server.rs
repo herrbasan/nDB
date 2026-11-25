@@ -1330,26 +1330,8 @@ fn respond_query(db: &Database, config: &ServerConfig, req: &Request) -> Respons
         .and_then(|f| f.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
 
-    if fields.is_none() {
-        return match db.query_raw(filter, opts) {
-            Ok((total, rows)) => Response::JsonRaw(200, query_raw_body(total, &rows, None)),
-            Err(e) => {
-                let (status, body) = db_error(e);
-                Response::Json(status, body)
-            }
-        };
-    }
-
-    match db.query_projected(filter, opts, fields.as_deref()) {
-        Ok((total, results)) => Response::Json(
-            200,
-            json!({
-                "ok": true,
-                "total": total,
-                "count": results.len(),
-                "results": results,
-            }),
-        ),
+    match db.query_raw_projected(filter, opts, fields.as_deref()) {
+        Ok((total, rows)) => Response::JsonRaw(200, query_raw_body(total, &rows, None)),
         // Unreachable for invalid ASTs — the pre-validation above already
         // returned 400. Kept as the loud net rather than an unwrap.
         Err(e) => {
@@ -2006,13 +1988,13 @@ fn route_v2(
         ("POST", ["find"]) => handle_v2_find(&db, req),
         ("POST", ["facets"]) => handle_v2_facets(&db, req),
 
-        ("GET", ["doc", id]) => handle_v2_get_doc(&db, req, id),
+        ("GET", ["doc", id]) => return respond_v2_get_doc(&db, req, id),
         ("PUT", ["doc"]) => handle_v2_insert(&db, req),
         ("PUT", ["doc", id]) => handle_v2_replace(&db, req, id),
         ("PATCH", ["doc", id]) => handle_v2_patch(&db, req, id),
         ("DELETE", ["doc", id]) => handle_v2_delete(&db, id),
         ("POST", ["doc", id, "restore"]) => handle_v2_restore(&db, id),
-        ("POST", ["docs", "mget"]) => handle_v2_mget(&db, req),
+        ("POST", ["docs", "mget"]) => return handle_v2_mget(&db, req),
 
         ("POST", ["index"]) => handle_v2_create_index(&db, req),
         ("POST", ["compact"]) => handle_v2_compact(&db),
@@ -2079,29 +2061,10 @@ fn respond_v2_query(db: &Database, config: &ServerConfig, req: &Request) -> Resp
 
     let start = Instant::now();
 
-    if fields.is_none() {
-        return match db.query_raw(filter, opts) {
-            Ok((total, rows)) => Response::JsonRaw(
-                200,
-                query_raw_body(total, &rows, Some(elapsed_ms(start))),
-            ),
-            Err(e) => {
-                let (status, body) = map_db_error(e);
-                Response::Json(status, body)
-            }
-        };
-    }
-
-    match db.query_projected(filter, opts, fields.as_deref()) {
-        Ok((total, results)) => Response::Json(
+    match db.query_raw_projected(filter, opts, fields.as_deref()) {
+        Ok((total, rows)) => Response::JsonRaw(
             200,
-            json!({
-                "ok": true,
-                "total": total,
-                "count": results.len(),
-                "results": results,
-                "took_ms": elapsed_ms(start),
-            }),
+            query_raw_body(total, &rows, Some(elapsed_ms(start))),
         ),
         Err(e) => {
             let (status, body) = map_db_error(e);
@@ -2224,19 +2187,40 @@ fn project_doc_for_http(doc: &Value, id: &str, fields: &[String]) -> Value {
     Value::Object(out)
 }
 
-fn handle_v2_get_doc(db: &Database, req: &Request, id: &str) -> (u16, Value) {
+/// `GET …/doc/{id}` — the full document (no `fields`) is streamed as stored
+/// bytes on RAM, so a multi-megabyte conversation never becomes a `Value`.
+fn respond_v2_get_doc(db: &Database, req: &Request, id: &str) -> Response {
+    let params = query_params(&req.query);
+    let fields = projection_from_params(&params).filter(|fields| !fields.is_empty());
+
+    if fields.is_none() && db.is_ram() {
+        return match db.get_raw_json(id) {
+            Ok(bytes) => {
+                let mut body = Vec::with_capacity(bytes.len() + 24);
+                body.extend_from_slice(b"{\"doc\":");
+                body.extend_from_slice(&bytes);
+                body.extend_from_slice(b",\"ok\":true}");
+                Response::JsonRaw(200, body)
+            }
+            Err(e) => {
+                let (status, body) = map_db_error(e);
+                Response::Json(status, body)
+            }
+        };
+    }
+
     let doc = match db.get(id) {
         Ok(d) => d,
-        Err(e) => return map_db_error(e),
+        Err(e) => {
+            let (status, body) = map_db_error(e);
+            return Response::Json(status, body);
+        }
     };
-    let params = query_params(&req.query);
-    match projection_from_params(&params) {
-        Some(fields) if !fields.is_empty() => (
-            200,
-            json!({"ok": true, "doc": project_doc_for_http(&doc, id, &fields)}),
-        ),
-        _ => (200, json!({"ok": true, "doc": doc})),
-    }
+    let body = match fields {
+        Some(fields) => json!({"ok": true, "doc": project_doc_for_http(&doc, id, &fields)}),
+        None => json!({"ok": true, "doc": doc}),
+    };
+    Response::Json(200, body)
 }
 
 fn handle_v2_insert(db: &Database, req: &Request) -> (u16, Value) {
@@ -2355,18 +2339,22 @@ struct MgetRequest {
 /// arbitrarily long read transaction.
 const MGET_MAX_IDS: usize = 1_000;
 
-fn handle_v2_mget(db: &Database, req: &Request) -> (u16, Value) {
+fn handle_v2_mget(db: &Database, req: &Request) -> Response {
     let body = match parse_body_v2(req) {
         Ok(b) => b,
-        Err(e) => return e,
+        Err((status, body)) => return Response::Json(status, body),
     };
     let request: MgetRequest = match serde_json::from_value(body) {
         Ok(r) => r,
-        Err(e) => return v2_error(400, "invalid_request", format!("invalid mget request: {e}")),
+        Err(e) => {
+            let (status, body) =
+                v2_error(400, "invalid_request", format!("invalid mget request: {e}"));
+            return Response::Json(status, body);
+        }
     };
 
     if request.ids.len() > MGET_MAX_IDS {
-        return v2_error(
+        let (status, body) = v2_error(
             413,
             "payload_too_large",
             format!(
@@ -2374,9 +2362,21 @@ fn handle_v2_mget(db: &Database, req: &Request) -> (u16, Value) {
                 request.ids.len()
             ),
         );
+        return Response::Json(status, body);
     }
 
     let fields = request.fields.filter(|f| !f.is_empty());
+
+    if fields.is_none() && db.is_ram() {
+        return match mget_raw_body(db, &request.ids) {
+            Ok(body) => Response::JsonRaw(200, body),
+            Err(e) => {
+                let (status, body) = map_db_error(e);
+                Response::Json(status, body)
+            }
+        };
+    }
+
     let mut docs = serde_json::Map::new();
     let mut missing = Vec::new();
     let mut seen = HashSet::new();
@@ -2394,13 +2394,68 @@ fn handle_v2_mget(db: &Database, req: &Request) -> (u16, Value) {
                 docs.insert(id, value);
             }
             Err(Error::NotFound { .. }) => missing.push(id),
-            Err(e) => return map_db_error(e),
+            Err(e) => {
+                let (status, body) = map_db_error(e);
+                return Response::Json(status, body);
+            }
         }
     }
-    (
+    Response::Json(
         200,
         json!({"ok": true, "docs": Value::Object(docs), "missing": missing}),
     )
+}
+
+/// The RAM `mget` response, built from stored document bytes: ids are deduped
+/// once, the `docs` map is emitted in the same sorted order `serde_json::Map`
+/// would produce, and `missing` keeps request order.
+fn mget_raw_body(db: &Database, ids: &[String]) -> Result<Vec<u8>, Error> {
+    let mut seen = HashSet::new();
+    let mut unique: Vec<&String> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if seen.insert(id.as_str()) {
+            unique.push(id);
+        }
+    }
+
+    let unique_owned: Vec<String> = unique.iter().map(|id| (*id).clone()).collect();
+    let raw = db.mget_raw_json(&unique_owned)?;
+
+    let mut docs: Vec<(&str, &[u8])> = Vec::new();
+    let mut missing: Vec<&str> = Vec::new();
+    for (id, bytes) in unique.iter().zip(raw.iter()) {
+        match bytes {
+            Some(bytes) => docs.push((id.as_str(), bytes.as_slice())),
+            None => missing.push(id.as_str()),
+        }
+    }
+    docs.sort_by(|a, b| a.0.cmp(b.0));
+
+    let payload: usize = docs
+        .iter()
+        .map(|(id, bytes)| id.len() + bytes.len() + 4)
+        .sum::<usize>()
+        + missing.iter().map(|id| id.len() + 3).sum::<usize>()
+        + 64;
+    let mut body = Vec::with_capacity(payload);
+    body.extend_from_slice(b"{\"docs\":{");
+    for (index, (id, bytes)) in docs.iter().enumerate() {
+        if index > 0 {
+            body.push(b',');
+        }
+        crate::docval::write_json_str(id, &mut body);
+        body.push(b':');
+        body.extend_from_slice(bytes);
+    }
+    body.extend_from_slice(b"},\"missing\":[");
+    for (index, id) in missing.iter().enumerate() {
+        if index > 0 {
+            body.push(b',');
+        }
+        crate::docval::write_json_str(id, &mut body);
+    }
+    body.extend_from_slice(b"],\"ok\":true}");
+    Ok(body)
 }
 
 fn handle_v2_create_index(db: &Database, req: &Request) -> (u16, Value) {

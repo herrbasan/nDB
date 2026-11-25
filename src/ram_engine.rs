@@ -1,7 +1,7 @@
 //! The RAM-first engine (storage format v3).
 //!
-//! One reader/writer lock owns everything a reader can observe — documents,
-//! secondary indexes, the lineage watermarks and the change ring — so a read
+//! One reader/writer lock owns everything a reader can observe â€” documents,
+//! secondary indexes, the lineage watermarks and the change ring â€” so a read
 //! never sees a document without the index entry that matches it. Writers stage
 //! a batch, durably append it with one `write_all` + one `sync_all`, and only
 //! then take the write lock once to publish. Acknowledged writes are therefore
@@ -13,8 +13,8 @@
 //! - **Transient I/O** (`Interrupted`, Windows `ERROR_SHARING_VIOLATION`) is
 //!   retried a bounded number of times. The failed batch is truncated back to
 //!   its starting offset first, so a partial write can never be extended twice.
-//! - **Uncertain durable tail** — a write or fsync that still fails after the
-//!   retries — poisons the database: nothing is published, and every later
+//! - **Uncertain durable tail** â€” a write or fsync that still fails after the
+//!   retries â€” poisons the database: nothing is published, and every later
 //!   mutation is refused with [`Error::Poisoned`] until the folder is reopened
 //!   and recovered. Reads keep working; RAM is correct up to `last_seq`.
 //! - **Corruption** is [`Error::Corruption`] naming file, offset and sequence.
@@ -66,7 +66,7 @@ pub struct RamConfig {
     /// post-images are 40 MB however few events they are.
     pub change_ring_cap_bytes: usize,
     /// Compact in the background once the active WAL generation grows past
-    /// this many bytes. `None` disables it — an embedded or unit-test open
+    /// this many bytes. `None` disables it â€” an embedded or unit-test open
     /// never grows a compaction thread behind the caller's back; `ndb serve`
     /// turns it on explicitly via [`RamConfig::server_default`].
     pub auto_compact_wal_bytes: Option<u64>,
@@ -130,7 +130,7 @@ pub struct RamStats {
     pub publish_us: u64,
 }
 
-// ─── RAM state ──────────────────────────────────────────────────────────────
+// â”€â”€â”€ RAM state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RamChangeKind {
@@ -153,7 +153,7 @@ struct RamChangeEvent {
 /// One snapshot pin: the frozen document list plus the ring floor it reserves.
 ///
 /// The list is `Arc`-shared, so pinning a 338 MB database costs one pointer
-/// copy — never a document clone, and never under the commit lock.
+/// copy â€” never a document clone, and never under the commit lock.
 struct Pin {
     cut_seq: u64,
     expires_at: Instant,
@@ -353,7 +353,7 @@ impl RamState {
     }
 }
 
-// ─── Group-commit plumbing ──────────────────────────────────────────────────
+// â”€â”€â”€ Group-commit plumbing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// What a committed job returns to its caller.
 enum Reply {
@@ -434,7 +434,7 @@ const DELETE_EVENT_OVERHEAD: usize = 64;
 
 /// A patch copies only the nodes on the mutated path; everything else stays
 /// structurally shared with `state.docs`. Its ring entry therefore retains the
-/// divergence — bounded by the encoded op plus the copied ancestors — not a
+/// divergence â€” bounded by the encoded op plus the copied ancestors â€” not a
 /// whole document image.
 fn patch_event_bytes(record: &DocRecord, wal: &RamWalRecord) -> usize {
     record.id.len() + EVENT_OVERHEAD + wal.payload_bytes() * 2 + 8192
@@ -443,7 +443,7 @@ fn patch_event_bytes(record: &DocRecord, wal: &RamWalRecord) -> usize {
 /// One staged RAM mutation, applied only after the batch fsync succeeded.
 ///
 /// `ring_bytes` is the memory this change-ring entry will retain beyond what
-/// `state.docs` already holds — decided while staging, so admission checks and
+/// `state.docs` already holds â€” decided while staging, so admission checks and
 /// published `ring_bytes` use the same number.
 enum PubOp {
     Put {
@@ -762,7 +762,7 @@ struct StageTimings {
     batch_count: u64,
 }
 
-// ─── The engine ─────────────────────────────────────────────────────────────
+// â”€â”€â”€ The engine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// The live RAM-first backend of one `Database`.
 pub(crate) struct RamEngine {
@@ -801,6 +801,20 @@ const DURABLE_RETRIES: usize = 3;
 /// How often the compaction thread looks at the WAL size.
 const AUTO_COMPACT_POLL: Duration = Duration::from_millis(500);
 
+/// Upper bound on the pre-sized serializer buffer. `approx_bytes` counts heap
+/// nodes, not JSON characters, so it over-estimates; a huge document must not
+/// reserve its whole estimate up front.
+const RAW_JSON_MAX_CAPACITY: usize = 8 * 1024 * 1024;
+
+/// Initial capacity for one document's JSON buffer.
+///
+/// `approx_bytes` is a safe upper bound on the encoded length (it counts the
+/// per-node `Arc`/`BTreeMap` overhead JSON omits), so reserving it means a
+/// multi-megabyte conversation serializes without a single reallocation.
+fn raw_json_capacity(approx_bytes: usize) -> usize {
+    approx_bytes.min(RAW_JSON_MAX_CAPACITY)
+}
+
 impl std::fmt::Debug for RamEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RamEngine")
@@ -838,7 +852,7 @@ impl RamEngine {
             initialise(dir, &io)?
         };
 
-        // ── Base ────────────────────────────────────────────────────
+        // â”€â”€ Base â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         let base_path = base_file_path(dir, manifest.base_gen);
         let base = read_ram_base_file(&base_path)?;
         if base.base_seq > manifest.last_seq {
@@ -858,7 +872,7 @@ impl RamEngine {
             docs.insert(Arc::clone(&record.id), record);
         }
 
-        // ── WAL scan (primary + a stalled compaction's target) ──────
+        // â”€â”€ WAL scan (primary + a stalled compaction's target) â”€â”€â”€â”€â”€â”€
         let primary_path = wal_file_path(dir, manifest.wal_gen);
         let mut scans: Vec<(PathBuf, RamWalScan)> =
             vec![(primary_path.clone(), scan_ram_wal(&primary_path)?)];
@@ -883,7 +897,7 @@ impl RamEngine {
             }
         }
 
-        // ── Replay: committed batches ascending, deduped by seq ─────
+        // â”€â”€ Replay: committed batches ascending, deduped by seq â”€â”€â”€â”€â”€
         let mut doc_records: BTreeMap<u64, RamWalRecord> = BTreeMap::new();
         let mut schema_records: Vec<RamWalRecord> = Vec::new();
         let mut pending_present = false;
@@ -983,7 +997,7 @@ impl RamEngine {
             });
         }
 
-        // ── Open the writer, then fold a pending generation into it ─
+        // â”€â”€ Open the writer, then fold a pending generation into it â”€
         let mut writer =
             RamWalWriter::create_or_open(&primary_path, manifest.wal_gen, Arc::clone(&io))?;
         let mut manifest = manifest;
@@ -1024,7 +1038,7 @@ impl RamEngine {
             }
         }
 
-        // ── Indexes from the final document set ────────────────────
+        // â”€â”€ Indexes from the final document set â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         let mut indexes: HashMap<String, RamIndex> = HashMap::new();
         let mut index_bytes = 0usize;
         for spec in &manifest.indexes {
@@ -1033,7 +1047,7 @@ impl RamEngine {
             indexes.insert(spec.field.clone(), built);
         }
 
-        // ── Change ring retention ──────────────────────────────────
+        // â”€â”€ Change ring retention â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         let mut state = RamState {
             docs,
             deleted,
@@ -1108,7 +1122,7 @@ impl RamEngine {
         Ok(engine)
     }
 
-    // ─── Reads ──────────────────────────────────────────────────────
+    // â”€â”€â”€ Reads â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     pub(crate) fn get(&self, id: &str) -> Result<Value> {
         let state = self.state.read();
@@ -1120,13 +1134,13 @@ impl RamEngine {
 
     /// The exact JSON bytes of one document, straight from the RAM tree.
     ///
-    /// Part of the engine's zero-parse read surface: reachable through
-    /// `query_raw` today and by the streaming HTTP path in the next slice.
-    #[allow(dead_code)]
+    /// Part of the engine's zero-parse read surface: no `Value` is built, the
+    /// buffer is pre-sized from the record's own live-bytes estimate so a
+    /// multi-megabyte conversation does not reallocate while serializing.
     pub(crate) fn get_raw_json(&self, id: &str) -> Result<Vec<u8>> {
         let state = self.state.read();
         let record = state.doc(id).ok_or_else(|| Error::not_found(id))?;
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(raw_json_capacity(record.approx_bytes));
         record.doc.write_json(&mut out);
         Ok(out)
     }
@@ -1141,13 +1155,12 @@ impl RamEngine {
     }
 
     /// Batch read of the exact JSON bytes, one entry per requested id.
-    #[allow(dead_code)]
     pub(crate) fn mget_raw_json(&self, ids: &[String]) -> Vec<Option<Vec<u8>>> {
         let state = self.state.read();
         ids.iter()
             .map(|id| {
                 state.doc(id).map(|record| {
-                    let mut out = Vec::new();
+                    let mut out = Vec::with_capacity(raw_json_capacity(record.approx_bytes));
                     record.doc.write_json(&mut out);
                     out
                 })
@@ -1311,12 +1324,11 @@ impl RamEngine {
     }
 
     pub(crate) fn query_with(&self, ast: Value, opts: QueryOptions) -> Result<Vec<Value>> {
-        let (_, rows) = self.select(&ast, &opts, None)?;
-        let mut out = Vec::with_capacity(rows.len());
-        for bytes in rows {
-            out.push(serde_json::from_slice(&bytes)?);
-        }
-        Ok(out)
+        let (_, page) = self.select_records(&ast, &opts)?;
+        Ok(page
+            .into_iter()
+            .map(|record| record.doc.to_value())
+            .collect())
     }
 
     pub(crate) fn query_projected(
@@ -1325,12 +1337,15 @@ impl RamEngine {
         opts: QueryOptions,
         fields: Option<&[String]>,
     ) -> Result<(usize, Vec<Value>)> {
-        let (total, rows) = self.select(&ast, &opts, fields)?;
-        let mut page = Vec::with_capacity(rows.len());
-        for bytes in rows {
-            page.push(serde_json::from_slice(&bytes)?);
+        let (total, page) = self.select_records(&ast, &opts)?;
+        let mut out = Vec::with_capacity(page.len());
+        for record in page {
+            out.push(match fields {
+                Some(fields) => record.doc.project_to_value(fields),
+                None => record.doc.to_value(),
+            });
         }
-        Ok((total, page))
+        Ok((total, out))
     }
 
     pub(crate) fn query_raw(
@@ -1338,21 +1353,42 @@ impl RamEngine {
         ast: Value,
         opts: QueryOptions,
     ) -> Result<(usize, Vec<Arc<[u8]>>)> {
-        let (total, rows) = self.select(&ast, &opts, None)?;
-        Ok((total, rows.into_iter().map(Arc::from).collect()))
+        self.query_raw_projected(ast, opts, None)
     }
 
-    /// Select the matching page and serialize it straight out of the RAM trees.
+    /// The selected page serialized straight out of the RAM trees â€” no
+    /// `serde_json::Value` is built anywhere on this path.
+    pub(crate) fn query_raw_projected(
+        &self,
+        ast: Value,
+        opts: QueryOptions,
+        fields: Option<&[String]>,
+    ) -> Result<(usize, Vec<Arc<[u8]>>)> {
+        let (total, page) = self.select_records(&ast, &opts)?;
+        let mut out = Vec::with_capacity(page.len());
+        for record in page {
+            let mut buf = Vec::with_capacity(raw_json_capacity(record.approx_bytes));
+            match fields {
+                Some(fields) => record.doc.project_write_json(fields, &mut buf),
+                None => record.doc.write_json(&mut buf),
+            }
+            out.push(Arc::from(buf));
+        }
+        Ok((total, out))
+    }
+
+    /// Select the matching page, holding the read lock only for selection:
+    /// the returned `Arc<DocRecord>`s keep their trees alive after the lock is
+    /// released, so serialization never runs under it.
     ///
     /// `offset` is honoured with or without a `limit` (herrbasan/nDB#15), and a
     /// set `limit` bounds the work: only `offset + limit` rows survive the
     /// partial selection before the page is sorted.
-    fn select(
+    fn select_records(
         &self,
         ast: &Value,
         opts: &QueryOptions,
-        fields: Option<&[String]>,
-    ) -> Result<(usize, Vec<Vec<u8>>)> {
+    ) -> Result<(usize, Vec<Arc<DocRecord>>)> {
         validate_query_ast(ast)?;
         let state = self.state.read();
         let mut matches = collect_matches(&state, ast);
@@ -1381,22 +1417,12 @@ impl RamEngine {
         }
 
         let offset = opts.offset.unwrap_or(0);
-        let page: Vec<&Arc<DocRecord>> = matches
-            .iter()
+        let page: Vec<Arc<DocRecord>> = matches
+            .into_iter()
             .skip(offset)
             .take(opts.limit.unwrap_or(usize::MAX))
             .collect();
-
-        let mut rows = Vec::with_capacity(page.len());
-        for record in page {
-            let mut buf = Vec::new();
-            match fields {
-                Some(fields) => record.doc.project_write_json(fields, &mut buf),
-                None => record.doc.write_json(&mut buf),
-            }
-            rows.push(buf);
-        }
-        Ok((total, rows))
+        Ok((total, page))
     }
 
     pub(crate) fn facet_counts(&self, fields: &[String]) -> Vec<(String, BTreeMap<String, usize>)> {
@@ -1517,14 +1543,14 @@ impl RamEngine {
         }
     }
 
-    // ─── Snapshot pins ──────────────────────────────────────────────
+    // â”€â”€â”€ Snapshot pins â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Freeze the current document set and reserve its ring entries.
     ///
     /// Answering with `Vec<Arc<DocRecord>>` means pinning hundreds of MB costs
     /// a few hundred pointers, not a deep clone. The pin keeps the same list
     /// behind an `Arc`, so paging the export and the caller share one frozen
-    /// document set — and neither of them touches live state.
+    /// document set â€” and neither of them touches live state.
     pub(crate) fn pin_snapshot(
         &self,
         ttl: Duration,
@@ -1611,7 +1637,7 @@ impl RamEngine {
         self.state.write().reap_expired_pins_locked()
     }
 
-    // ─── Public mutations ───────────────────────────────────────────
+    // â”€â”€â”€ Public mutations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     pub(crate) fn insert(&self, doc: Value, prefix: Option<String>) -> Result<String> {
         match self.submit(Job::Insert { doc, prefix })? {
@@ -1696,7 +1722,7 @@ impl RamEngine {
         }
     }
 
-    // ─── Indexes ────────────────────────────────────────────────────
+    // â”€â”€â”€ Indexes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     pub(crate) fn create_index(&self, field: &str, kind: V2IndexKind) -> Result<()> {
         self.refuse_if_poisoned()?;
@@ -1767,13 +1793,13 @@ impl RamEngine {
             .unwrap_or(false)
     }
 
-    // ─── Durability & compaction ────────────────────────────────────
+    // â”€â”€â”€ Durability & compaction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     pub(crate) fn flush(&self) -> Result<()> {
         self.wal.lock().sync()
     }
 
-    /// Fold the WAL into a new base generation — non-blocking for writers and
+    /// Fold the WAL into a new base generation â€” non-blocking for writers and
     /// readers.
     ///
     /// The three phases exist so that the only thing a writer ever waits for is
@@ -1788,7 +1814,7 @@ impl RamEngine {
     /// 2. **Base serialization** (no lock): stream the frozen `DocRecord`s
     ///    into `base.gen_<next>.ndb`. A crash or error here leaves a manifest
     ///    whose `pending_wal_gen` still names a WAL that holds every write
-    ///    acknowledged after the freeze — recovery replays base + WAL +
+    ///    acknowledged after the freeze â€” recovery replays base + WAL +
     ///    pending and loses nothing.
     /// 3. **Atomic publish** (short state lock): swap the manifest, advance
     ///    `min_available_seq` to the freeze point (but never past a live pin's
@@ -1803,7 +1829,7 @@ impl RamEngine {
         let _compaction = self.compaction_lock.lock();
         self.refuse_if_poisoned()?;
 
-        // ── Step 1: freeze the visible state, rotate durably ───────
+        // â”€â”€ Step 1: freeze the visible state, rotate durably â”€â”€â”€â”€â”€â”€â”€
         let (cut_seq, frozen_docs, next_gen) = {
             let _commit = self.commit_lock.lock();
             let (cut_seq, mut docs, mut manifest) = {
@@ -1852,7 +1878,7 @@ impl RamEngine {
             }
         };
 
-        // ── Step 2: serialize the base with no lock held ───────────
+        // â”€â”€ Step 2: serialize the base with no lock held â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         write_ram_base_file(
             &base_file_path(&self.dir, next_gen),
             cut_seq,
@@ -1861,7 +1887,7 @@ impl RamEngine {
         )?;
         drop(frozen_docs);
 
-        // ── Step 3: publish the swap ───────────────────────────────
+        // â”€â”€ Step 3: publish the swap â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         //
         // The manifest file is written with the generation fields this
         // compaction owns; the in-memory manifest is updated surgically under
@@ -1972,7 +1998,7 @@ impl RamEngine {
         });
     }
 
-    // ─── Group commit ───────────────────────────────────────────────
+    // â”€â”€â”€ Group commit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     fn refuse_if_poisoned(&self) -> Result<()> {
         if self.poisoned.load(Ordering::SeqCst) {
@@ -2120,7 +2146,7 @@ impl RamEngine {
             return results;
         }
 
-        // ── Memory governance, before anything reaches the WAL ──────
+        // â”€â”€ Memory governance, before anything reaches the WAL â”€â”€â”€â”€â”€â”€
         if let Err(rejected) = self.admit(&stage) {
             return results
                 .into_iter()
@@ -2131,7 +2157,7 @@ impl RamEngine {
                 .collect();
         }
 
-        // ── The durable step ────────────────────────────────────────
+        // â”€â”€ The durable step â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         let fsync_start = Instant::now();
         let prepared = {
             let mut wal = self.wal.lock();
@@ -2171,7 +2197,7 @@ impl RamEngine {
 
         match durable {
             Ok(()) => {
-                // ── Publish, once, after the fsync ──────────────────
+                // â”€â”€ Publish, once, after the fsync â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 let publish_start = Instant::now();
                 self.publish(stage, end_seq);
                 let mut timings = self.timings.lock();
@@ -2196,7 +2222,7 @@ impl RamEngine {
     }
 
     /// Write one prepared batch and fsync it, retrying only a transient
-    /// failure — and rolling the partial bytes back before each retry.
+    /// failure â€” and rolling the partial bytes back before each retry.
     fn durable_append(&self, buffer: &[u8], end_seq: u64, start_len: u64) -> Result<()> {
         let mut wal = self.wal.lock();
         let path = wal.path().to_path_buf();
@@ -2344,7 +2370,7 @@ impl Drop for RamEngine {
     ///
     /// A thread mid-compaction holds a strong `Arc` (it upgraded a `Weak`), so
     /// `Drop` cannot run *inside* `compact()`. It can, however, run on the
-    /// compactor thread itself — when that thread's `Arc` is the last one — and
+    /// compactor thread itself â€” when that thread's `Arc` is the last one â€” and
     /// joining a thread from inside itself would deadlock. The handle is only
     /// joined from a different thread; a self-join is skipped, and the loop
     /// sees the stop flag on its next iteration.
@@ -2438,10 +2464,10 @@ fn duplicate_error(error: &Error) -> Error {
     }
 }
 
-// ─── Query helpers ──────────────────────────────────────────────────────────
+// â”€â”€â”€ Query helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// A top-level field read, matching `serde_json::Value::get` (no dot-path
-/// interpretation) — the semantics `find`, `find_where` and facets have always
+/// interpretation) â€” the semantics `find`, `find_where` and facets have always
 /// had.
 fn top_level<'a>(doc: &'a DocVal, field: &str) -> Option<&'a DocVal> {
     match doc {
@@ -2451,7 +2477,7 @@ fn top_level<'a>(doc: &'a DocVal, field: &str) -> Option<&'a DocVal> {
 }
 
 /// Sort key for one document, resolving a dot path and treating a missing
-/// field as JSON null — exactly what the reference model does.
+/// field as JSON null â€” exactly what the reference model does.
 fn sort_key(record: &DocRecord, field: &str) -> OrderedValue {
     match record.doc.get_path(field) {
         Some(value) => value.ordered_key(),
@@ -2540,7 +2566,7 @@ fn collect_matches(state: &RamState, ast: &Value) -> Vec<Arc<DocRecord>> {
     }
 }
 
-// ─── Recovery helpers ───────────────────────────────────────────────────────
+// â”€â”€â”€ Recovery helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn record_id(op: &RamWalOp) -> String {
     match op {

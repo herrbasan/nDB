@@ -249,11 +249,41 @@ impl DocVal {
 /// serde_json escapes exactly `"`, `\` and the C0 range (with `\b \t \n \f \r`
 /// shortcuts); every other byte, including all multi-byte UTF-8, is emitted
 /// verbatim.
-fn write_json_str(text: &str, out: &mut Vec<u8>) {
+///
+/// Unescaped runs are copied with `extend_from_slice`, never byte by byte, and
+/// whole eight-byte words that hold nothing escapable are skipped in one step:
+/// a multi-megabyte string field otherwise costs one branch per byte.
+/// JSON-escape `text` into `out`, quotes included — the HTTP layer shares it so
+/// ids and documents are escaped by the same code.
+pub(crate) fn write_json_str(text: &str, out: &mut Vec<u8>) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = text.as_bytes();
     out.push(b'"');
-    for &byte in text.as_bytes() {
-        match byte {
+    let mut run_start = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        while index + 8 <= bytes.len() {
+            let word = u64::from_le_bytes(
+                bytes[index..index + 8]
+                    .try_into()
+                    .expect("eight-byte slice"),
+            );
+            if word_has_escapable(word) {
+                break;
+            }
+            index += 8;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        if !needs_escape(bytes[index]) {
+            index += 1;
+            continue;
+        }
+        if run_start < index {
+            out.extend_from_slice(&bytes[run_start..index]);
+        }
+        match bytes[index] {
             b'"' => out.extend_from_slice(b"\\\""),
             b'\\' => out.extend_from_slice(b"\\\\"),
             0x08 => out.extend_from_slice(b"\\b"),
@@ -261,15 +291,41 @@ fn write_json_str(text: &str, out: &mut Vec<u8>) {
             0x0a => out.extend_from_slice(b"\\n"),
             0x0c => out.extend_from_slice(b"\\f"),
             0x0d => out.extend_from_slice(b"\\r"),
-            0x00..=0x1f => {
+            byte => {
                 out.extend_from_slice(b"\\u00");
                 out.push(HEX[(byte >> 4) as usize]);
                 out.push(HEX[(byte & 0x0f) as usize]);
             }
-            _ => out.push(byte),
         }
+        run_start = index + 1;
+        index += 1;
+    }
+    if run_start < bytes.len() {
+        out.extend_from_slice(&bytes[run_start..]);
     }
     out.push(b'"');
+}
+
+#[inline]
+fn needs_escape(byte: u8) -> bool {
+    byte < 0x20 || byte == b'"' || byte == b'\\'
+}
+
+/// Whether any of the eight bytes in `word` needs escaping.
+///
+/// The usual SWAR byte masks: `haszero` is exact, and `hasless` never misses a
+/// byte below the bound (a borrow can report a false positive, which only costs
+/// one slow byte).
+#[inline]
+fn word_has_escapable(word: u64) -> bool {
+    const LOW: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let below_space = word.wrapping_sub(LOW * 0x20) & !word & HIGH;
+    let quote = word ^ (LOW * u64::from(b'"'));
+    let backslash = word ^ (LOW * u64::from(b'\\'));
+    let quote = quote.wrapping_sub(LOW) & !quote & HIGH;
+    let backslash = backslash.wrapping_sub(LOW) & !backslash & HIGH;
+    (below_space | quote | backslash) != 0
 }
 
 // ─── Path resolution ─────────────────────────────────────────────────────────
@@ -756,6 +812,22 @@ fn evaluate_condition(field_val: &DocVal, condition: &Value) -> bool {
 // ─── Projection (parity with project_doc) ───────────────────────────────────
 
 impl DocVal {
+    /// Materialise the `fields` projection as a `Value`, walking only the
+    /// requested paths — the same result as
+    /// `project_doc(&self.to_value(), fields)` without building the full tree.
+    pub fn project_to_value(&self, fields: &[String]) -> Value {
+        let mut out = serde_json::Map::new();
+        for field in fields {
+            if let Some(value) = self.get_path(field) {
+                out.insert(field.clone(), value.to_value());
+            }
+        }
+        if let Some(id) = self.get_path("_id") {
+            out.insert("_id".to_string(), id.to_value());
+        }
+        Value::Object(out)
+    }
+
     /// Serialize the `fields` projection directly, without materialising a
     /// `serde_json::Value`. Byte-identical to
     /// `serde_json::to_vec(&project_doc(&doc.to_value(), fields))`.
@@ -843,6 +915,34 @@ mod tests {
             assert_eq!(doc.to_json_string().as_bytes(), expected.as_slice());
             assert_eq!(doc.to_value(), value);
         }
+    }
+
+    /// The escaped-run fast path skips eight bytes at a time; an escapable byte
+    /// must be found at any offset inside a word, and long runs of plain text
+    /// must survive the word skip untouched.
+    #[test]
+    fn escapes_are_found_at_every_word_offset() {
+        for escape in ['"', '\\', '\n', '\t', '\r', '\u{8}', '\u{c}', '\u{0}', '\u{1f}'] {
+            for offset in 0..24usize {
+                let mut text = "a".repeat(offset);
+                text.push(escape);
+                text.push_str(&"b".repeat(13));
+                let value = json!(text);
+                let expected = serde_json::to_vec(&value).expect("serialize");
+                let mut written = Vec::new();
+                build(&value).write_json(&mut written);
+                assert_eq!(
+                    written,
+                    expected,
+                    "escaping diverged for {escape:?} at offset {offset}"
+                );
+            }
+        }
+        let long = "x".repeat(9_999);
+        let value = json!(format!("{long}end"));
+        let mut written = Vec::new();
+        build(&value).write_json(&mut written);
+        assert_eq!(written, serde_json::to_vec(&value).unwrap());
     }
 
     #[test]

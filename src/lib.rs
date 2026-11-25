@@ -2588,6 +2588,40 @@ impl Database {
             .ok_or_else(|| Error::not_found(id))
     }
 
+    /// The exact JSON bytes of one document, without building a `Value`.
+    ///
+    /// RAM serializes its `DocVal` tree directly into a pre-sized buffer; v2
+    /// copies the stored bytes out of the mapping; v1 has no byte form to
+    /// reuse and encodes once. The HTTP layer streams this straight into the
+    /// response body.
+    pub fn get_raw_json(&self, id: &str) -> Result<Vec<u8>> {
+        if let Some(ram) = &self.ram {
+            return ram.get_raw_json(id);
+        }
+        if let Some(v2) = &self.v2 {
+            return v2.get_raw_json(id);
+        }
+        serde_json::to_vec(&self.get(id)?).map_err(Into::into)
+    }
+
+    /// Batch read of exact JSON bytes, one entry per requested id.
+    ///
+    /// Missing ids are `None`; any other error aborts the batch loudly.
+    pub fn mget_raw_json(&self, ids: &[String]) -> Result<Vec<Option<Vec<u8>>>> {
+        if let Some(ram) = &self.ram {
+            return Ok(ram.mget_raw_json(ids));
+        }
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self.get_raw_json(id) {
+                Ok(bytes) => out.push(Some(bytes)),
+                Err(Error::NotFound { .. }) => out.push(None),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
     /// Add one document to every index. Caller holds the writer lock.
     fn index_insert_doc(&self, id: &str, doc: &Value) {
         {
@@ -3585,6 +3619,33 @@ impl Database {
             return v2.query_raw(ast, opts);
         }
         let (total, docs) = self.query_projected(ast, opts, None)?;
+        let mut out = Vec::with_capacity(docs.len());
+        for doc in docs {
+            out.push(std::sync::Arc::from(serde_json::to_vec(&doc)?));
+        }
+        Ok((total, out))
+    }
+
+    /// The selected page as pre-serialized JSON bytes with an optional field
+    /// projection — the HTTP path for `fields`-bearing queries.
+    ///
+    /// On RAM the projection is written straight out of the `DocVal` trees
+    /// (`project_write_json`), so no `Value` exists anywhere on the path. The
+    /// v2/v1 fallback projects as values and encodes once, which is what the
+    /// projected HTTP response did before.
+    pub fn query_raw_projected(
+        &self,
+        ast: Value,
+        opts: QueryOptions,
+        fields: Option<&[String]>,
+    ) -> Result<(usize, Vec<std::sync::Arc<[u8]>>)> {
+        if let Some(ram) = &self.ram {
+            return ram.query_raw_projected(ast, opts, fields);
+        }
+        if fields.is_none() {
+            return self.query_raw(ast, opts);
+        }
+        let (total, docs) = self.query_projected(ast, opts, fields)?;
         let mut out = Vec::with_capacity(docs.len());
         for doc in docs {
             out.push(std::sync::Arc::from(serde_json::to_vec(&doc)?));

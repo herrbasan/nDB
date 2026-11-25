@@ -985,6 +985,18 @@ impl V2Engine {
         }
     }
 
+    /// The document's stored JSON bytes, copied straight out of the mapping /
+    /// WAL overlay — no parse, no re-serialize. The store's bytes are what
+    /// `serde_json::to_vec` produced at commit time, so this is byte-identical
+    /// to re-encoding the parsed value.
+    pub(crate) fn get_raw_json(&self, id: &str) -> Result<Vec<u8>> {
+        let state = self.state.read();
+        match state.doc(id) {
+            Some((bytes, _)) => Ok(bytes.to_vec()),
+            None => Err(Error::not_found(id)),
+        }
+    }
+
     pub(crate) fn doc_seq(&self, id: &str) -> Option<u64> {
         self.state.read().doc(id).map(|(_, doc_seq)| doc_seq)
     }
