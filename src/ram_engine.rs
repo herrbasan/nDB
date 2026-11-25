@@ -65,6 +65,11 @@ pub struct RamConfig {
     /// Retained change bytes. Count alone is not a bound: ten 4 MB chat
     /// post-images are 40 MB however few events they are.
     pub change_ring_cap_bytes: usize,
+    /// Compact in the background once the active WAL generation grows past
+    /// this many bytes. `None` disables it — an embedded or unit-test open
+    /// never grows a compaction thread behind the caller's back; `ndb serve`
+    /// turns it on explicitly via [`RamConfig::server_default`].
+    pub auto_compact_wal_bytes: Option<u64>,
 }
 
 impl Default for RamConfig {
@@ -73,9 +78,25 @@ impl Default for RamConfig {
             max_memory_bytes: None,
             change_ring_cap_events: 1024,
             change_ring_cap_bytes: 64 * 1024 * 1024,
+            auto_compact_wal_bytes: None,
         }
     }
 }
+
+impl RamConfig {
+    /// The budget `ndb serve` mounts databases with: the embedded defaults plus
+    /// WAL-growth-driven background compaction.
+    pub fn server_default() -> Self {
+        RamConfig {
+            auto_compact_wal_bytes: Some(32 * 1024 * 1024),
+            ..RamConfig::default()
+        }
+    }
+}
+
+/// Default lifetime of a snapshot pin. Reaping runs on a timer (see
+/// `server::DbRegistry`), so an idle server always releases what it pinned.
+pub const DEFAULT_PIN_TTL: Duration = Duration::from_secs(300);
 
 /// Live memory, change-feed and stage-timing counters of one RAM-first
 /// database. Every field is a snapshot taken under the state lock.
@@ -129,10 +150,17 @@ struct RamChangeEvent {
     approx_bytes: usize,
 }
 
-/// One snapshot pin: a frozen document list plus the ring floor it reserves.
+/// One snapshot pin: the frozen document list plus the ring floor it reserves.
+///
+/// The list is `Arc`-shared, so pinning a 338 MB database costs one pointer
+/// copy — never a document clone, and never under the commit lock.
 struct Pin {
     cut_seq: u64,
     expires_at: Instant,
+    /// The lineage this pin froze; a page answers with it, never with a newer
+    /// watermark read from live state.
+    lineage: SourceLineage,
+    docs: Arc<Vec<Arc<DocRecord>>>,
 }
 
 enum RamIndex {
@@ -744,18 +772,34 @@ pub(crate) struct RamEngine {
     state: RwLock<RamState>,
     wal: Mutex<RamWalWriter>,
     commit_lock: Mutex<()>,
+    /// Serialises compactions. Never held by a writer, so a compaction in
+    /// flight cannot block a commit.
+    compaction_lock: Mutex<()>,
     queue: Mutex<QueueState>,
     queue_cv: Condvar,
     next_job: AtomicU64,
     poisoned: AtomicBool,
     poison_reason: Mutex<Option<String>>,
     timings: Mutex<StageTimings>,
+    auto_compact: Mutex<Option<AutoCompact>>,
     _lock: DbLock,
 }
 
-const PIN_TTL: Duration = Duration::from_secs(300);
+/// The stop signal and handle of the WAL-growth compaction thread.
+struct AutoCompact {
+    stop: Arc<AutoCompactStop>,
+    handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+struct AutoCompactStop {
+    flag: Mutex<bool>,
+    wake: Condvar,
+}
+
 /// Bounded retries for a transient durable-write failure.
 const DURABLE_RETRIES: usize = 3;
+/// How often the compaction thread looks at the WAL size.
+const AUTO_COMPACT_POLL: Duration = Duration::from_millis(500);
 
 impl std::fmt::Debug for RamEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1022,6 +1066,7 @@ impl RamEngine {
             state: RwLock::new(state),
             wal: Mutex::new(writer),
             commit_lock: Mutex::new(()),
+            compaction_lock: Mutex::new(()),
             queue: Mutex::new(QueueState {
                 queue: VecDeque::new(),
                 leader_active: false,
@@ -1031,27 +1076,35 @@ impl RamEngine {
             poisoned: AtomicBool::new(false),
             poison_reason: Mutex::new(None),
             timings: Mutex::new(StageTimings::default()),
+            auto_compact: Mutex::new(None),
             _lock: lock,
         };
 
         // Recovery rewrites a clean manifest: `pending_wal_gen` is gone (its
         // records now live in the active WAL), and any adopted schema state is
         // recorded so the next boot needs no WAL scanning to learn it.
+        //
+        // The clean manifest is also what the orphan sweep uses: `wal.gen_<p>`
+        // is dead the moment the fold above re-committed its records into the
+        // active generation, and keeping it referenced would leak a file that
+        // holds nothing the manifest names.
         let adopted_pending = manifest.pending_wal_gen;
-        if adopted_pending.is_some() || !schema_records.is_empty() {
-            let (last_seq, min_available_seq) = {
-                let state = engine.state.read();
-                (state.lineage.last_seq, state.lineage.min_available_seq)
-            };
-            let mut clean = engine.state.read().manifest.clone();
+        let clean = if adopted_pending.is_some() || !schema_records.is_empty() {
+            let mut clean = manifest.clone();
             clean.pending_wal_gen = None;
-            clean.last_seq = last_seq;
-            clean.min_available_seq = min_available_seq;
+            {
+                let state = engine.state.read();
+                clean.last_seq = state.lineage.last_seq;
+                clean.min_available_seq = state.lineage.min_available_seq;
+            }
             write_ram_manifest_atomic(dir, &clean, io.as_ref())?;
-            engine.state.write().manifest = clean;
-        }
+            engine.state.write().manifest = clean.clone();
+            clean
+        } else {
+            manifest
+        };
 
-        sweep_orphan_generations(dir, &manifest, io.as_ref())?;
+        sweep_orphan_generations(dir, &clean, io.as_ref())?;
         Ok(engine)
     }
 
@@ -1469,30 +1522,69 @@ impl RamEngine {
     /// Freeze the current document set and reserve its ring entries.
     ///
     /// Answering with `Vec<Arc<DocRecord>>` means pinning hundreds of MB costs
-    /// a few hundred pointers, not a deep clone. The pin surface is exercised
-    /// by the ring-floor tests; a served `/snapshot` route adopts it next.
-    #[allow(dead_code)]
-    pub(crate) fn pin_snapshot(&self) -> (u64, u64, Vec<Arc<DocRecord>>) {
+    /// a few hundred pointers, not a deep clone. The pin keeps the same list
+    /// behind an `Arc`, so paging the export and the caller share one frozen
+    /// document set — and neither of them touches live state.
+    pub(crate) fn pin_snapshot(
+        &self,
+        ttl: Duration,
+    ) -> Result<(u64, SourceLineage, Vec<Arc<DocRecord>>)> {
+        if ttl.is_zero() {
+            return Err(Error::invalid_arg(
+                "a snapshot pin must live for a non-zero duration",
+            ));
+        }
+        let expires_at = Instant::now().checked_add(ttl).ok_or_else(|| {
+            Error::invalid_arg(format!("snapshot pin TTL {ttl:?} overflows the clock"))
+        })?;
         let mut state = self.state.write();
         state.reap_expired_pins_locked();
-        let cut_seq = state.lineage.last_seq;
+        let lineage = state.lineage.clone();
         let mut docs: Vec<Arc<DocRecord>> = state.docs.values().cloned().collect();
         docs.sort_by(|a, b| a.id.cmp(&b.id));
+        let docs = Arc::new(docs);
         let pin_id = state.next_pin;
         state.next_pin += 1;
         state.pins.insert(
             pin_id,
             Pin {
-                cut_seq,
-                expires_at: Instant::now() + PIN_TTL,
+                cut_seq: lineage.last_seq,
+                expires_at,
+                lineage: lineage.clone(),
+                docs: Arc::clone(&docs),
             },
         );
         state.recompute_min_pinned();
-        (pin_id, cut_seq, docs)
+        Ok((pin_id, lineage, (*docs).clone()))
+    }
+
+    /// One page of a pinned snapshot.
+    ///
+    /// `None` covers both "never issued" and "expired": the caller answers
+    /// `410 snapshot_expired` either way, because neither can be resumed.
+    pub(crate) fn get_pinned_page(
+        &self,
+        pin_id: u64,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Option<(SourceLineage, usize, Vec<Arc<DocRecord>>)> {
+        let (lineage, docs) = {
+            let mut state = self.state.write();
+            state.reap_expired_pins_locked();
+            let pin = state.pins.get(&pin_id)?;
+            (pin.lineage.clone(), Arc::clone(&pin.docs))
+        };
+        let total = docs.len();
+        let page = docs
+            .iter()
+            .skip(offset)
+            .take(limit.unwrap_or(usize::MAX))
+            .cloned()
+            .collect();
+        Some((lineage, total, page))
     }
 
     /// Release a pin. Unknown ids are reported, not ignored.
-    #[allow(dead_code)]
     pub(crate) fn release_pin(&self, pin_id: u64) -> Result<()> {
         let mut state = self.state.write();
         if state.pins.remove(&pin_id).is_none() {
@@ -1503,7 +1595,19 @@ impl RamEngine {
     }
 
     /// Drop expired pins. Returns how many were reaped.
+    ///
+    /// The read-lock probe in front of the write lock matters: the server's
+    /// reaper calls this every two seconds for every mounted database, and an
+    /// idle database must not take a write lock just to learn it has nothing
+    /// to do.
     pub(crate) fn reap_expired_pins(&self) -> usize {
+        {
+            let state = self.state.read();
+            let now = Instant::now();
+            if !state.pins.values().any(|pin| pin.expires_at <= now) {
+                return 0;
+            }
+        }
         self.state.write().reap_expired_pins_locked()
     }
 
@@ -1669,69 +1773,203 @@ impl RamEngine {
         self.wal.lock().sync()
     }
 
-    /// Fold the WAL into a new base generation.
+    /// Fold the WAL into a new base generation — non-blocking for writers and
+    /// readers.
     ///
-    /// Stop-the-world on purpose for Phase 1: the base is written and fsynced
-    /// under a *new* generation, the new WAL header is created, and only then is
-    /// the manifest swapped atomically. A crash before the swap leaves the old
-    /// generations authoritative (the new files are orphans and get swept); a
-    /// crash after it leaves the new base + WAL authoritative. `seq` never
-    /// resets, and `min_available_seq` advances to `last_seq + 1` because the
-    /// rewritten documents are base state, not events.
+    /// The three phases exist so that the only thing a writer ever waits for is
+    /// two short critical sections, and the expensive part (serialising every
+    /// document) runs with no lock held at all:
+    ///
+    /// 1. **Freeze & durable rotate** (commit lock held): capture the visible
+    ///    sequence and the `Arc` handles of its documents, create
+    ///    `wal.gen_<next>.ndb`, persist `pending_wal_gen = next` in the
+    ///    manifest *before* the writer swaps, then swap. Writers now commit
+    ///    into the new generation and readers keep reading RAM.
+    /// 2. **Base serialization** (no lock): stream the frozen `DocRecord`s
+    ///    into `base.gen_<next>.ndb`. A crash or error here leaves a manifest
+    ///    whose `pending_wal_gen` still names a WAL that holds every write
+    ///    acknowledged after the freeze — recovery replays base + WAL +
+    ///    pending and loses nothing.
+    /// 3. **Atomic publish** (short state lock): swap the manifest, advance
+    ///    `min_available_seq` to the freeze point (but never past a live pin's
+    ///    floor), prune the ring below it, then sweep the superseded files.
+    ///
+    /// A previous compaction that failed after its freeze leaves
+    /// `pending_wal_gen` set; the retry reuses that generation as its target
+    /// instead of rotating again, so no acknowledged write can be orphaned by a
+    /// second rotation.
     pub(crate) fn compact(&self) -> Result<()> {
         self.refuse_if_poisoned()?;
-        let _commit = self.commit_lock.lock();
+        let _compaction = self.compaction_lock.lock();
+        self.refuse_if_poisoned()?;
 
-        let (docs, last_seq, next_gen, mut manifest) = {
-            let state = self.state.read();
-            let mut docs: Vec<Arc<DocRecord>> = state.docs.values().cloned().collect();
+        // ── Step 1: freeze the visible state, rotate durably ───────
+        let (cut_seq, frozen_docs, next_gen) = {
+            let _commit = self.commit_lock.lock();
+            let (cut_seq, mut docs, mut manifest) = {
+                let state = self.state.read();
+                (
+                    state.lineage.last_seq,
+                    state.docs.values().cloned().collect::<Vec<_>>(),
+                    state.manifest.clone(),
+                )
+            };
             docs.sort_by(|a, b| a.id.cmp(&b.id));
-            let next_gen = state.manifest.base_gen.max(state.manifest.wal_gen) + 1;
-            (docs, state.lineage.last_seq, next_gen, state.manifest.clone())
+
+            match manifest.pending_wal_gen {
+                Some(pending_gen) => {
+                    // A stalled compaction already rotated: its generation is
+                    // the active writer and holds every write made since. Reuse
+                    // it as this compaction's target.
+                    let active = self.wal.lock().wal_gen();
+                    if active != pending_gen {
+                        return Err(Error::corruption(
+                            &self.dir,
+                            format!(
+                                "manifest names pending WAL generation {pending_gen} but the active writer is {active}"
+                            ),
+                        ));
+                    }
+                    (cut_seq, docs, pending_gen)
+                }
+                None => {
+                    let next_gen = manifest.base_gen.max(manifest.wal_gen) + 1;
+                    let new_wal = RamWalWriter::create_or_open(
+                        &wal_file_path(&self.dir, next_gen),
+                        next_gen,
+                        Arc::clone(&self.io),
+                    )?;
+                    // The manifest must name the generation before any writer
+                    // can reach it: a crash between the two steps then leaves
+                    // an unreferenced stub (swept as an orphan), never writes
+                    // nothing points at.
+                    manifest.pending_wal_gen = Some(next_gen);
+                    write_ram_manifest_atomic(&self.dir, &manifest, self.io.as_ref())?;
+                    *self.wal.lock() = new_wal;
+                    self.state.write().manifest = manifest;
+                    (cut_seq, docs, next_gen)
+                }
+            }
         };
 
+        // ── Step 2: serialize the base with no lock held ───────────
         write_ram_base_file(
             &base_file_path(&self.dir, next_gen),
-            last_seq,
-            &docs,
+            cut_seq,
+            &frozen_docs,
             self.io.as_ref(),
         )?;
-        // The new generation's header must exist before the manifest names it.
-        {
-            let writer = RamWalWriter::create_or_open(
-                &wal_file_path(&self.dir, next_gen),
-                next_gen,
-                Arc::clone(&self.io),
-            )?;
-            writer.sync()?;
-        }
+        drop(frozen_docs);
 
-        manifest.base_gen = next_gen;
-        manifest.wal_gen = next_gen;
-        manifest.pending_wal_gen = None;
-        manifest.last_seq = last_seq;
-        manifest.min_available_seq = last_seq.saturating_add(1);
-        write_ram_manifest_atomic(&self.dir, &manifest, self.io.as_ref())?;
-
-        // The manifest is the authority: only now is the old generation dead.
-        let writer = RamWalWriter::create_or_open(
-            &wal_file_path(&self.dir, next_gen),
-            next_gen,
-            Arc::clone(&self.io),
-        )?;
+        // ── Step 3: publish the swap ───────────────────────────────
+        //
+        // The manifest file is written with the generation fields this
+        // compaction owns; the in-memory manifest is updated surgically under
+        // the state lock rather than replaced, so an index DDL that landed
+        // between the freeze and here is never dropped from RAM (its WAL
+        // record makes the same change durable on the next boot).
+        let (new_manifest, last_seq_now) = {
+            let state = self.state.read();
+            let mut manifest = state.manifest.clone();
+            manifest.base_gen = next_gen;
+            manifest.wal_gen = next_gen;
+            manifest.pending_wal_gen = None;
+            manifest.last_seq = state.lineage.last_seq;
+            manifest.min_available_seq = cut_seq.saturating_add(1);
+            (manifest, state.lineage.last_seq)
+        };
+        write_ram_manifest_atomic(&self.dir, &new_manifest, self.io.as_ref())?;
         {
             let mut state = self.state.write();
-            state.lineage.min_available_seq = manifest.min_available_seq;
-            state.change_ring.clear();
-            state.ring_bytes = 0;
-            state.manifest = manifest.clone();
+            state.reap_expired_pins_locked();
+            // Compaction may advance the feed floor, but a pin's reservation
+            // outranks it: entries at or after a live pin's `cut_seq` stay
+            // readable for as long as that pin exists.
+            let keep_floor = cut_seq
+                .saturating_add(1)
+                .min(state.min_pinned_seq.unwrap_or(u64::MAX));
+            while let Some(front) = state.change_ring.front() {
+                if front.seq >= keep_floor {
+                    break;
+                }
+                if let Some(event) = state.change_ring.pop_front() {
+                    state.ring_bytes = state.ring_bytes.saturating_sub(event.approx_bytes);
+                }
+            }
+            state.lineage.min_available_seq = keep_floor;
+            state.manifest.base_gen = next_gen;
+            state.manifest.wal_gen = next_gen;
+            state.manifest.pending_wal_gen = None;
+            state.manifest.last_seq = last_seq_now.max(state.lineage.last_seq);
+            state.manifest.min_available_seq = cut_seq.saturating_add(1);
             state.refresh_available_seq();
         }
-        *self.wal.lock() = writer;
 
-        // Sweep everything the new manifest does not name.
-        sweep_orphan_generations(&self.dir, &manifest, self.io.as_ref())?;
+        sweep_orphan_generations(&self.dir, &new_manifest, self.io.as_ref())?;
         Ok(())
+    }
+
+    /// Start WAL-growth-driven background compaction, when configured.
+    ///
+    /// Called by the `Database` that owns the engine, after the engine is
+    /// behind an `Arc`. The thread holds only a `Weak`, so it can never keep a
+    /// closed database alive, and `Drop` joins it.
+    pub(crate) fn start_background(self: &Arc<Self>) {
+        if self.config.auto_compact_wal_bytes.is_none() || self.auto_compact.lock().is_some() {
+            return;
+        }
+        let threshold = self
+            .config
+            .auto_compact_wal_bytes
+            .expect("checked just above");
+        let stop = Arc::new(AutoCompactStop {
+            flag: Mutex::new(false),
+            wake: Condvar::new(),
+        });
+        let thread_stop = Arc::clone(&stop);
+        let weak = Arc::downgrade(self);
+        let handle = std::thread::Builder::new()
+            .name("ndb-ram-compactor".to_string())
+            .spawn(move || {
+                let mut last_attempt = 0u64;
+                loop {
+                    {
+                        let mut flag = thread_stop.flag.lock();
+                        if *flag {
+                            return;
+                        }
+                        thread_stop.wake.wait_for(&mut flag, AUTO_COMPACT_POLL);
+                        if *flag {
+                            return;
+                        }
+                    }
+                    let Some(engine) = weak.upgrade() else {
+                        return;
+                    };
+                    let len = match engine.wal.lock().file_len() {
+                        Ok(len) => len,
+                        Err(error) => {
+                            report::detached("ram auto-compaction: stat WAL", error);
+                            continue;
+                        }
+                    };
+                    // Only act when the log grew since the last attempt: a
+                    // failing disk must not turn into a hot retry loop.
+                    if len < threshold || len <= last_attempt {
+                        continue;
+                    }
+                    last_attempt = len;
+                    match engine.compact() {
+                        Ok(()) => last_attempt = 0,
+                        Err(error) => report::detached("ram auto-compaction", error),
+                    }
+                }
+            })
+            .expect("spawn the RAM auto-compaction thread");
+        *self.auto_compact.lock() = Some(AutoCompact {
+            stop,
+            handle: Mutex::new(Some(handle)),
+        });
     }
 
     // ─── Group commit ───────────────────────────────────────────────
@@ -2098,6 +2336,32 @@ impl RamEngine {
             (buffer, end_seq, start_len)
         };
         self.durable_append(&buffer, end_seq, start_len)
+    }
+}
+
+impl Drop for RamEngine {
+    /// Stop and join the background compactor.
+    ///
+    /// A thread mid-compaction holds a strong `Arc` (it upgraded a `Weak`), so
+    /// `Drop` cannot run *inside* `compact()`. It can, however, run on the
+    /// compactor thread itself — when that thread's `Arc` is the last one — and
+    /// joining a thread from inside itself would deadlock. The handle is only
+    /// joined from a different thread; a self-join is skipped, and the loop
+    /// sees the stop flag on its next iteration.
+    fn drop(&mut self) {
+        let auto = self.auto_compact.lock().take();
+        if let Some(auto) = auto {
+            *auto.stop.flag.lock() = true;
+            auto.stop.wake.notify_all();
+            if let Some(handle) = auto.handle.lock().take() {
+                if handle.thread().id() == std::thread::current().id() {
+                    return;
+                }
+                if handle.join().is_err() {
+                    report::detached("ram auto-compaction thread", "panicked while joining");
+                }
+            }
+        }
     }
 }
 

@@ -103,10 +103,36 @@ existing folders.
   unconditional (#16). Memory is governed by `RamConfig` (unpinned ring
   eviction first, then `Error::MemoryLimitExceeded` / HTTP 507 before the WAL is
   touched).
+- **Compaction (slice 2A) is non-blocking.** Three phases, serialised by a
+  dedicated `compaction_lock`, never holding the commit or state lock across
+  base serialization: (1) *freeze & durable rotate* under `commit_lock` —
+  capture `cut_seq` + the `Arc<DocRecord>` handles, create
+  `wal.gen_<N+1>.ndb`, persist `pending_wal_gen` in the manifest **before** the
+  writer swaps; (2) *serialize* `base.gen_<N+1>.ndb` with **no lock held**;
+  (3) *publish* — atomic manifest swap, prune the ring below
+  `min(cut_seq+1, min_pinned_seq)`, then sweep superseded generations. A stall
+  leaves `pending_wal_gen` naming a WAL that holds post-freeze writes; recovery
+  replays base + WAL + pending (deduped by seq), re-commits the pending records
+  into the active generation and rewrites the manifest before sweeping. A retry
+  after a stalled step *reuses* that pending generation instead of rotating
+  again (a second rotation would orphan acknowledged writes).
+  `RamConfig::auto_compact_wal_bytes` (`None` for embedded opens,
+  `Some(32 MiB)` via `RamConfig::server_default`) starts a WAL-growth thread
+  that joins on `Drop`; there is no timer-driven compaction.
+- **Pinned snapshots (slice 2A).** `RamEngine::pin_snapshot(ttl)` freezes the
+  document set as `Arc<Vec<Arc<DocRecord>>>` (never a deep clone, never under
+  `commit_lock`) and reserves ring entries at/after its `cut_seq`;
+  `get_pinned_page` / `release_pin` serve and release it. `GET
+  /v2/dbs/{name}/snapshot` on a RAM database pages the pinned `Arc` set (only
+  the requested page is converted to JSON) and the registry's reaper thread
+  (2 s wake, exits on `request_process_shutdown`) releases expired pins for
+  every mounted DB, so an idle server never holds one.
 - `StorageFormat::{Auto,V1,V2,Ram}` — `ram`/`v3` parse; `Auto` routes a folder
   whose `manifest.json` is version 3 to the engine (v2 manifests carry
   `format_version`); `Database::open_ram`, `open_ram_with_config`,
-  `open_ram_with_io` (test/`fault-io`), `is_ram`, `ram_stats`.
+  `open_ram_with_io` (test/`fault-io`), `open_with_ram_config` (serve),
+  `is_ram`, `ram_stats`, `pin_snapshot` / `pinned_page` / `release_pin` /
+  `reap_expired_pins`.
   `GET /stats` and `GET /v2/dbs/{name}/stats` add a `ram` block
   (live/index/ring bytes, oldest retained seq, expired cursors, pins, poison,
   WAL bytes, stage timings); `/v2/dbs` reports `"format": "ram"`.
@@ -116,7 +142,11 @@ existing folders.
 - Tests: `cargo test --features fault-io --test phase18_ram_engine_tests` (the
   10 000-op differential oracle, the three fix regressions, 4 MB structural
   sharing/WAL growth, 8-writer/4-reader group commit, poison injection, memory
-  budget); `--test refdb_oracle_tests --test phase17_fault_injection_tests`;
+  budget); `--test phase19_compaction_and_faults_tests` (every §4 crash row R0,
+  R1, C1–C7 out-of-process through `crash_child`, mid-log corruption + repair,
+  compaction under live readers/writers, pinned-snapshot retention and
+  backpressure, WAL-growth auto-compaction, the RAM `/snapshot` pin route and
+  the reaper); `--test refdb_oracle_tests --test phase17_fault_injection_tests`;
   `cargo test --features fault-io --lib io::tests`.
 - Baseline: `cargo run --release --example corpus_baseline -- [--corpus
   memories|chat|all]` (default `all`) measures the Phase 0 workloads — warm

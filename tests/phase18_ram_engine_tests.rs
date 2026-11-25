@@ -30,6 +30,7 @@ fn open_oracle(dir: &Path) -> Database {
             max_memory_bytes: None,
             change_ring_cap_events: 1_000_000,
             change_ring_cap_bytes: 1024 * 1024 * 1024,
+            auto_compact_wal_bytes: None,
         },
     )
     .expect("open a RAM-first database")
@@ -981,6 +982,7 @@ fn memory_budget_evicts_ring_history_then_refuses_the_write() {
             max_memory_bytes: Some(320 * 1024),
             change_ring_cap_events: 4,
             change_ring_cap_bytes: 64 * 1024 * 1024,
+            auto_compact_wal_bytes: None,
         },
     )
     .expect("open with a small budget");

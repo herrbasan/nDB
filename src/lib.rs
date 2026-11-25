@@ -1628,6 +1628,20 @@ pub struct Database {
     ram: Option<Arc<ram_engine::RamEngine>>,
 }
 
+/// One page of a pinned RAM-first snapshot.
+///
+/// The set behind it is the `Arc<Vec<Arc<DocRecord>>>` the pin froze; only the
+/// page being returned is converted to owned JSON.
+#[derive(Debug, Clone)]
+pub struct RamSnapshotPage {
+    /// The watermark and epoch the pin froze.
+    pub lineage: SourceLineage,
+    /// Documents in the whole pinned set.
+    pub total: usize,
+    /// The requested page, id-ascending.
+    pub docs: Vec<Value>,
+}
+
 impl Database {
     /// Open or create a database at the given path.
     ///
@@ -1723,7 +1737,22 @@ impl Database {
 
     /// Open a database with explicit options (format detection and
     /// persistence selection).
+    ///
+    /// A RAM-first (v3) folder mounts with [`RamConfig::default`] — embedded
+    /// callers keep their own lifecycle, so no compaction thread is started.
+    /// `ndb serve` uses [`Database::open_with_ram_config`] to also opt into
+    /// WAL-growth compaction.
     pub fn open_with_options(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
+        Self::open_with_ram_config(path, options, RamConfig::default())
+    }
+
+    /// Open a database with explicit options and the RAM-first budget/behaviour
+    /// to use when the folder resolves to a v3 database.
+    pub fn open_with_ram_config(
+        path: impl AsRef<Path>,
+        options: OpenOptions,
+        ram_config: RamConfig,
+    ) -> Result<Self> {
         let raw = path.as_ref().to_path_buf();
         // A directory names a database folder; anything else names the journal
         // (whose parent is the folder). A v2 folder that does not exist yet is
@@ -1797,7 +1826,7 @@ impl Database {
                 journal,
                 base_dir,
                 lock,
-                RamConfig::default(),
+                ram_config,
                 Arc::new(crate::io::RealIo::new()),
             ),
             StorageFormat::V2 => Self::open_v2_locked(journal, base_dir, lock, options.persistence),
@@ -1821,6 +1850,7 @@ impl Database {
             io,
             lock,
         )?);
+        engine.start_background();
 
         let mut item_buckets = HashMap::new();
         for (name, policy) in &bucket_policies {
@@ -4372,6 +4402,60 @@ impl Database {
     /// Live RAM-first counters, or `None` for a v1/v2 database.
     pub fn ram_stats(&self) -> Option<RamStats> {
         self.ram.as_ref().map(|engine| engine.ram_stats())
+    }
+
+    /// Pin a frozen, `Arc`-shared view of the RAM document set for `ttl`.
+    ///
+    /// The documents are never deep-cloned and the pin is taken under the
+    /// state lock only to copy pointers, so pinning a large database costs
+    /// kilobytes. `Ok(None)` means this is not a v1/v2 database — the caller
+    /// keeps its own owned snapshot instead.
+    pub fn pin_snapshot(
+        &self,
+        ttl: Duration,
+    ) -> Result<Option<(u64, SourceLineage, Vec<Arc<docval::DocRecord>>)>> {
+        match &self.ram {
+            Some(ram) => ram.pin_snapshot(ttl).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// One page of a pinned snapshot, or `None` when the pin is unknown or has
+    /// expired (the caller answers `410 snapshot_expired`).
+    pub fn pinned_page(
+        &self,
+        pin_id: u64,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Option<RamSnapshotPage> {
+        let ram = self.ram.as_ref()?;
+        let (lineage, total, page) = ram.get_pinned_page(pin_id, offset, limit)?;
+        Some(RamSnapshotPage {
+            lineage,
+            total,
+            docs: page
+                .iter()
+                .map(|record| record.doc.to_value())
+                .collect(),
+        })
+    }
+
+    /// Release a snapshot pin early.
+    pub fn release_pin(&self, pin_id: u64) -> Result<()> {
+        match &self.ram {
+            Some(ram) => ram.release_pin(pin_id),
+            None => Err(Error::invalid_arg(
+                "snapshot pins belong to RAM-first databases only",
+            )),
+        }
+    }
+
+    /// Drop this database's expired pins; returns how many were reaped (always
+    /// zero for a v1/v2 database).
+    pub fn reap_expired_pins(&self) -> usize {
+        self.ram
+            .as_ref()
+            .map_or(0, |engine| engine.reap_expired_pins())
     }
 
     /// The live v2 manifest, when this is a v2 database.

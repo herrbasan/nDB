@@ -135,16 +135,29 @@ pub struct DbRegistry {
     /// Frozen snapshots pinned by `GET /v2/dbs/{name}/snapshot`, so pages of
     /// one read never drift under concurrent writes.
     snapshots: RwLock<HashMap<String, PinnedSnapshot>>,
+    /// Budget and background behaviour a mounted v3 database opens with.
+    ram_config: crate::RamConfig,
 }
 
 /// How long a pinned snapshot stays addressable. Long enough for a client to
 /// walk a large export, short enough that abandoned pins free themselves.
-const SNAPSHOT_TTL: Duration = Duration::from_secs(300);
+///
+/// The same TTL is handed to the RAM-first engine's own pins, so a forgotten
+/// pin releases its change-ring reservation on the engine's timer too.
+const SNAPSHOT_TTL: Duration = crate::ram_engine::DEFAULT_PIN_TTL;
 
 struct PinnedSnapshot {
     db: String,
-    snapshot: Arc<Snapshot>,
+    body: PinnedBody,
     created: Instant,
+}
+
+enum PinnedBody {
+    /// A v1/v2 database: the snapshot is an owned `(lineage, docs)` pair.
+    Owned(Arc<Snapshot>),
+    /// A RAM-first database: the engine holds the frozen `Arc` list, and a
+    /// page is read from it on demand instead of re-materialising the set.
+    Ram(u64),
 }
 
 impl DbRegistry {
@@ -161,6 +174,7 @@ impl DbRegistry {
             scheduled_ms,
             create_format: RwLock::new(crate::StorageFormat::Auto),
             snapshots: RwLock::new(HashMap::new()),
+            ram_config: crate::RamConfig::server_default(),
         }
     }
 
@@ -176,6 +190,15 @@ impl DbRegistry {
 
     /// Freeze `snapshot` under an id the caller can page through.
     pub fn pin_snapshot(&self, db: &str, snapshot: Arc<Snapshot>) -> String {
+        self.insert_pin(db, PinnedBody::Owned(snapshot))
+    }
+
+    /// Register a pin the RAM-first engine already took.
+    pub fn pin_ram_snapshot(&self, db: &str, pin_id: u64) -> String {
+        self.insert_pin(db, PinnedBody::Ram(pin_id))
+    }
+
+    fn insert_pin(&self, db: &str, body: PinnedBody) -> String {
         let mut pins = self.snapshots.write();
         pins.retain(|_, pin| pin.created.elapsed() < SNAPSHOT_TTL);
         let id = crate::storage::generate_epoch_uuid();
@@ -183,7 +206,7 @@ impl DbRegistry {
             id.clone(),
             PinnedSnapshot {
                 db: db.to_string(),
-                snapshot,
+                body,
                 created: Instant::now(),
             },
         );
@@ -195,9 +218,52 @@ impl DbRegistry {
     pub fn pinned_snapshot(&self, db: &str, id: &str) -> Option<Arc<Snapshot>> {
         let mut pins = self.snapshots.write();
         pins.retain(|_, pin| pin.created.elapsed() < SNAPSHOT_TTL);
-        pins.get(id)
-            .filter(|pin| pin.db == db)
-            .map(|pin| Arc::clone(&pin.snapshot))
+        match pins.get(id).filter(|pin| pin.db == db).map(|pin| &pin.body) {
+            Some(PinnedBody::Owned(snapshot)) => Some(Arc::clone(snapshot)),
+            _ => None,
+        }
+    }
+
+    /// The engine pin behind `id`, for a RAM-first database.
+    pub fn pinned_ram_snapshot(&self, db: &str, id: &str) -> Option<u64> {
+        let mut pins = self.snapshots.write();
+        pins.retain(|_, pin| pin.created.elapsed() < SNAPSHOT_TTL);
+        match pins.get(id).filter(|pin| pin.db == db).map(|pin| &pin.body) {
+            Some(PinnedBody::Ram(pin_id)) => Some(*pin_id),
+            _ => None,
+        }
+    }
+
+    /// Reap everything a timer must reap so an idle server never holds a pin:
+    /// this registry's expired entries (releasing the engine pin behind each)
+    /// and every mounted database's own expired pins.
+    pub fn reap_expired_pins(&self) {
+        let expired: Vec<(String, u64)> = {
+            let mut pins = self.snapshots.write();
+            let mut expired = Vec::new();
+            pins.retain(|_, pin| {
+                if pin.created.elapsed() < SNAPSHOT_TTL {
+                    return true;
+                }
+                if let PinnedBody::Ram(pin_id) = pin.body {
+                    expired.push((pin.db.clone(), pin_id));
+                }
+                false
+            });
+            expired
+        };
+        for (db_name, pin_id) in expired {
+            // The entry is already gone, so a release failure here only means
+            // the engine had reaped the pin on its own timer first.
+            if let Some(db) = self.get(&db_name) {
+                if let Err(error) = db.release_pin(pin_id) {
+                    report::suppressed("snapshot reaper: release engine pin", error);
+                }
+            }
+        }
+        for (_, db) in self.entries() {
+            db.reap_expired_pins();
+        }
     }
 
     /// Root under which `POST /v2/dbs` may create databases (and from which
@@ -309,12 +375,13 @@ impl DbRegistry {
         // `Database::open` errors carry the path and context; a failed open is
         // a service fault (500 over HTTP, fatal in the CLI), not a caller
         // argument error, so the kind is preserved rather than flattened.
-        let db = Database::open_with_options(
+        let db = Database::open_with_ram_config(
             &normalized,
             crate::OpenOptions {
                 format,
                 persistence,
             },
+            self.ram_config,
         )?;
 
         // The file exists now, so the OS's own canonical form is checkable —
@@ -740,6 +807,8 @@ const KEEP_ALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Accept-loop poll interval (the listener is non-blocking so the shutdown
 /// flag is observed without a self-connect wake-up).
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// How often the pin reaper sweeps every mounted database.
+const PIN_REAP_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Worker count for the connection pool: `config.threads` when set, otherwise
 /// one per logical core (at least 4).
@@ -856,6 +925,34 @@ fn serve_multi_listener_shutdown(
         .set_nonblocking(true)
         .map_err(|e| Error::invalid_arg(format!("set listener non-blocking: {e}")))?;
 
+    // Expired snapshot pins are released by a timer, not by the next request:
+    // an idle server must never hold a forgotten pin's RAM or its change-ring
+    // reservation. The thread holds only a `Weak`, and is joined below.
+    let reaper_stop = Arc::new((Mutex::new(false), Condvar::new()));
+    let reaper = {
+        let stop = Arc::clone(&reaper_stop);
+        let registry = Arc::downgrade(&registry);
+        std::thread::Builder::new()
+            .name("ndb-pin-reaper".to_string())
+            .spawn(move || loop {
+                let (flag, wake) = &*stop;
+                let mut stopped = flag.lock();
+                if *stopped {
+                    return;
+                }
+                wake.wait_for(&mut stopped, PIN_REAP_INTERVAL);
+                if *stopped {
+                    return;
+                }
+                drop(stopped);
+                let Some(registry) = registry.upgrade() else {
+                    return;
+                };
+                registry.reap_expired_pins();
+            })
+            .map_err(|e| Error::invalid_arg(format!("spawn pin reaper thread: {e}")))?
+    };
+
     loop {
         if shutdown.load(Ordering::SeqCst) || process_shutdown_requested() {
             break;
@@ -884,6 +981,11 @@ fn serve_multi_listener_shutdown(
 
     // Drain: no new work enters, workers finish the connections they hold.
     queue.close();
+    *reaper_stop.0.lock() = true;
+    reaper_stop.1.notify_all();
+    if reaper.join().is_err() {
+        eprintln!("warning: the pin reaper thread panicked");
+    }
     for handle in worker_handles {
         if handle.join().is_err() {
             eprintln!("warning: a worker thread panicked during shutdown");
@@ -2446,21 +2548,16 @@ fn handle_v2_snapshot(
     let requested_id = param(&params, "snapshot_id").map(str::to_string);
     let paginated = requested_id.is_some() || offset > 0 || limit.is_some();
 
+    if db.is_ram() {
+        return handle_ram_snapshot(registry, db_name, db, requested_id, offset, limit, paginated);
+    }
+
     // Pages of one read must come from one frozen state: a client paging a
     // large export would otherwise see inserts and deletes land between pages.
     let (snapshot, snapshot_id) = match requested_id {
         Some(id) => match registry.pinned_snapshot(db_name, &id) {
             Some(snapshot) => (snapshot, Some(id)),
-            None => {
-                return v2_error(
-                    410,
-                    "snapshot_expired",
-                    format!(
-                        "snapshot '{id}' is unknown, expired ({}s TTL) or belongs to another database; restart the read without snapshot_id",
-                        SNAPSHOT_TTL.as_secs()
-                    ),
-                )
-            }
+            None => return snapshot_expired_error(&id),
         },
         None if paginated => {
             let snapshot = Arc::new(db.snapshot_at());
@@ -2490,6 +2587,91 @@ fn handle_v2_snapshot(
             "count": docs.len(),
             "docs": docs,
         }),
+    )
+}
+
+/// `GET /v2/dbs/{name}/snapshot` on a RAM-first database.
+///
+/// The pin holds `Arc<DocRecord>`s inside the engine, so paging an export
+/// never re-materialises the document set and never takes the commit lock.
+/// Only the requested page is converted to JSON.
+fn handle_ram_snapshot(
+    registry: &DbRegistry,
+    db_name: &str,
+    db: &Database,
+    requested_id: Option<String>,
+    offset: usize,
+    limit: Option<usize>,
+    paginated: bool,
+) -> (u16, Value) {
+    if !paginated {
+        // One-shot export: the whole set leaves as JSON, so it is materialised
+        // once. There is no second page to reuse, and pinning it would only
+        // retain memory for a response that is already built.
+        let Snapshot { lineage, docs } = db.snapshot_at();
+        let total = docs.len();
+        let docs: Vec<Value> = docs.into_iter().map(|(_, doc)| doc).collect();
+        return (
+            200,
+            json!({
+                "ok": true,
+                "source_epoch_uuid": lineage.source_epoch_uuid,
+                "watermark_seq": lineage.last_seq,
+                "snapshot_id": Value::Null,
+                "total": total,
+                "count": docs.len(),
+                "docs": docs,
+            }),
+        );
+    }
+
+    let (pin_id, snapshot_id) = match requested_id {
+        Some(id) => match registry.pinned_ram_snapshot(db_name, &id) {
+            Some(pin_id) => (pin_id, id),
+            None => return snapshot_expired_error(&id),
+        },
+        None => {
+            let pinned = match db.pin_snapshot(SNAPSHOT_TTL) {
+                Ok(Some(pinned)) => pinned,
+                Ok(None) => {
+                    return v2_error(
+                        500,
+                        "internal_error",
+                        format!("database '{db_name}' is not RAM-first"),
+                    )
+                }
+                Err(error) => return v2_error(500, "internal_error", error.to_string()),
+            };
+            let pin_id = pinned.0;
+            (pin_id, registry.pin_ram_snapshot(db_name, pin_id))
+        }
+    };
+
+    match db.pinned_page(pin_id, offset, limit) {
+        Some(page) => (
+            200,
+            json!({
+                "ok": true,
+                "source_epoch_uuid": page.lineage.source_epoch_uuid,
+                "watermark_seq": page.lineage.last_seq,
+                "snapshot_id": snapshot_id,
+                "total": page.total,
+                "count": page.docs.len(),
+                "docs": page.docs,
+            }),
+        ),
+        None => snapshot_expired_error(&snapshot_id),
+    }
+}
+
+fn snapshot_expired_error(id: &str) -> (u16, Value) {
+    v2_error(
+        410,
+        "snapshot_expired",
+        format!(
+            "snapshot '{id}' is unknown, expired ({}s TTL) or belongs to another database; restart the read without snapshot_id",
+            SNAPSHOT_TTL.as_secs()
+        ),
     )
 }
 
