@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 
 // Core Philosophy Exit Codes
@@ -18,6 +18,13 @@ const EXIT_LOCKED: i32 = 3;
 fn fatal(msg: &str) -> ! {
     eprintln!("Error: {msg}");
     process::exit(EXIT_GENERAL_ERROR);
+}
+
+/// Report a failed integrity audit with the corruption exit code, so a caller
+/// can tell "the database is damaged" from "the command could not run".
+fn corrupt_fatal(msg: &str) -> ! {
+    eprintln!("Error: {msg}");
+    process::exit(EXIT_CORRUPTION);
 }
 
 // ─── Graceful shutdown (M3) ─────────────────────────────────────────
@@ -162,7 +169,9 @@ fn print_usage() {
     eprintln!("");
     eprintln!("Commands:");
     eprintln!("  init <path> [--buckets a,b] [--v2]  Initialize a new database");
+    eprintln!("  init <path> --ram             Initialize a v3 (RAM-first) database");
     eprintln!("  migrate <path>                Migrate a v1 journal to the v2 binary backend");
+    eprintln!("  migrate <path> --ram          Migrate v1 (data.jsonl) or v2 to v3 RAM-first");
     eprintln!("  destroy <path> --force        Safely delete a database");
     eprintln!("  info <path>                   Show database statistics");
     eprintln!("  compact <path>                Compact the database in-place");
@@ -171,8 +180,8 @@ fn print_usage() {
     eprintln!("  import <src> <path>           Restore a snapshot");
     eprintln!("  merge <base> <merge-in>       Combine databases");
     eprintln!("  verify <path>                 Check for corruptions");
-    eprintln!("  fsck <path>                   Full integrity check (v1 journal or v2 generations)");
-    eprintln!("  repair <path>                 Quarantine/truncate a corrupt v1 journal or v2 WAL");
+    eprintln!("  fsck <path>                   Full integrity check (v1, v2 or v3 folder)");
+    eprintln!("  repair <path>                 Quarantine/truncate a corrupt v1 journal, v2 or v3 WAL");
     eprintln!("  recover <src> <dest>          Recover corrupted data");
     eprintln!("  dump <path>                   Export JSON Lines to stdout");
     eprintln!("  config <get|set> ...          Manage metadata/config");
@@ -445,7 +454,7 @@ fn handle_serve(args: &[String]) {
 
 fn handle_init(args: &[String]) {
     if args.is_empty() {
-        eprintln!("Usage: ndb init <path> [--buckets a,b] [--v2]");
+        eprintln!("Usage: ndb init <path> [--buckets a,b] [--v2 | --ram]");
         process::exit(EXIT_GENERAL_ERROR);
     }
     let path = Path::new(&args[0]);
@@ -454,9 +463,10 @@ fn handle_init(args: &[String]) {
         process::exit(EXIT_GENERAL_ERROR);
     }
     
-    // Parse buckets and the v2 flag
+    // Parse buckets and the format flag
     let mut buckets = Vec::new();
     let mut v2 = false;
+    let mut ram = false;
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--buckets" && i + 1 < args.len() {
@@ -469,7 +479,16 @@ fn handle_init(args: &[String]) {
             i += 1;
             continue;
         }
+        if args[i] == "--ram" || args[i] == "--v3" {
+            ram = true;
+            i += 1;
+            continue;
+        }
         eprintln!("Error: unknown init argument '{}'", args[i]);
+        process::exit(EXIT_GENERAL_ERROR);
+    }
+    if v2 && ram {
+        eprintln!("Error: --v2 and --ram are mutually exclusive");
         process::exit(EXIT_GENERAL_ERROR);
     }
 
@@ -532,6 +551,21 @@ fn handle_init(args: &[String]) {
         process::exit(EXIT_SUCCESS);
     }
 
+    // v3 RAM-first: the engine writes `base.gen_1.ndb`, `wal.gen_1.ndb` and a
+    // version-3 `manifest.json`. It also refuses a folder holding a v1 journal,
+    // so this path can never shadow existing documents.
+    if ram {
+        match ndb::Database::open_ram(path) {
+            Ok(db) => drop(db),
+            Err(e) => {
+                eprintln!("Failed to initialise the v3 (RAM-first) database: {e}");
+                process::exit(EXIT_GENERAL_ERROR);
+            }
+        }
+        println!("Initialized v3 (RAM-first) database at {}", path.display());
+        process::exit(EXIT_SUCCESS);
+    }
+
     if let Err(e) = ndb::storage::init_file(
         &path.join("data.jsonl"),
         &ndb::storage::SourceLineage::fresh(),
@@ -544,18 +578,52 @@ fn handle_init(args: &[String]) {
     process::exit(EXIT_SUCCESS);
 }
 
-/// `ndb migrate <path>` — convert a v1 JSONL database folder to v2.
+/// `ndb migrate <path> [--ram | --v3 | --to v2|ram]` — convert a v1 (`data.jsonl`)
+/// or v2 (`manifest.json` version 2) folder into the binary backends.
 ///
-/// Staged in `<dir>/.migrating/` so a crash mid-run leaves the live database
-/// untouched and a rerun starts clean. The source journal is renamed to
-/// `data.jsonl.v1.bak` only after the staged v2 generation has been verified
-/// byte-for-byte at the document level and moved into place.
+/// **Default target stays v2.** `ndb migrate <path>` with no flag keeps its
+/// historical meaning (v1 → v2), which the phase16 CLI contract pins; the
+/// RAM-first target is explicitly requested with `--ram` / `--v3` / `--to ram`.
 fn handle_migrate(args: &[String]) {
-    if args.len() != 1 {
-        eprintln!("Usage: ndb migrate <path>");
-        process::exit(EXIT_GENERAL_ERROR);
+    let mut path_index: Option<usize> = None;
+    let mut target = ndb::StorageFormat::V2;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ram" | "--v3" => target = ndb::StorageFormat::Ram,
+            "--to" => {
+                if i + 1 >= args.len() {
+                    fatal("--to requires a value (v2 | ram)");
+                }
+                i += 1;
+                target = match ndb::StorageFormat::parse(&args[i]) {
+                    Ok(ndb::StorageFormat::V2) => ndb::StorageFormat::V2,
+                    Ok(ndb::StorageFormat::Ram) => ndb::StorageFormat::Ram,
+                    Ok(other) => fatal(&format!(
+                        "--to accepts v2 | ram (v3), not '{}'",
+                        other.as_str()
+                    )),
+                    Err(e) => fatal(&e.to_string()),
+                };
+            }
+            other if other.starts_with("--") => {
+                fatal(&format!("unknown migrate argument '{other}'"))
+            }
+            _ => {
+                if path_index.is_some() {
+                    fatal("migrate takes exactly one path");
+                }
+                path_index = Some(i);
+            }
+        }
+        i += 1;
     }
-    let input = Path::new(&args[0]);
+    let Some(path_index) = path_index else {
+        eprintln!("Usage: ndb migrate <path> [--ram | --v3 | --to v2|ram]");
+        process::exit(EXIT_GENERAL_ERROR);
+    };
+
+    let input = Path::new(&args[path_index]);
     let dir = if input.is_dir() {
         input.to_path_buf()
     } else {
@@ -566,20 +634,48 @@ fn handle_migrate(args: &[String]) {
     };
     let journal = dir.join("data.jsonl");
 
-    if dir.join(ndb::MANIFEST_FILE).exists() {
-        fatal(&format!(
-            "{} is already a v2 database (manifest.json exists)",
+    // Source format is read from the manifest, never guessed from a filename.
+    let source_version = manifest_version(&dir);
+    match source_version {
+        Some(3) => fatal(&format!(
+            "{} is already a v3 (RAM-first) database",
             dir.display()
-        ));
+        )),
+        Some(2) => match target {
+            ndb::StorageFormat::Ram => migrate_to_ram(&dir, ndb::StorageFormat::V2),
+            _ => fatal(&format!(
+                "{} is already a v2 database (manifest.json exists)",
+                dir.display()
+            )),
+        },
+        Some(other) => fatal(&format!(
+            "{} holds a manifest with unknown version {other}",
+            dir.display()
+        )),
+        None => {
+            if !journal.exists() {
+                fatal(&format!("no v1 journal at {}", journal.display()));
+            }
+            match target {
+                ndb::StorageFormat::Ram => migrate_to_ram(&dir, ndb::StorageFormat::V1),
+                _ => migrate_to_v2(&dir, &journal),
+            }
+        }
     }
-    if !journal.exists() {
-        fatal(&format!("no v1 journal at {}", journal.display()));
-    }
+}
+
+/// The `migrate` default: v1 journal → v2 base/WAL generations.
+///
+/// Staged in `<dir>/.migrating/` so a crash mid-run leaves the live database
+/// untouched and a rerun starts clean. The source journal is renamed to
+/// `data.jsonl.v1.bak` only after the staged v2 generation has been verified
+/// byte-for-byte at the document level and moved into place.
+fn migrate_to_v2(dir: &Path, journal: &Path) {
 
     // Opening takes the OS writer lock: a database served by another process
     // is refused here, which is exactly the maintenance guarantee needed
     // before rewriting any of its artefacts.
-    let db = match ndb::Database::open(&journal) {
+    let db = match ndb::Database::open(journal) {
         Ok(db) => db,
         Err(e) => fatal(&format!(
             "cannot open {}: {e} (is a service still running on this database?)",
@@ -709,7 +805,7 @@ fn handle_migrate(args: &[String]) {
         fatal(&format!("write {}: {e}", dir.join(ndb::MANIFEST_FILE).display()));
     }
     let backup = dir.join("data.jsonl.v1.bak");
-    if let Err(e) = fs::rename(&journal, &backup) {
+    if let Err(e) = fs::rename(journal, &backup) {
         fatal(&format!(
             "rename {} to {}: {e}",
             journal.display(),
@@ -736,6 +832,363 @@ fn handle_migrate(args: &[String]) {
     process::exit(EXIT_SUCCESS);
 }
 
+/// Read a folder's `manifest.json` version without binding to either schema:
+/// v2 names the field `format_version`, v3 names it `version`. `None` means the
+/// folder holds no manifest (an absent v2/v3 database is a v1 journal).
+fn manifest_version(dir: &Path) -> Option<u32> {
+    let path = dir.join("manifest.json");
+    if !path.exists() {
+        return None;
+    }
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => fatal(&format!("read {}: {e}", path.display())),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(e) => fatal(&format!("{} is not valid JSON: {e}", path.display())),
+    };
+    match value
+        .get("version")
+        .or_else(|| value.get("format_version"))
+        .and_then(|v| v.as_u64())
+    {
+        Some(version) => match u32::try_from(version) {
+            Ok(version) => Some(version),
+            Err(_) => fatal(&format!(
+                "{} declares an out-of-range version {version}",
+                path.display()
+            )),
+        },
+        None => fatal(&format!(
+            "{} has neither a usable `version` nor `format_version` field",
+            path.display()
+        )),
+    }
+}
+
+/// `migrate … --ram`: a v1 (`data.jsonl`) or v2 folder → v3 RAM-first.
+///
+/// Staged in `<dir>/.migrating_ram/` and verified document-by-document before
+/// anything in the live folder moves. Source artefacts are preserved *before*
+/// the v3 manifest is published, so the old backend stays the sole authority
+/// until the folder genuinely is a v3 database: `data.jsonl` becomes
+/// `data.jsonl.v1.bak`, and `manifest.json` + `base.gen_*` + `wal.gen_*` move
+/// into `_v2_backup/`.
+fn migrate_to_ram(dir: &Path, source: ndb::StorageFormat) {
+    let journal = dir.join("data.jsonl");
+    let opened = match source {
+        ndb::StorageFormat::V2 => ndb::Database::open_v2(dir),
+        _ => ndb::Database::open(&journal),
+    };
+    let db = match opened {
+        Ok(db) => db,
+        Err(e) => fatal(&format!(
+            "cannot open {}: {e} (is a service still running on this database?)",
+            dir.display()
+        )),
+    };
+    let lineage = db.lineage();
+    let snapshot = db.snapshot_at();
+    let mut docs: Vec<(String, u64, serde_json::Value)> = Vec::with_capacity(snapshot.docs.len());
+    for (id, doc) in &snapshot.docs {
+        // A pre-lineage v1 journal carries no per-document seq; the source
+        // `last_seq` is then the honest upper bound, exactly as the v2 path
+        // has always treated it.
+        let doc_seq = db.doc_seq(id).unwrap_or(lineage.last_seq);
+        docs.push((id.clone(), doc_seq, doc.clone()));
+    }
+    // v1 never persists index definitions; v2 does, and they must survive.
+    let indexes = match db.v2_manifest() {
+        Some(manifest) => manifest.indexes,
+        None => Vec::new(),
+    };
+    drop(db);
+
+    let staging = dir.join(".migrating_ram");
+    if staging.exists() {
+        if let Err(e) = fs::remove_dir_all(&staging) {
+            fatal(&format!(
+                "cannot clear the previous partial migration at {}: {e}",
+                staging.display()
+            ));
+        }
+    }
+    if let Err(e) = fs::create_dir_all(&staging) {
+        fatal(&format!("create {}: {e}", staging.display()));
+    }
+
+    let io = ndb::io::RealIo::new();
+    let base_path = staging.join(ndb::ram_format::base_file_name(1));
+    let wal_path = staging.join(ndb::ram_format::wal_file_name(1));
+    let records: Vec<std::sync::Arc<ndb::docval::DocRecord>> = docs
+        .iter()
+        .map(|(id, doc_seq, doc)| {
+            ndb::docval::DocRecord::new(
+                std::sync::Arc::from(id.as_str()),
+                *doc_seq,
+                ndb::docval::DocVal::from_value(doc),
+            )
+        })
+        .collect();
+
+    if let Err(e) =
+        ndb::ram_format::write_ram_base_file(&base_path, lineage.last_seq, &records, &io)
+    {
+        cleanup_staging(&staging);
+        fatal(&format!("write v3 base generation: {e}"));
+    }
+    if let Err(e) = ndb::ram_format::RamWalWriter::create_or_open(
+        &wal_path,
+        1,
+        std::sync::Arc::new(ndb::io::RealIo::new()),
+    ) {
+        cleanup_staging(&staging);
+        fatal(&format!("write v3 WAL generation: {e}"));
+    }
+    let manifest = ndb::ram_format::RamManifest {
+        version: ndb::ram_format::RAM_STORAGE_VERSION,
+        source_epoch_uuid: lineage.source_epoch_uuid.clone(),
+        base_gen: 1,
+        wal_gen: 1,
+        pending_wal_gen: None,
+        last_seq: lineage.last_seq,
+        // Every document is folded into `base.gen_1.ndb` and the WAL holds no
+        // events, so nothing before `last_seq + 1` is replayable through the
+        // change feed. Carrying a lower source value would advertise history
+        // that no longer exists — and the engine reports `last_seq + 1` for
+        // this folder anyway. This is the same rule the v2 migration applies.
+        min_available_seq: lineage.last_seq.saturating_add(1),
+        indexes: indexes.clone(),
+    };
+    if let Err(e) = ndb::ram_format::write_ram_manifest_atomic(&staging, &manifest, &io) {
+        cleanup_staging(&staging);
+        fatal(&format!("write v3 manifest: {e}"));
+    }
+
+    // Verify the staged folder before anything live moves: it must open, carry
+    // every document, reproduce each JSON value exactly, and keep the lineage
+    // and every index declaration.
+    let staged = match ndb::Database::open_ram(&staging) {
+        Ok(db) => db,
+        Err(e) => {
+            cleanup_staging(&staging);
+            fatal(&format!("staged v3 database does not open: {e}"));
+        }
+    };
+    verify_ram_parity("staged v3 database", &staged, &staging, &lineage, &indexes, &docs);
+    drop(staged);
+
+    // Preserve the source backend before the new manifest becomes authoritative.
+    let mut backup_bytes = 0u64;
+    let backup = dir.join("_v2_backup");
+    if matches!(source, ndb::StorageFormat::V2) {
+        if let Err(e) = fs::create_dir_all(&backup) {
+            cleanup_staging(&staging);
+            fatal(&format!("create {}: {e}", backup.display()));
+        }
+        let mut names = vec![ndb::MANIFEST_FILE.to_string()];
+        match fs::read_dir(dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(e) => {
+                            cleanup_staging(&staging);
+                            fatal(&format!("list {}: {e}", dir.display()));
+                        }
+                    };
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let is_generation = (name.starts_with("base.gen_")
+                        || name.starts_with("wal.gen_"))
+                        && name.ends_with(".ndb");
+                    if is_generation {
+                        names.push(name);
+                    }
+                }
+            }
+            Err(e) => {
+                cleanup_staging(&staging);
+                fatal(&format!("list {}: {e}", dir.display()));
+            }
+        }
+        names.sort();
+        names.dedup();
+        for name in &names {
+            let from = dir.join(name);
+            let to = backup.join(name);
+            backup_bytes += fs::metadata(&from).map(|m| m.len()).unwrap_or(0);
+            if let Err(e) = fs::rename(&from, &to) {
+                cleanup_staging(&staging);
+                fatal(&format!(
+                    "back up {name} into {}: {e}",
+                    backup.display()
+                ));
+            }
+        }
+    }
+
+    // Publish: generations first, then the manifest (the sole authority).
+    for name in [
+        ndb::ram_format::base_file_name(1),
+        ndb::ram_format::wal_file_name(1),
+        ndb::MANIFEST_FILE.to_string(),
+    ] {
+        let from = staging.join(&name);
+        let to = dir.join(&name);
+        if let Err(e) = fs::rename(&from, &to) {
+            fatal(&format!(
+                "move {name} into {}: {e} — the source artefacts are preserved at {}; \
+                 move them back to roll this migration back",
+                dir.display(),
+                if source == ndb::StorageFormat::V2 {
+                    backup.display().to_string()
+                } else {
+                    journal.display().to_string()
+                }
+            ));
+        }
+    }
+    if let Err(e) = fs::remove_dir_all(&staging) {
+        eprintln!("warning: could not remove {}: {e}", staging.display());
+    }
+
+    let v1_bytes = if matches!(source, ndb::StorageFormat::V2) {
+        0
+    } else {
+        let backup = dir.join("data.jsonl.v1.bak");
+        let bytes = fs::metadata(&journal).map(|m| m.len()).unwrap_or(0);
+        if let Err(e) = fs::rename(&journal, &backup) {
+            fatal(&format!(
+                "rename {} to {}: {e} — the v3 manifest is already published; \
+                 move the journal back before reopening as v1",
+                journal.display(),
+                backup.display()
+            ));
+        }
+        bytes
+    };
+
+    // Reopen what is now the live database and prove parity a second time.
+    let live = match ndb::Database::open_ram(dir) {
+        Ok(db) => db,
+        Err(e) => fatal(&format!(
+            "the migrated v3 database does not open: {e}"
+        )),
+    };
+    verify_ram_parity("migrated v3 database", &live, dir, &lineage, &indexes, &docs);
+    drop(live);
+
+    let base_size = fs::metadata(dir.join(ndb::ram_format::base_file_name(1)))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let wal_size = fs::metadata(dir.join(ndb::ram_format::wal_file_name(1)))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    println!("Migrated {} to v3 (RAM-first)", dir.display());
+    println!(
+        "Source: {}",
+        if source == ndb::StorageFormat::V2 {
+            "v2 binary generations"
+        } else {
+            "v1 journal"
+        }
+    );
+    println!("Documents: {}", docs.len());
+    println!("source_epoch_uuid: {}", lineage.source_epoch_uuid);
+    println!("last_seq: {}", lineage.last_seq);
+    println!(
+        "min_available_seq: {}",
+        lineage.last_seq.saturating_add(1)
+    );
+    if indexes.is_empty() {
+        println!("indexes: none");
+    } else {
+        println!("indexes: {}", indexes.len());
+        for spec in &indexes {
+            println!("  - {} ({:?})", spec.field, spec.kind);
+        }
+    }
+    println!("v3 base + WAL: {} bytes", base_size + wal_size);
+    if source == ndb::StorageFormat::V2 {
+        println!(
+            "v2 artefacts: {backup_bytes} bytes (kept at {})",
+            backup.display()
+        );
+    } else {
+        println!("v1 journal: {v1_bytes} bytes (kept at data.jsonl.v1.bak)");
+    }
+    process::exit(EXIT_SUCCESS);
+}
+
+/// Strict doc-by-doc parity between a v3 folder and the source it was built
+/// from: count, ids, every JSON value, the lineage and every index declaration.
+fn verify_ram_parity(
+    label: &str,
+    db: &ndb::Database,
+    dir: &Path,
+    lineage: &ndb::SourceLineage,
+    indexes: &[ndb::V2IndexSpec],
+    docs: &[(String, u64, serde_json::Value)],
+) {
+    if db.len() != docs.len() {
+        fatal(&format!(
+            "{label} holds {} documents, expected {}",
+            db.len(),
+            docs.len()
+        ));
+    }
+    let live = db.lineage();
+    if live.source_epoch_uuid != lineage.source_epoch_uuid {
+        fatal(&format!(
+            "{label} epoch is {}, the source is {}",
+            live.source_epoch_uuid, lineage.source_epoch_uuid
+        ));
+    }
+    if live.last_seq != lineage.last_seq {
+        fatal(&format!(
+            "{label} last_seq is {}, the source is {}",
+            live.last_seq, lineage.last_seq
+        ));
+    }
+    if live.min_available_seq != lineage.last_seq.saturating_add(1) {
+        fatal(&format!(
+            "{label} min_available_seq is {}, expected {} (no event history precedes the base)",
+            live.min_available_seq,
+            lineage.last_seq.saturating_add(1)
+        ));
+    }
+    let mut actual_ids = db.get_all_ids();
+    actual_ids.sort();
+    let mut expected_ids: Vec<String> = docs.iter().map(|(id, _, _)| id.clone()).collect();
+    expected_ids.sort();
+    if actual_ids != expected_ids {
+        fatal(&format!("{label} document ids do not match the source"));
+    }
+    for (id, _, expected) in docs {
+        match db.get(id) {
+            Ok(actual) => {
+                if &actual != expected {
+                    fatal(&format!(
+                        "document {id:?} does not round-trip through {label}"
+                    ));
+                }
+            }
+            Err(e) => fatal(&format!("{label} is missing {id:?}: {e}")),
+        }
+    }
+    let written = match ndb::ram_format::read_ram_manifest(dir) {
+        Ok(manifest) => manifest,
+        Err(e) => fatal(&format!("read {label} manifest: {e}")),
+    };
+    if written.indexes != indexes {
+        fatal(&format!(
+            "{label} index declarations do not match the source ({:?} vs {:?})",
+            written.indexes, indexes
+        ));
+    }
+}
+
 fn cleanup_staging(staging: &Path) {
     if let Err(e) = fs::remove_dir_all(staging) {
         eprintln!(
@@ -745,7 +1198,8 @@ fn cleanup_staging(staging: &Path) {
     }
 }
 
-/// `ndb fsck <path>` — full integrity audit of a v1 journal or a v2 folder.
+/// `ndb fsck <path>` — full integrity audit of a v1 journal, a v2 folder or a
+/// v3 (RAM-first) folder.
 fn handle_fsck(args: &[String]) {
     if args.len() != 1 {
         eprintln!("Usage: ndb fsck <path>");
@@ -761,34 +1215,84 @@ fn handle_fsck(args: &[String]) {
             .unwrap_or_else(|| Path::new(".").to_path_buf())
     };
 
-    if dir.join(ndb::MANIFEST_FILE).exists() {
-        let report = match ndb::fsck_v2_dir(&dir) {
-            Ok(report) => report,
-            Err(e) => fatal(&format!("fsck {}: {e}", dir.display())),
-        };
-        println!("Database: {}", dir.display());
-        println!("Format: v2");
-        println!("base.gen_{}: {} documents, {} bytes", report.base_gen, report.doc_count, report.base_bytes);
-        println!(
-            "wal.gen_{}: {} frames, {} bytes",
-            report.wal_gen, report.wal_frames, report.wal_bytes
-        );
-        println!("base_seq: {}", report.base_seq);
-        println!("last_seq: {}", report.last_seq);
-        println!("min_available_seq: {}", report.min_available_seq);
-        println!("indexes: {}", report.index_count);
-        match check_bucket_files(&dir) {
-            Ok(count) => println!("bucket files: {count} verified"),
-            Err(e) => fatal(&format!("fsck {}: {e}", dir.display())),
+    match manifest_version(&dir) {
+        Some(ndb::ram_format::RAM_STORAGE_VERSION) => {
+            let manifest = match ndb::ram_format::read_ram_manifest(&dir) {
+                Ok(manifest) => manifest,
+                Err(e) => corrupt_fatal(&format!("read {}: {e}", dir.display())),
+            };
+            let report = match ndb::ram_format::fsck_ram_dir(&dir) {
+                Ok(report) => report,
+                Err(e) => corrupt_fatal(&format!("fsck {}: {e}", dir.display())),
+            };
+            println!("Database: {}", dir.display());
+            println!("Format: v3 (RAM-first)");
+            println!(
+                "base.gen_{}: {} documents, base_seq {}",
+                report.base_gen, report.doc_count, report.base_seq
+            );
+            println!(
+                "wal.gen_{}: {} committed batch(es)",
+                report.wal_gen, report.wal_batches
+            );
+            if let Some(pending) = report.pending_wal_gen {
+                println!(
+                    "pending wal.gen_{pending}: {} committed batch(es)",
+                    report.pending_batches.unwrap_or(0)
+                );
+            }
+            println!("last_seq: {}", report.last_seq);
+            println!("min_available_seq: {}", manifest.min_available_seq);
+            println!("source_epoch_uuid: {}", manifest.source_epoch_uuid);
+            if report.indexes.is_empty() {
+                println!("indexes: 0");
+            } else {
+                println!("indexes: {}", report.indexes.len());
+            }
+            for warning in &report.warnings {
+                println!("warning: {warning}");
+            }
+            match check_bucket_files(&dir) {
+                Ok(count) => println!("bucket files: {count} verified"),
+                Err(e) => corrupt_fatal(&format!("fsck {}: {e}", dir.display())),
+            }
+            println!("OK");
+            process::exit(EXIT_SUCCESS);
         }
-        println!("OK");
-        process::exit(EXIT_SUCCESS);
+        Some(version) if version != 2 => corrupt_fatal(&format!(
+            "{} holds a manifest with unknown version {version}",
+            dir.display()
+        )),
+        Some(_) => {
+            let report = match ndb::fsck_v2_dir(&dir) {
+                Ok(report) => report,
+                Err(e) => corrupt_fatal(&format!("fsck {}: {e}", dir.display())),
+            };
+            println!("Database: {}", dir.display());
+            println!("Format: v2");
+            println!("base.gen_{}: {} documents, {} bytes", report.base_gen, report.doc_count, report.base_bytes);
+            println!(
+                "wal.gen_{}: {} frames, {} bytes",
+                report.wal_gen, report.wal_frames, report.wal_bytes
+            );
+            println!("base_seq: {}", report.base_seq);
+            println!("last_seq: {}", report.last_seq);
+            println!("min_available_seq: {}", report.min_available_seq);
+            println!("indexes: {}", report.index_count);
+            match check_bucket_files(&dir) {
+                Ok(count) => println!("bucket files: {count} verified"),
+                Err(e) => corrupt_fatal(&format!("fsck {}: {e}", dir.display())),
+            }
+            println!("OK");
+            process::exit(EXIT_SUCCESS);
+        }
+        None => {}
     }
 
     // v1: verify the journal and the doc trash without opening for write.
     let journal = dir.join("data.jsonl");
     if !journal.exists() {
-        fatal(&format!(
+        corrupt_fatal(&format!(
             "{} holds neither manifest.json nor data.jsonl",
             dir.display()
         ));
@@ -902,6 +1406,51 @@ fn handle_info(args: &[String]) {
     
     let path = Path::new(&args[0]);
     let meta_path = path.join("meta.json");
+
+    if manifest_version(path) == Some(ndb::ram_format::RAM_STORAGE_VERSION) {
+        let manifest = match ndb::ram_format::read_ram_manifest(path) {
+            Ok(manifest) => manifest,
+            Err(e) => fatal(&format!("read {}: {e}", path.display())),
+        };
+        let base_size = fs::metadata(ndb::ram_format::base_file_path(path, manifest.base_gen))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let wal_size = fs::metadata(ndb::ram_format::wal_file_path(path, manifest.wal_gen))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let meta: serde_json::Value = fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let doc_count = match ndb::ram_format::read_ram_base_file(
+            &ndb::ram_format::base_file_path(path, manifest.base_gen),
+        ) {
+            Ok(base) => base.doc_count,
+            Err(e) => fatal(&format!("read base generation: {e}")),
+        };
+        println!("Status: Valid");
+        println!("Format: v3 (RAM-first)");
+        println!("Database Path: {}", path.display());
+        println!("Schema Version: {}", meta.get("version").and_then(|v| v.as_i64()).unwrap_or(0));
+        println!("Active Documents: {doc_count}");
+        println!("base.gen_{}: {} bytes", manifest.base_gen, base_size);
+        println!("wal.gen_{}: {} bytes", manifest.wal_gen, wal_size);
+        if let Some(pending) = manifest.pending_wal_gen {
+            println!("pending_wal_gen: {pending}");
+        }
+        println!("last_seq: {}", manifest.last_seq);
+        println!("min_available_seq: {}", manifest.min_available_seq);
+        println!("source_epoch_uuid: {}", manifest.source_epoch_uuid);
+        if manifest.indexes.is_empty() {
+            println!("Indexes: None");
+        } else {
+            println!("Indexes:");
+            for spec in &manifest.indexes {
+                println!("  - {} ({:?})", spec.field, spec.kind);
+            }
+        }
+        process::exit(EXIT_SUCCESS);
+    }
 
     if path.join(ndb::MANIFEST_FILE).exists() {
         let manifest = match ndb::read_manifest(path) {
@@ -1105,7 +1654,11 @@ fn handle_export(args: &[String]) {
     }
 
     eprintln!("[2/4] Connecting to source database...");
-    let db = match ndb::Database::open(&db_path) {
+    // A folder names the database; only a bare file path is a v1 journal. This
+    // keeps `export <v2|v3 folder> <dest>` from creating a stray `data.jsonl`
+    // beside the binary generations.
+    let source = if src_path.is_dir() { src_path } else { &db_path };
+    let db = match ndb::Database::open(source) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("Failed to open source database: {}", e);
@@ -1390,33 +1943,47 @@ fn handle_merge(args: &[String]) {
     process::exit(EXIT_SUCCESS);
 }
 
+/// Verify every file reference a document holds: the nested `_file` object form
+/// **and** every string form the engine's own mark phase recognizes — compact
+/// `bucket:hash.ext` nURIs and the `/api/buckets/…`, `/file/…`, `/files/…`,
+/// `/v2/dbs/<db>/files/…` URLs (#12).
+///
+/// A checker narrower than the collector is worse than none: it reports a clean
+/// database while never looking at the references the engine actually honours.
 fn check_file_refs(val: &serde_json::Value, base_path: &Path) -> Result<(), String> {
+    // 1. Nested `_file` objects carry structured fields rather than a string,
+    //    so the normalizer cannot see them.
     if let Some(obj) = val.as_object() {
-        for v in obj.values() {
-            if let Some(inner) = v.as_object() {
-                if inner.contains_key("_file") {
-                    if let Some(file_ref) = inner.get("_file").and_then(|f| f.as_object()) {
-                        let bucket = file_ref.get("bucket").and_then(|x| x.as_str()).unwrap_or("");
-                        let id = file_ref.get("id").and_then(|x| x.as_str()).unwrap_or("");
-                        let ext = file_ref.get("ext").and_then(|x| x.as_str()).unwrap_or("");
-                        
-                        if !bucket.is_empty() && !id.is_empty() {
-                            let path = base_path.join("_files").join(bucket).join(format!("{}.{}", id, ext));
-                            if !path.exists() {
-                                return Err(format!("{}:{}.{}", bucket, id, ext));
-                            }
-                        }
-                    }
-                } else {
-                    check_file_refs(v, base_path)?;
+        if let Some(file_ref) = obj.get("_file").and_then(|f| f.as_object()) {
+            let bucket = file_ref.get("bucket").and_then(|x| x.as_str()).unwrap_or("");
+            let id = file_ref.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            let ext = file_ref.get("ext").and_then(|x| x.as_str()).unwrap_or("");
+            if !bucket.is_empty() && !id.is_empty() {
+                let path = base_path
+                    .join("_files")
+                    .join(bucket)
+                    .join(format!("{id}.{ext}"));
+                if !path.exists() {
+                    return Err(format!("{bucket}:{id}.{ext}"));
                 }
-            } else if v.is_array() {
-                check_file_refs(v, base_path)?;
             }
         }
-    } else if let Some(arr) = val.as_array() {
-        for v in arr {
-            check_file_refs(v, base_path)?;
+    }
+
+    // 2. Every string form, normalized exactly like `gc_buckets` does.
+    let mut refs = std::collections::HashSet::new();
+    ndb::Database::extract_file_refs(val, &mut refs);
+    for compact in refs {
+        let file_ref = match ndb::FileRef::from_compact(&compact) {
+            Some(file_ref) => file_ref,
+            None => return Err(format!("{compact} (unparseable normalized ref)")),
+        };
+        let path = base_path
+            .join("_files")
+            .join(&file_ref.bucket)
+            .join(file_ref.filename());
+        if !path.exists() {
+            return Err(compact);
         }
     }
     Ok(())
@@ -1539,8 +2106,89 @@ fn handle_repair(args: &[String]) {
             .unwrap_or_else(|| Path::new(".").to_path_buf())
     };
 
+    // v3 (RAM-first): quarantine and truncate each WAL generation's bad tail
+    // under the maintenance lock.
+    if manifest_version(&dir) == Some(ndb::ram_format::RAM_STORAGE_VERSION) {
+        let manifest = match ndb::ram_format::read_ram_manifest(&dir) {
+            Ok(manifest) => manifest,
+            Err(e) => fatal(&format!("read {}: {e}", dir.display())),
+        };
+        let journal = dir.join("data.jsonl");
+        let _lock = match ndb::MaintenanceLock::acquire(&journal) {
+            Ok(lock) => lock,
+            Err(e) => fatal(&format!(
+                "cannot repair {}: {e} (is a service still running on this database?)",
+                dir.display()
+            )),
+        };
+        let io = ndb::io::RealIo::new();
+        let mut generations = vec![("wal", manifest.wal_gen)];
+        if let Some(pending) = manifest.pending_wal_gen {
+            generations.push(("pending wal", pending));
+        }
+        let mut primary: Option<(u64, u64, Option<PathBuf>)> = None;
+        for (label, gen) in generations {
+            let path = ndb::ram_format::wal_file_path(&dir, gen);
+            let report = match ndb::ram_format::repair_ram_wal(&path, &io) {
+                Ok(report) => report,
+                Err(e) => fatal(&format!("repair {}: {e}", path.display())),
+            };
+            println!("{label}.gen_{gen}: {}", path.display());
+            println!(
+                "Preserved: {} batch(es), {} of {} byte(s), through seq {}",
+                report.batches_kept, report.good_offset, report.scanned_bytes, report.last_valid_seq
+            );
+            if report.truncated_bytes > 0 {
+                println!(
+                    "Removed: {} byte(s) after byte {}",
+                    report.truncated_bytes, report.good_offset
+                );
+                match &report.quarantine_path {
+                    Some(path) => println!("Original preserved at: {}", path.display()),
+                    None => eprintln!("warning: no quarantine copy was written"),
+                }
+            } else {
+                println!("Nothing to repair: the WAL is intact.");
+            }
+            if let Some(issue) = &report.issue {
+                println!("Issue: {issue}");
+            }
+            if label == "wal" {
+                primary = Some((
+                    report.last_valid_seq,
+                    report.truncated_bytes,
+                    report.quarantine_path.clone(),
+                ));
+            }
+        }
+        if let Some((last_valid, truncated, quarantine)) = primary {
+            if truncated == 0 {
+                println!("Lost seq range: none (no committed record was removed)");
+            } else {
+                // The manifest's `last_seq` is published by compaction and lags
+                // the WAL in normal operation, so it is a floor here, never the
+                // upper bound of what the damaged tail held.
+                println!(
+                    "Lost seq range: from {} upward (the damaged tail is preserved at {})",
+                    last_valid.saturating_add(1),
+                    quarantine
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "<no quarantine copy>".to_string())
+                );
+                if manifest.last_seq > last_valid {
+                    println!(
+                        "The manifest declared last_seq {}; nothing above {last_valid} is in the \
+                         lineage now, so a reopen refuses until the lineage is reconciled",
+                        manifest.last_seq
+                    );
+                }
+            }
+        }
+        process::exit(EXIT_SUCCESS);
+    }
+
     // v2: quarantine and truncate the WAL's bad tail under the maintenance lock.
-    if dir.join(ndb::MANIFEST_FILE).exists() {
+    if manifest_version(&dir) == Some(2) {
         let manifest = match ndb::read_manifest(&dir) {
             Ok(manifest) => manifest,
             Err(e) => fatal(&format!("read {}: {e}", dir.display())),

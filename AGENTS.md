@@ -64,8 +64,9 @@ public API is identical on both.
 
 Engine: `src/v2_engine.rs`; on-disk format: `src/v2_format.rs`, raw-JSON scan:
 `src/v2_json_scan.rs`, mapping: `src/mmap.rs`, checksums: `src/crc32.rs`.
-CLI: `ndb init --v2`, `migrate`, `fsck`, `repair`, `export --jsonl`. Full
-reference: `documentation/v2-storage.md`; benchmark and gate verdicts:
+CLI: `ndb init --v2|--ram`, `migrate [--ram]`, `fsck`, `repair`, `export
+--jsonl`. Full reference: `documentation/v2-storage.md` (v2) and
+`documentation/cli.md` (all formats); benchmark and gate verdicts:
 `docs/phase3-benchmark-v1-vs-v2.md`.
 
 ### RAM-first engine (Phase 1, slice 1C landed)
@@ -136,6 +137,18 @@ existing folders.
   `GET /stats` and `GET /v2/dbs/{name}/stats` add a `ram` block
   (live/index/ring bytes, oldest retained seq, expired cursors, pins, poison,
   WAL bytes, stage timings); `/v2/dbs` reports `"format": "ram"`.
+- **CLI (slice 2B).** `ndb init <path> --ram` (alias `--v3`); `ndb migrate
+  <path> --ram|--v3|--to ram` from **v1 or v2** — staged in `.migrating_ram/`,
+  verified document-by-document (count, ids, JSON values, lineage, indexes)
+  before *and* after publishing, with `data.jsonl.v1.bak` / `_v2_backup/`
+  preserving the source backend; the manifest is written with
+  `min_available_seq = last_seq + 1` because every document is folded into
+  `base.gen_1.ndb` and no event history carries over; `ndb fsck` auto-detects
+  the folder by manifest version and runs `fsck_ram_dir` + bucket checks;
+  `ndb repair` quarantines and truncates each WAL generation (including
+  `pending_wal_gen`) under the maintenance lock and prints the surviving seq;
+  `ndb export --jsonl` is id-sorted with a `_meta` lineage line. `ndb migrate
+  <path>` **without** a flag still means v1 → v2 (phase16 CLI contract).
 - `tests/support/refdb.rs` — `RefDb`, a sequential reference model used as the
   differential oracle; `tests/support/crash_child.rs` — out-of-process crash
   runner (`current_exe()` + `NDB_CRASH_CHILD_ROLE`).
@@ -166,7 +179,7 @@ existing folders.
 
 ## File Buckets
 
-Named binary storage with **SHA-256 content-hash deduplication**. Identical files are stored once, under the **full 64-char hash** (legacy 8-char ids stay readable); a dedup hit is verified (size + re-hash) so a damaged blob is reported, never returned. Files are referenced by compact `bucket:hash.ext` strings (nURI) or any of `/api/buckets/{b}/{f}`, `/file/{b}/{f}`, `/files/{b}/{f}`, `/v2/dbs/{db}/files/{b}/{f}` — all count as live references. Soft-delete moves files to `_trash/files/` rather than removing them. Garbage collection (`gc_buckets`) sweeps unreferenced files to trash and serializes with `store_file` on the writer lock. Targeted release (`release_file`) checks live **and restorable (trash) documents** before trashing a specific file.
+Named binary storage with **SHA-256 content-hash deduplication**. Identical files are stored once, under the **full 64-char hash** (legacy 8-char ids stay readable); a dedup hit is verified (size + re-hash) so a damaged blob is reported, never returned. Files are referenced by compact `bucket:hash.ext` strings (nURI) or any of `/api/buckets/{b}/{f}`, `/file/{b}/{f}`, `/files/{b}/{f}`, `/v2/dbs/{db}/files/{b}/{f}` — all count as live references, and `ndb verify` resolves the same set through `Database::normalize_file_ref` (a checker narrower than the collector reports clean while looking at nothing). Soft-delete moves files to `_trash/files/` rather than removing them; trashed entries are **never aged by `mtime`** (a rename preserves it) — a `<name>.trashed_at` sidecar records residence, `restore` removes it, and a missing/unreadable sidecar means retain. Garbage collection (`gc_buckets`) sweeps unreferenced files to trash and serializes with `store_file` on the writer lock; buckets declared `kind: "items"` are skipped entirely (their folders are keyed by item id and `items.jsonl` is engine-owned). Targeted release (`release_file`) checks live **and restorable (trash) documents** before trashing a specific file.
 
 ## Atomic Delta Updates
 
@@ -226,7 +239,7 @@ Resident daemon (`src/server.rs`) — hand-rolled HTTP/1.1 on `std::net`, no asy
 | `array_push` delta (Rust core) | Complete |
 | Delta updates in Node.js backend | Complete (`arrayPush`, `set`, `remove` wired and used by consumers; ops return an `applied` flag — `Ok(false)`/`false` = no-op, writes nothing, D1 2026-09-28) |
 | `release_file` + `gc_buckets` (Rust) | Complete |
-| TTL-based trash purging | Complete (`with_trash_ttl` + background thread; purge serialized against delete's trash append via `trash_lock`, B3 2026-09-28) |
+| TTL-based trash purging | Complete (`with_trash_ttl` + background thread; purge serialized against delete's trash append via `trash_lock`, B3 2026-09-28; residence comes from the `.trashed_at` sidecar written at delete/trash time, never from `mtime` — a missing or unreadable sidecar retains the entry, #14) |
 | Failure discipline | Complete — no bare `let _ =` on a `Result`; preconditions return `Err`, ancillary cleanup is reported (`src/report.rs`); a document is never reported deleted when its trash record could not be written |
 | Journal-first write ordering | Complete — every mutating op appends before any in-memory/index/ref state moves; a failed append changes nothing (fault-injected tests) |
 | Durability hardening (Phase 1b slice 1) | Complete — torn-tail truncation + mid-journal corruption refusal + `ndb repair`, per-DB OS writer lock, transactional `apply_ops` with per-doc `doc_seq`/`If-Match` (`409 conflict`), bucket ref normalization + GC/store serialization + full-SHA-256 dedup verification, durable doc-trash `sync_all`, parent-dir fsync after renames, real `Scheduled` flusher, Windows reserved/case-folded DB names, mget cap, pinned snapshot pagination; `tests/phase14_durability_hardening_tests.rs` |
@@ -237,6 +250,7 @@ Resident daemon (`src/server.rs`) — hand-rolled HTTP/1.1 on `std::net`, no asy
 | Multi-DB HTTP service (`ndb serve`) | Complete (step 1) — `DbRegistry` mounts arbitrary DB paths by name, `--db`/`--dir`/`--config`, `/health` + `/v2/dbs` + per-DB CRUD/query/sync/bucket routes; `tests/phase13_multi_db_serve_tests.rs` |
 | Schema validation from `meta.json` | Not implemented (`meta.json` schemas block ignored) |
 | v2 binary/mmap storage backend (Phase 3, slice 3D) | Complete — `manifest.json` + mmap base generations + CRC32 WAL; zero-copy directory and persisted index sections (fixed-stride offset tables, O(1) slot access, O(log n) id lookup, `&[u32]` slot views); no per-document slot map (superseded bitset + WAL overlay, empty at cold boot); raw-JSON filter/sort-key scanning with bounded top-K and projected/raw materialization (`src/v2_json_scan.rs`); per-DB leader/follower group commit (one fsync per batch, RAM published only after fsync), bounded 1024-entry change ring with on-disk WAL fallback, non-blocking compaction with a mirror WAL and a few-KB freeze; `StorageFormat::{Auto,V1,V2}` gains `Database::open_v2*`; CLI `init --v2`, `migrate`, `fsck`, v2 `repair`, `export --jsonl`; `POST /v2/dbs` accepts `format: "v2"`. Reference: `documentation/v2-storage.md`; benchmark and gate verdicts: `docs/phase3-benchmark-v1-vs-v2.md`; tests: `tests/phase3_slice3b_v2_tests.rs`, `tests/phase16_v2_storage_tests.rs`, `tests/phase15_perf_and_planner_tests.rs` |
+| RAM-first engine (v3, slices 1–2B) | Complete — authoritative `DocVal` in RAM, op-level WAL with group commit, non-blocking compaction with `pending_wal_gen`, pinned snapshots, `FaultIo` crash matrix; CLI `init --ram`/`--v3`, `migrate --ram` from v1 and v2 (staged, doc-by-doc parity before and after publishing, `data.jsonl.v1.bak`/`_v2_backup` preservation), v3 `fsck`/`repair`/`export --jsonl`; `tests/phase18_ram_engine_tests.rs`, `tests/phase19_compaction_and_faults_tests.rs`, `tests/phase20_cli_and_maintenance_tests.rs` |
 | nURI `link` type enforcement | Not implemented (file refs detected heuristically by string match, not by schema) |
 | Bucket migration script for legacy data | Not bundled here (the consumer's `migrate-ndb-to-folder.js` was used in production) |
 

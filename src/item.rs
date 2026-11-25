@@ -365,6 +365,12 @@ impl ItemBucket {
                 if let Err(e) = storage::sync_parent_dir(&folder) {
                     report::suppressed("delete_item: fsync item bucket directory", e);
                 }
+                // Trash residence is recorded explicitly (#14): the folder's
+                // own timestamps describe when the bytes were written, not how
+                // long the item has been recoverable.
+                if let Err(e) = crate::bucket::write_trash_stamp(&trash, item_id) {
+                    report::suppressed("delete_item: record trash residence", e);
+                }
             }
         }
         Ok(())
@@ -403,6 +409,11 @@ impl ItemBucket {
                 }
                 if let Err(e) = storage::sync_parent_dir(&trashed) {
                     report::suppressed("restore_item: fsync item trash directory", e);
+                }
+                if let Err(e) =
+                    crate::bucket::remove_trash_stamp(&self.trash_dir(), item_id)
+                {
+                    report::suppressed("restore_item: remove trash residence stamp", e);
                 }
             }
         }

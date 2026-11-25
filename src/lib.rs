@@ -4105,7 +4105,7 @@ impl Database {
                     "created": now_secs(),
                     "source_epoch_uuid": lineage.source_epoch_uuid,
                     "last_seq": lineage.last_seq,
-                    "min_available_seq": lineage.last_seq.saturating_add(1),
+                    "min_available_seq": lineage.min_available_seq,
                 }
             });
             buf.push_str(&meta.to_string());
@@ -4690,6 +4690,21 @@ impl Database {
                     .map_err(Error::io_err(entry.path(), "stat bucket entry"))?;
                 if file_type.is_dir() {
                     let bucket_name = entry.file_name().to_string_lossy().to_string();
+
+                    // Item buckets (#11) are keyed by item id, not content: an
+                    // items-bucket entry can never match a compact
+                    // `bucket:hash.ext` reference, so sweeping one would trash
+                    // live item folders and the engine-owned `items.jsonl`
+                    // journal. Their lifecycle is `delete_item` / the reserved
+                    // sweep, never mark-and-sweep.
+                    if self
+                        .bucket_policies
+                        .get(&bucket_name)
+                        .is_some_and(|p| p.kind == Some(BucketKind::Items))
+                    {
+                        continue;
+                    }
+
                     let bkt = self.bucket(&bucket_name);
 
                     // A bucket we cannot enumerate is named and skipped rather
@@ -4703,6 +4718,13 @@ impl Database {
                         }
                     };
                     for filename in files {
+                        // The item-record journal is engine-owned and can
+                        // never be a content hash. Skipping the name as well
+                        // as the bucket kind means a mis-declared bucket still
+                        // cannot lose its journal to a sweep (#11).
+                        if filename == "items.jsonl" {
+                            continue;
+                        }
                         let ref_str = format!("{}:{}", bucket_name, filename);
                         if !active_refs.contains(&ref_str) {
                             // Missing from documents
@@ -4742,7 +4764,11 @@ impl Database {
     /// - `/file/images/a1b2c3d4.png` (legacy single-DB route)
     /// - `/files/images/a1b2c3d4.png` (v2 route)
     /// - `/v2/dbs/<db>/files/images/a1b2c3d4.png`
-    fn normalize_file_ref(s: &str) -> Option<String> {
+    ///
+    /// Public because maintenance tooling (`ndb verify`) must recognize exactly
+    /// the ref forms the engine's mark phase recognizes (#12) — a second,
+    /// narrower matcher in the CLI is how integrity checks go quietly blind.
+    pub fn normalize_file_ref(s: &str) -> Option<String> {
         // Compact form first
         if let Some(fr) = FileRef::from_compact(s) {
             if fr.id.len() >= 8 && !fr.bucket.is_empty() && !fr.ext.is_empty() {
@@ -4803,7 +4829,10 @@ impl Database {
         Ok(refs)
     }
 
-    pub(crate) fn extract_file_refs(value: &Value, refs: &mut HashSet<String>) {
+    /// Collect every file reference held by a JSON value, in the same
+    /// normalized `bucket:hash.ext` form the mark phase produces. Public for
+    /// the same reason as [`Database::normalize_file_ref`] (#12).
+    pub fn extract_file_refs(value: &Value, refs: &mut HashSet<String>) {
         match value {
             Value::String(s) => {
                 if let Some(compact) = Self::normalize_file_ref(s) {

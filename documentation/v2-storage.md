@@ -158,12 +158,14 @@ live database untouched.
 ```
 ndb init <path> --v2            create a v2 folder database
 ndb migrate <path>              v1 -> v2 (staged, verified, data.jsonl.v1.bak)
+ndb migrate <path> --ram        v1 or v2 -> v3 RAM-first (see documentation/cli.md)
 ndb fsck <path>                 v2: manifest/base/dir/index/WAL CRCs + bucket files
                                 v1: journal + trash replay
-ndb repair <path>               v1 journal truncation, or v2 WAL quarantine+truncate
+                                v3: fsck_ram_dir + bucket files (auto-detected)
+ndb repair <path>               v1 journal truncation, or v2/v3 WAL quarantine+truncate
 ndb export <path> <out.jsonl> --jsonl
-ndb compact <path>              works on both formats (takes the OS writer lock)
-ndb info <path>                 reports Format: v1 or v2
+ndb compact <path>              works on every format (takes the OS writer lock)
+ndb info <path>                 reports Format: v1, v2 or v3 (RAM-first)
 ```
 
 `ndb migrate` stages everything in `<dir>/.migrating/` (a rerun replaces it),

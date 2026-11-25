@@ -1770,13 +1770,23 @@ pub fn fsck_ram_dir(dir: &Path) -> Result<RamFsckReport> {
         ));
     }
     let last_seq = check_continuity(&wal, base.base_seq, &wal_path)?;
-    if last_seq != manifest.last_seq {
+    if last_seq < manifest.last_seq {
         return Err(Error::corruption(
             dir,
             format!(
                 "lineage reaches seq {last_seq}, the manifest declares last_seq {}",
                 manifest.last_seq
             ),
+        ));
+    }
+    if last_seq > manifest.last_seq {
+        // The manifest's `last_seq` is advanced by compaction, so a WAL that
+        // has committed past it is the normal state between compactions — and
+        // recovery accepts it. Requiring equality would make fsck reject every
+        // live-written database.
+        warnings.push(format!(
+            "manifest last_seq {} lags the lineage at {last_seq}; the next compaction publishes it",
+            manifest.last_seq
         ));
     }
 
@@ -2718,6 +2728,22 @@ mod tests {
         assert!(
             error.to_string().contains("lineage reaches seq 5"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn fsck_tolerates_a_manifest_that_lags_the_wal() {
+        // `last_seq` is published by compaction only, so a WAL that has
+        // committed past it is the normal state between compactions.
+        let (dir, mut manifest) = clean_dir();
+        manifest.last_seq = 4;
+        write_ram_manifest_atomic(dir.path(), &manifest, &RealIo).expect("manifest");
+        let report = fsck_ram_dir(dir.path()).expect("a lagging manifest is not corruption");
+        assert_eq!(report.last_seq, 5);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("lags the lineage")),
+            "{:?}",
+            report.warnings
         );
     }
 

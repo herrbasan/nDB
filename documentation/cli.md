@@ -24,20 +24,63 @@ Commands:
 
 | Command | Description |
 |---------|-------------|
-| `init <path> [--buckets a,b]` | Create a new database folder |
+| `init <path> [--buckets a,b] [--v2 \| --ram]` | Create a new database folder (v1 journal by default, v2 binary, or v3 RAM-first) |
+| `migrate <path> [--ram \| --v3 \| --to v2\|ram]` | v1 → v2 (default), or v1/v2 → v3 RAM-first |
 | `destroy <path> [--force]` | Permanently delete a database (prompts for confirmation unless `--force`) |
 | `info <path>` | Show statistics (doc count, disk usage, fragmentation, buckets) |
 | `compact <path>` | Rewrite the journal with only active documents |
 | `export <path> <dest> [--consistent]` | Create a portable snapshot |
+| `export <path> <out.jsonl> --jsonl` | Export human-readable, id-sorted JSONL (works on v1, v2 and v3) |
 | `import <src> <path> [--force]` | Restore a snapshot |
 | `merge <base> <merge-in> --output <dest>` | Combine two databases (resolves `_modified` collisions) |
 | `verify <path>` | Check for corruptions, missing file references, and item-bucket integrity |
-| `repair <path>` | Quarantine a corrupt journal (`<file>.corrupt.<ts>.bak`) and truncate it at the last good line |
+| `fsck <path>` | Full integrity audit — v1 journal, v2 generations, or a v3 RAM-first folder |
+| `repair <path>` | Quarantine a corrupt v1 journal / v2 WAL / v3 WAL generation and truncate it at the last good record |
 | `recover <src> --output <dest>` | Salvage surviving rows from a corrupted database |
 | `dump <path>` | Print all documents as JSON Lines to stdout |
 | `config <get\|set> <key> [value]` | Read/write `meta.json` keys (dot notation) |
 | `query <path> <query_ast>` | Run a JSON query (equality / `$eq`) and print matches |
 | `serve <path> [options]` | Run as a resident HTTP daemon (blocks; see below) |
+
+## Storage formats
+
+| Format | Layout | Created by |
+|--------|--------|------------|
+| v1 (default) | `data.jsonl` | `ndb init <path>` |
+| v2 | `manifest.json` (`format_version: 2`) + `base.gen_*.ndb` + `wal.gen_*.ndb` | `ndb init <path> --v2` |
+| v3 (RAM-first) | `manifest.json` (`version: 3`) + `base.gen_*.ndb` + `wal.gen_*.ndb` | `ndb init <path> --ram` |
+
+`--v3` is accepted as an alias for `--ram` everywhere it appears.
+
+## Migration
+
+**The default target of `ndb migrate <path>` is v2**, preserving the historical
+v1 → v2 behaviour that the phase16 CLI contract pins. The RAM-first target is
+requested explicitly:
+
+```
+ndb migrate <path> --ram        # or --v3, or --to ram
+```
+
+A v3 migration accepts either source:
+
+- **v1** (`data.jsonl`) — the journal is retired to `data.jsonl.v1.bak` after the
+  v3 folder is published.
+- **v2** (`manifest.json` version 2) — `manifest.json`, `base.gen_*` and
+  `wal.gen_*` are moved into `_v2_backup/` **before** the v3 manifest is
+  published, so the old backend stays the sole authority until the swap.
+
+Both paths stage into `.migrating_ram/`, reopen the staged folder and verify
+**document by document** (count, every `_id`, every JSON value, the lineage, and
+every `Hash`/`BTree` index declaration) before anything live moves — and then
+repeat the parity check against the published folder. `source_epoch_uuid` and
+`last_seq` are preserved; `min_available_seq` becomes `last_seq + 1` because
+every document is folded into `base.gen_1.ndb` and no event history is carried
+over (advertising a lower floor would promise replay that does not exist).
+
+An already-v3 folder is refused (`already a v3 (RAM-first) database`), as is a
+folder whose `.lock` is held by a running service.
+
 
 ## `ndb serve`
 
@@ -86,14 +129,14 @@ Limits: 64 concurrent connections (503 over), 64 MB request bodies (413), 30 s r
 |------|---------|
 | `0` | Success |
 | `1` | General error |
-| `2` | Corruption detected (from `verify`) |
+| `2` | Corruption detected (`verify`, `fsck`) |
 | `3` | Database locked / `.readonly` missing |
 
 ## Notes
 
 - **`destroy` checks for a `.lock` marker** and refuses if present (`EXIT_LOCKED`). The library now creates a real OS lock file (`.lock` beside a folder database's `data.jsonl`, `<file>.lock` for a flat journal) while a `Database` is open; `ndb` maintenance commands open the database, so run them against a database no service has mounted.
-- **`repair`** is the recovery path for the corruption `Database::open` refuses: it copies the journal to `<file>.corrupt.<timestamp>.bak`, truncates at the last complete record, fsyncs, and prints the preserved record count plus the lost byte/line range. A torn *final* line never needs it — opening truncates that automatically with a warning.
+- **`repair`** is the recovery path for the corruption `Database::open` refuses: it copies the journal to `<file>.corrupt.<timestamp>.bak`, truncates at the last complete record, fsyncs, and prints the preserved record count plus the lost byte/line range. A torn *final* line never needs it — opening truncates that automatically with a warning. On a **v3** folder it repairs the WAL generations (`wal.gen_*`, and `pending_wal_gen` when a stalled compaction left one) under the maintenance lock, printing the quarantined copy and the sequence the lineage now ends at. Note that `manifest.json`’s `last_seq` is published by compaction, so it may lag the WAL — `fsck` reports that as a warning, not corruption.
 - **`config`** operates on `meta.json` in the *current directory* — run it inside the database folder.
 - **`merge`** resolves ID collisions by comparing a `_modified` field on each document; documents without it default to `0`.
-- **`verify`** checks for `_file` object references inside documents (the `{bucket, id, ext}` form) against the `_files/` tree, and validates JSON on every journal line. For buckets declared `kind: "items"` in `meta.json` it additionally verifies each live item's original against its committed `size`/`sha256`, that reserved items have their folder, and flags orphan folders.
+- **`verify`** checks every file reference a document holds against the `_files/` tree — the nested `_file` object form (`{bucket, id, ext}`) **and** every string form the engine's mark phase recognizes (compact `bucket:hash.ext`, `/api/buckets/…`, `/file/…`, `/files/…`, `/v2/dbs/<db>/files/…`), using the same normalizer as `gc_buckets`. It also validates JSON on every journal line. For buckets declared `kind: "items"` in `meta.json` it additionally verifies each live item's original against its committed `size`/`sha256`, that reserved items have their folder, and flags orphan folders. On a v2/v3 folder `verify` delegates to `fsck`.
 - The `--consistent` export flag requires a `.readonly` marker file; without it the export is treated as "crash-consistent".

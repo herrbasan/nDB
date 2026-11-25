@@ -102,6 +102,57 @@ pub fn mime_for_filename(filename: &str) -> &'static str {
         .unwrap_or("application/octet-stream")
 }
 
+/// Sidecar suffix recording when an entry entered trash (#14).
+///
+/// A rename preserves the file's own modification time, so `mtime` says when
+/// the content was last written — not how long it has been recoverable. The
+/// TTL sweep must use residence time, so every trashed entry gets one of these
+/// beside it.
+pub(crate) const TRASHED_AT_SUFFIX: &str = ".trashed_at";
+
+/// Where the residence record of one trashed entry lives.
+pub(crate) fn trash_stamp_path(trash_dir: &Path, entry: &str) -> PathBuf {
+    trash_dir.join(format!("{entry}{TRASHED_AT_SUFFIX}"))
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Durably record that `entry` entered trash now: temp file, `sync_all`,
+/// rename, parent fsync — a crash leaves either no stamp or a complete one,
+/// never a half-written epoch that would be parsed as a bogus residence.
+pub(crate) fn write_trash_stamp(trash_dir: &Path, entry: &str) -> Result<()> {
+    let path = trash_stamp_path(trash_dir, entry);
+    let tmp = trash_dir.join(format!(
+        "{entry}.{}.{}.stamp.tmp",
+        std::process::id(),
+        fastrand::u64(..)
+    ));
+    let mut file = fs::File::create(&tmp).map_err(Error::io_err(&tmp, "create trash stamp"))?;
+    file.write_all(format!("{}\n", now_epoch_secs()).as_bytes())
+        .map_err(Error::io_err(&tmp, "write trash stamp"))?;
+    file.sync_all()
+        .map_err(Error::io_err(&tmp, "sync trash stamp"))?;
+    drop(file);
+    fs::rename(&tmp, &path).map_err(Error::io_err(&path, "publish trash stamp"))?;
+    sync_parent_dir(&path)
+}
+
+/// Remove the residence record of a restored or purged entry. A missing stamp
+/// is the expected state for entries trashed before #14 existed.
+pub(crate) fn remove_trash_stamp(trash_dir: &Path, entry: &str) -> Result<()> {
+    let path = trash_stamp_path(trash_dir, entry);
+    match fs::remove_file(&path) {
+        Ok(()) => sync_parent_dir(&path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::io_err(&path, "remove trash stamp")(e)),
+    }
+}
+
 /// A file bucket for storing binary data.
 pub struct FileBucket {
     /// Bucket name.
@@ -231,6 +282,11 @@ impl FileBucket {
         fs::rename(&src, &dst).map_err(Error::io_err(&src, "move file to trash"))?;
         sync_parent_dir(&dst)?;
         sync_parent_dir(&src)?;
+        // The move stands; only the residence record can be missing, and a
+        // missing record means the entry is retained — never purged early.
+        if let Err(e) = write_trash_stamp(&trash_dir, &file_ref.filename()) {
+            report::suppressed("delete: record trash residence", e);
+        }
 
         Ok(())
     }
@@ -271,10 +327,18 @@ impl FileBucket {
         fs::rename(&src, &dst).map_err(Error::io_err(&src, "restore file from trash"))?;
         sync_parent_dir(&dst)?;
         sync_parent_dir(&src)?;
+        if let Err(e) = remove_trash_stamp(&trash_dir, &filename) {
+            report::suppressed("restore: remove trash residence stamp", e);
+        }
         Ok(())
     }
 
-    /// Purge trashed files older than given duration.
+    /// Purge trashed files whose **residence in trash** exceeds the duration.
+    ///
+    /// Residence comes from the `.trashed_at` sidecar written when the entry
+    /// moved here (#14) — never from the file's own modification time, which a
+    /// rename preserves: an old file would otherwise be purged the instant it
+    /// became recoverable. A missing or unreadable sidecar means "retain".
     pub fn purge_trash_ttl(&self, older_than: std::time::Duration) -> Result<usize> {
         let trash_dir = self.trash_dir();
         if !trash_dir.exists() {
@@ -285,13 +349,18 @@ impl FileBucket {
         let mut count = 0;
         for entry in fs::read_dir(&trash_dir).map_err(Error::io_err(&trash_dir, "read trash dir"))? {
             let entry = entry.map_err(Error::io_err(&trash_dir, "read trash entry"))?;
+            let entry_name = entry.file_name().to_string_lossy().to_string();
+            // Sidecars are metadata of a sibling entry, not trash entries.
+            if entry_name.ends_with(TRASHED_AT_SUFFIX) {
+                continue;
+            }
 
             if check_ttl {
-                match trash_entry_age(&entry) {
+                match trash_residence(&trash_dir, &entry_name) {
                     Some(age) if age <= older_than => continue,
                     Some(_) => {}
-                    // Age unknown: purging anyway could destroy the only copy
-                    // of a file still inside its restore window. Leave it.
+                    // Residence unknown: purging anyway could destroy the only
+                    // copy of a file still inside its restore window. Leave it.
                     None => continue,
                 }
             }
@@ -305,9 +374,12 @@ impl FileBucket {
             };
             if let Err(e) = removed {
                 report::suppressed("purge_trash_ttl: remove expired trash entry", e);
-            } else {
-                count += 1;
+                continue;
             }
+            if let Err(e) = remove_trash_stamp(&trash_dir, &entry_name) {
+                report::suppressed("purge_trash_ttl: remove trash residence stamp", e);
+            }
+            count += 1;
         }
         Ok(count)
     }
@@ -328,29 +400,46 @@ impl FileBucket {
     }
 }
 
-// ─── Trash Age ──────────────────────────────────────────────────────
+// ─── Trash Residence ────────────────────────────────────────────────
 
-/// Age of a trashed file, or `None` when it cannot be established.
+/// How long a trashed entry has been recoverable, from its `.trashed_at`
+/// sidecar.
 ///
-/// `None` must never be read as "old enough to delete": an unreadable or
-/// uncomparable timestamp says nothing about how long the file has been in
+/// `None` must never be read as "old enough to delete": a missing, unreadable
+/// or nonsensical recording says nothing about how long the entry has been in
 /// trash, so deleting on that basis could destroy a file that is still inside
 /// its restore window. The failure is reported and the caller leaves it be.
-fn trash_entry_age(entry: &fs::DirEntry) -> Option<std::time::Duration> {
-    let modified = match entry.metadata().and_then(|m| m.modified()) {
-        Ok(modified) => modified,
+fn trash_residence(trash_dir: &Path, entry_name: &str) -> Option<std::time::Duration> {
+    let path = trash_stamp_path(trash_dir, entry_name);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
         Err(e) => {
-            report::suppressed("purge_trash_ttl: read trash file age", e);
+            report::suppressed(
+                "purge_trash_ttl: read trash residence stamp",
+                format!("{}: {e} (entry retained)", path.display()),
+            );
             return None;
         }
     };
-    match std::time::SystemTime::now().duration_since(modified) {
-        Ok(age) => Some(age),
+    let trashed_at: u64 = match text.trim().parse() {
+        Ok(secs) => secs,
         Err(e) => {
-            report::suppressed("purge_trash_ttl: trash file age not comparable", e);
-            None
+            report::suppressed(
+                "purge_trash_ttl: parse trash residence stamp",
+                format!("{}: {e} (entry retained)", path.display()),
+            );
+            return None;
         }
+    };
+    let now = now_epoch_secs();
+    if trashed_at > now {
+        report::suppressed(
+            "purge_trash_ttl: trash residence stamp is in the future",
+            format!("{}: {trashed_at} > {now} (entry retained)", path.display()),
+        );
+        return None;
     }
+    Some(std::time::Duration::from_secs(now - trashed_at))
 }
 
 // ─── SHA-256 Implementation ─────────────────────────────────────────

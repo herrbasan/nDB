@@ -38,7 +38,7 @@ mydb/
             └── asset.json      # Caller's description file
 ```
 
-Trash mirrors the split: `_trash/files/<bucket>/` holds hash blobs by filename and item folders whole.
+Trash mirrors the split: `_trash/files/<bucket>/` holds hash blobs by filename and item folders whole. Every trashed entry is accompanied by a `<name>.trashed_at` sidecar (epoch seconds, written atomically and fsynced) — the TTL sweep uses it as the entry's residence, and `restore` removes it.
 
 ---
 
@@ -223,12 +223,12 @@ let data = bucket.get(&meta._file)?;
 std::fs::write("retrieved.png", &data)?;
 ```
 
-### `get_by_id(hash: &str, ext: &str) -> Result<Vec<u8>>`
+### `get_by_hash(hash: &str, ext: &str) -> Result<Vec<u8>>`
 
 Retrieve by hash and extension directly.
 
 ```rust
-let data = bucket.get_by_id("<sha256>", "png")?;
+let data = bucket.get_by_hash("<sha256>", "png")?;
 ```
 
 ---
@@ -273,6 +273,13 @@ The mark phase recognizes **every** ref form a document may store — the compac
 `bucket:<hash>.<ext>` nURI, `/api/buckets/<bucket>/<file>`, `/file/<bucket>/<file>`,
 `/files/<bucket>/<file>`, and `/v2/dbs/<db>/files/<bucket>/<file>`.
 
+Buckets declared `kind: "items"` are **never swept**: an item entry is keyed by
+an engine-issued id, can never match a content-hash reference, and the bucket's
+`items.jsonl` journal is engine-owned. Their lifecycle is `deleteItem` and the
+reserved-item sweep. Trash residence for both kinds is recorded in a
+`.trashed_at` sidecar beside the trashed entry (`_trash/files/<bucket>/<name>.trashed_at`),
+which the TTL sweep reads and `restore` removes.
+
 ### `release_file(ref) -> Result<bool>` / `release_file_with(ref, force)`
 
 Delete one file if nothing needs it. Returns `false` (HTTP `409
@@ -283,7 +290,7 @@ reference then belongs to the caller.
 
 ### `purge_trash_ttl(ttl: Duration) -> Result<()>`
 
-Delete all trashed files in this bucket that exceed the given TTL by reading their filesystem modification date.
+Delete trashed entries whose **residence in trash** exceeds the given TTL. Residence is read from the `.trashed_at` sidecar written beside the entry when it moved to trash — never from the file's own modification time: a rename preserves `mtime`, so an old file would otherwise age out of trash the instant it became recoverable. A missing or unreadable sidecar means **retain** (fail-safe); `purge_trash()` / `clear_trash()` purge everything regardless of residence.
 
 ```rust
 bucket.purge_trash_ttl(Duration::from_secs(86400))?;
@@ -299,8 +306,8 @@ List all active files in the bucket. Returns the stored filenames (e.g. `<64 hex
 
 ```rust
 let files = bucket.list()?;
-for file in &files {
-    println!("{} ({} bytes, {})", file.name, file.size, file.type_);
+for filename in &files {
+    println!("{filename}");   // e.g. "<64 hex>.png"
 }
 ```
 
