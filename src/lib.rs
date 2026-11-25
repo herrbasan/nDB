@@ -1570,6 +1570,11 @@ pub struct Database {
     deleted: RwLock<HashSet<String>>,
     /// In-memory file reference counter: nURI string → count.
     file_refs: RwLock<HashMap<String, usize>>,
+    /// Whether `file_refs` has been reconciled with the RAM engine's live
+    /// document set. A v3 database defers that walk — the v2 engine makes the
+    /// same trade in its own `ensure_file_refs` — so a cold boot never parses
+    /// every document to count attachments (#18).
+    ram_file_refs_loaded: std::sync::atomic::AtomicBool,
     /// Hash indexes (opt-in, O(1) equality / `$in` lookups).
     hash_indexes: RwLock<HashMap<String, HashIndex>>,
     /// BTree indexes (opt-in, O(log n) equality + exact range scans). A field
@@ -1873,6 +1878,7 @@ impl Database {
             docs: RwLock::new(HashMap::new()),
             deleted: RwLock::new(HashSet::new()),
             file_refs: RwLock::new(HashMap::new()),
+            ram_file_refs_loaded: std::sync::atomic::AtomicBool::new(false),
             hash_indexes: RwLock::new(HashMap::new()),
             btree_indexes: RwLock::new(HashMap::new()),
             writer: Arc::new(Mutex::new(())),
@@ -1936,6 +1942,7 @@ impl Database {
             docs: RwLock::new(HashMap::new()),
             deleted: RwLock::new(HashSet::new()),
             file_refs: RwLock::new((*file_refs.read()).clone()),
+            ram_file_refs_loaded: std::sync::atomic::AtomicBool::new(true),
             hash_indexes: RwLock::new(HashMap::new()),
             btree_indexes: RwLock::new(HashMap::new()),
             writer: Arc::new(Mutex::new(())),
@@ -2083,6 +2090,7 @@ impl Database {
             ),
             deleted: RwLock::new(deleted),
             file_refs: RwLock::new(file_refs),
+            ram_file_refs_loaded: std::sync::atomic::AtomicBool::new(true),
             hash_indexes: RwLock::new(HashMap::new()),
             btree_indexes: RwLock::new(HashMap::new()),
             writer: std::sync::Arc::new(Mutex::new(())),
@@ -2127,6 +2135,7 @@ impl Database {
             docs: RwLock::new(HashMap::new()),
             deleted: RwLock::new(HashSet::new()),
             file_refs: RwLock::new(HashMap::new()),
+            ram_file_refs_loaded: std::sync::atomic::AtomicBool::new(true),
             hash_indexes: RwLock::new(HashMap::new()),
             btree_indexes: RwLock::new(HashMap::new()),
             writer: std::sync::Arc::new(Mutex::new(())),
@@ -2503,7 +2512,12 @@ impl Database {
     /// O(1) operation: one collision check + HashMap insert + file append.
     pub fn insert(&self, mut doc: Value) -> Result<String> {
         if let Some(ram) = &self.ram {
-            return ram.insert(doc, None);
+            let mut refs = HashSet::new();
+            Self::extract_file_refs(&doc, &mut refs);
+            let _guard = self.writer.lock();
+            let id = ram.insert(doc, None)?;
+            self.count_added_refs(&refs);
+            return Ok(id);
         }
         if let Some(v2) = &self.v2 {
             return v2.insert(doc, None);
@@ -2543,7 +2557,12 @@ impl Database {
     /// Insert a document with a prefixed ID.
     pub fn insert_with_prefix(&self, prefix: &str, mut doc: Value) -> Result<String> {
         if let Some(ram) = &self.ram {
-            return ram.insert(doc, Some(prefix.to_string()));
+            let mut refs = HashSet::new();
+            Self::extract_file_refs(&doc, &mut refs);
+            let _guard = self.writer.lock();
+            let id = ram.insert(doc, Some(prefix.to_string()))?;
+            self.count_added_refs(&refs);
+            return Ok(id);
         }
         if let Some(v2) = &self.v2 {
             return v2.insert(doc, Some(prefix.to_string()));
@@ -2713,7 +2732,7 @@ impl Database {
     /// is still at seq `n`. Checks and commit happen under one writer lock.
     pub fn update_if(&self, id: &str, mut new_doc: Value, if_seq: Option<u64>) -> Result<()> {
         if let Some(ram) = &self.ram {
-            return ram.update(id, new_doc, if_seq);
+            return self.ram_mutate(ram, id, || ram.update(id, new_doc, if_seq));
         }
         if let Some(v2) = &self.v2 {
             return v2.update(id, new_doc, if_seq);
@@ -2773,7 +2792,7 @@ impl Database {
     /// index, non-array at the target) — nothing changed, nothing journaled.
     pub fn array_push(&self, id: &str, field: &str, value: Value) -> Result<bool> {
         if let Some(ram) = &self.ram {
-            return ram.array_push(id, field, value);
+            return self.ram_mutate(ram, id, || ram.array_push(id, field, value));
         }
         if let Some(v2) = &self.v2 {
             return v2.array_push(id, field, value);
@@ -2840,7 +2859,7 @@ impl Database {
     /// index) — nothing changed, nothing journaled.
     pub fn set(&self, id: &str, path: &str, value: Value) -> Result<bool> {
         if let Some(ram) = &self.ram {
-            return ram.set(id, path, value);
+            return self.ram_mutate(ram, id, || ram.set(id, path, value));
         }
         if let Some(v2) = &self.v2 {
             return v2.set(id, path, value);
@@ -2884,7 +2903,7 @@ impl Database {
     /// nothing changed, nothing journaled.
     pub fn remove(&self, id: &str, path: &str) -> Result<bool> {
         if let Some(ram) = &self.ram {
-            return ram.remove(id, path);
+            return self.ram_mutate(ram, id, || ram.remove(id, path));
         }
         if let Some(v2) = &self.v2 {
             return v2.remove(id, path);
@@ -2949,7 +2968,7 @@ impl Database {
             return Err(Error::invalid_arg("patch must contain at least one op"));
         }
         if let Some(ram) = &self.ram {
-            return ram.apply_ops(id, ops.to_vec(), if_seq);
+            return self.ram_mutate(ram, id, || ram.apply_ops(id, ops.to_vec(), if_seq));
         }
         if let Some(v2) = &self.v2 {
             return v2.apply_ops(id, ops.to_vec(), if_seq);
@@ -3168,6 +3187,11 @@ impl Database {
     /// document that is gone while its restorable copy was never written.
     fn delete_ram(&self, ram: &Arc<ram_engine::RamEngine>, id: &str) -> Result<()> {
         let _guard = self.writer.lock();
+        // The counters must reflect the live set before an orphan is decided:
+        // on a v3 folder opened on existing data they start empty, and a file
+        // wrongly judged "still referenced" would leak until a manual gc —
+        // while a wrongly judged "orphaned" one would dangle (#18).
+        self.ensure_ram_file_refs(ram);
         let doc_to_trash = ram.get(id)?;
 
         let mut extracted_file_refs = HashSet::new();
@@ -4963,6 +4987,72 @@ impl Database {
         for r in extracted {
             *file_refs.entry(r).or_insert(0) += 1;
         }
+    }
+
+    /// Count the refs one already-inserted document holds.
+    ///
+    /// The RAM engine commits inside its own write lock, so a v3 insert cannot
+    /// reach `increment_file_refs` with the document in hand — the caller
+    /// extracts first and counts after (#18). Counting before the first
+    /// reconciliation is harmless: `ensure_ram_file_refs` rebuilds the map from
+    /// the live set, which already contains this document.
+    fn count_added_refs(&self, refs: &HashSet<String>) {
+        if refs.is_empty() {
+            return;
+        }
+        let mut file_refs = self.file_refs.write();
+        for r in refs {
+            *file_refs.entry(r.clone()).or_insert(0) += 1;
+        }
+    }
+
+    /// Reconcile `file_refs` with the RAM engine's live documents, once.
+    ///
+    /// A v3 folder opened on existing data starts with no counters, and the RAM
+    /// write path cannot maintain them from inside the engine. One walk over
+    /// the live set makes them authoritative; every RAM mutation after this
+    /// point keeps them current. Caller holds `writer`, so no insert can land
+    /// between the walk and the swap.
+    fn ensure_ram_file_refs(&self, ram: &Arc<ram_engine::RamEngine>) {
+        if self.ram_file_refs_loaded.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut refs: HashMap<String, usize> = HashMap::new();
+        ram.for_each_doc(|_, doc| {
+            let mut found = HashSet::new();
+            Self::extract_file_refs(doc, &mut found);
+            for r in found {
+                *refs.entry(r).or_insert(0) += 1;
+            }
+        });
+        let mut target = self.file_refs.write();
+        target.clear();
+        target.extend(refs);
+        self.ram_file_refs_loaded.store(true, Ordering::SeqCst);
+    }
+
+    /// Run one RAM mutation with the file-reference bookkeeping the in-memory
+    /// path gets from [`Database::handle_ref_delta_and_trash`]: the document is
+    /// read around the delegated engine call, so a ref the mutation drops is
+    /// released exactly as it is on v1/v2 (#18). Caller must not already hold
+    /// `writer`.
+    fn ram_mutate<R>(
+        &self,
+        ram: &Arc<ram_engine::RamEngine>,
+        id: &str,
+        op: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
+        let _guard = self.writer.lock();
+        self.ensure_ram_file_refs(ram);
+        let old = ram.get(id).ok();
+        let result = op()?;
+        if let Some(old) = old {
+            let new = ram.get(id).ok();
+            if let Some(new) = new {
+                self.handle_ref_delta_and_trash(&old, &new);
+            }
+        }
+        Ok(result)
     }
 }
 

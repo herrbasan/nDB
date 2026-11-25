@@ -250,6 +250,10 @@ new manifest, never a mixture.
 - Pins expire after a TTL (default 300 s). Reaping runs on a **timer**, not on
   access, so an idle server always releases expired pins. An expired or unknown
   `snapshot_id` answers `410 snapshot_expired`.
+- The HTTP page route releases a pin early once it serves the page that
+  completes the read (`offset + count >= total`): a walk that finished — one
+  page or several — must not keep ring history alive for the rest of the TTL.
+  An unfinished walk stays pinned.
 - A pin never deep-clones the document set: it holds `Arc`s. Pinning is
   therefore cheap even for hundreds of MB.
 

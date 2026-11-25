@@ -125,15 +125,30 @@ existing folders.
   `commit_lock`) and reserves ring entries at/after its `cut_seq`;
   `get_pinned_page` / `release_pin` serve and release it. `GET
   /v2/dbs/{name}/snapshot` on a RAM database pages the pinned `Arc` set (only
-  the requested page is converted to JSON) and the registry's reaper thread
-  (2 s wake, exits on `request_process_shutdown`) releases expired pins for
-  every mounted DB, so an idle server never holds one.
+  the requested page is converted to JSON), releases the pin as soon as it
+  serves the completing page (`offset + count >= total`) and the registry's
+  reaper thread (2 s wake, exits on `request_process_shutdown`) releases expired
+  pins for every mounted DB, so an idle server never holds one.
+- **File references on the RAM engine (#18).** The v3 write path commits inside
+  the engine, so `Database::file_refs` cannot be counted there: a RAM insert
+  extracts and counts the document's nURIs itself, and
+  `update`/`set`/`remove`/`array_push`/`apply_ops` read the document around the
+  delegated call and run the same before/after delta the v1 path uses.
+  `ensure_ram_file_refs` reconciles the counters with the live set once (a v3
+  folder opened on existing data starts empty), so `DELETE /doc/:id` moves the
+  files only that document held into the bucket trash in the same call, exactly
+  as v2 does, and `release_file` / `DELETE /files/…` sees live and restorable
+  references identically on every backend.
 - `StorageFormat::{Auto,V1,V2,Ram}` — `ram`/`v3` parse; `Auto` routes a folder
   whose `manifest.json` is version 3 to the engine (v2 manifests carry
-  `format_version`); `Database::open_ram`, `open_ram_with_config`,
-  `open_ram_with_io` (test/`fault-io`), `open_with_ram_config` (serve),
-  `is_ram`, `ram_stats`, `pin_snapshot` / `pinned_page` / `release_pin` /
-  `reap_expired_pins`.
+  `format_version`, v1 folders hold `data.jsonl`); `Database::open_ram`,
+  `open_ram_with_config`, `open_ram_with_io` (test/`fault-io`),
+  `open_with_ram_config` (serve), `is_ram`, `ram_stats`, `pin_snapshot` /
+  `pinned_page` / `release_pin` / `reap_expired_pins`.
+  `ndb serve --format auto|v1|v2|ram` sets the create format and also decides
+  the format of a `--db name=<path>` mount whose path does not exist yet (a new
+  mount is v1 by default, v3 with `--format ram`); an existing folder is always
+  opened by detection, never by the flag.
   `GET /stats` and `GET /v2/dbs/{name}/stats` add a `ram` block
   (live/index/ring bytes, oldest retained seq, expired cursors, pins, poison,
   WAL bytes, stage timings); `/v2/dbs` reports `"format": "ram"`.

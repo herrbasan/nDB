@@ -245,3 +245,175 @@ fn query_projects_and_streams_with_the_same_pagination() {
     );
     assert!(body.get("took_ms").is_none(), "legacy body has no took_ms");
 }
+
+// ─── Bucket release on delete (#18) ─────────────────────────────────────────
+
+/// Store one file; returns its `hash.ext` filename and its compact nURI ref.
+fn store_file(port: u16, bucket: &str, filename: &str, bytes: &[u8]) -> (String, String) {
+    let path = format!("/v2/dbs/default/files/{bucket}?filename={filename}");
+    let (status, body) = raw(port, "PUT", &path, bytes);
+    let body: Value = serde_json::from_slice(&body).expect("store response is JSON");
+    assert_eq!(status, 201, "{body}");
+    let hash = body["hash"].as_str().expect("hash").to_string();
+    let ext = body["ext"].as_str().expect("ext").to_string();
+    let reference = body["ref"].as_str().expect("ref").to_string();
+    (format!("{hash}.{ext}"), reference)
+}
+
+fn insert_doc_with(port: u16, body: &Value) -> String {
+    let (status, response) = json_request(port, "PUT", "/v2/dbs/default/doc", Some(body));
+    assert_eq!(status, 201, "{response}");
+    response["id"].as_str().expect("id").to_string()
+}
+
+/// Status of a bucket file read — the body is the file's bytes, not JSON.
+fn file_status(port: u16, path: &str) -> u16 {
+    raw(port, "GET", path, &[]).0
+}
+
+/// Deleting a document on the RAM engine releases the bucket files only it
+/// referenced — the exact behaviour the v2 engine has (#18).
+///
+/// The order is the contract: a file another live document still holds stays,
+/// and the delete that removes the last holder moves the orphan out of the
+/// bucket in the same call, so the bytes are gone without a manual `POST gc`.
+#[test]
+fn deleting_a_ram_document_releases_its_unreferenced_bucket_files() {
+    let dir = TempDir::new().expect("temp dir");
+    let server = start(open_ram(dir.path()));
+    let port = server.port;
+
+    let (filename, reference) = store_file(port, "notepad", "note.txt", b"attachment bytes");
+    let file_path = format!("/v2/dbs/default/files/notepad/{filename}");
+
+    let first = insert_doc_with(port, &json!({"title": "one", "attach": reference.clone()}));
+    let second = insert_doc_with(port, &json!({"title": "two", "attach": reference}));
+
+    let (status, body) = json_request(port, "DELETE", &format!("/v2/dbs/default/doc/{first}"), None);
+    assert_eq!(status, 200, "delete of a live document: {body}");
+    assert_eq!(
+        file_status(port, &file_path),
+        200,
+        "a file another live document still holds stays"
+    );
+
+    let (status, body) = json_request(
+        port,
+        "DELETE",
+        &format!("/v2/dbs/default/files/notepad/{filename}"),
+        None,
+    );
+    assert_eq!(status, 409, "a live reference is still a reference: {body}");
+    assert_eq!(body["error"], "file_referenced");
+
+    let (status, body) = json_request(port, "DELETE", &format!("/v2/dbs/default/doc/{second}"), None);
+    assert_eq!(status, 200, "delete of the last holding document: {body}");
+
+    assert_eq!(
+        file_status(port, &file_path),
+        404,
+        "the released attachment is no longer served"
+    );
+
+    // The orphan left the active bucket, so a global gc has nothing left to do.
+    let (status, body) = json_request(port, "POST", "/v2/dbs/default/files/gc", None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["moved"], json!(0), "the delete already released it: {body}");
+}
+
+/// A RAM update that drops an attachment releases the file, exactly like the
+/// v1/v2 update path: the counters are maintained, not only rebuilt on delete.
+#[test]
+fn a_ram_update_that_drops_a_ref_releases_the_file() {
+    let dir = TempDir::new().expect("temp dir");
+    let server = start(open_ram(dir.path()));
+    let port = server.port;
+
+    let (filename, reference) = store_file(port, "notepad", "note.txt", b"attachment bytes");
+    let file_path = format!("/v2/dbs/default/files/notepad/{filename}");
+    let id = insert_doc_with(port, &json!({"attach": reference}));
+
+    let (status, body) = json_request(
+        port,
+        "PUT",
+        &format!("/v2/dbs/default/doc/{id}"),
+        Some(&json!({"title": "no attachment any more"})),
+    );
+    assert_eq!(status, 200, "replace the document: {body}");
+
+    assert_eq!(
+        file_status(port, &file_path),
+        404,
+        "the dropped ref released the file"
+    );
+}
+
+/// `DELETE /files` on a RAM database answers `200` for a file nothing
+/// references — no blanket `409 file_referenced` (#18).
+#[test]
+fn deleting_an_unreferenced_file_on_ram_succeeds() {
+    let dir = TempDir::new().expect("temp dir");
+    let server = start(open_ram(dir.path()));
+    let port = server.port;
+
+    let (filename, _) = store_file(port, "notepad", "orphan.txt", b"nobody claims me");
+    let file_path = format!("/v2/dbs/default/files/notepad/{filename}");
+
+    let (status, body) = json_request(port, "DELETE", &file_path, None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["deleted"], json!(true));
+
+    assert_eq!(file_status(port, &file_path), 404, "the file is gone");
+}
+
+/// A pinned snapshot releases its pin as soon as it serves the page that
+/// completes the read: a finished read must not reserve change-ring history for
+/// the rest of the TTL, and a snapshot that fits in one page must not linger at
+/// all.
+#[test]
+fn a_snapshot_releases_its_pin_once_the_last_page_is_served() {
+    let dir = TempDir::new().expect("temp dir");
+    let db = open_ram(dir.path());
+    for n in 0..3 {
+        db.insert(json!({"n": n})).expect("insert");
+    }
+    let server = start(db);
+    let port = server.port;
+
+    // Three docs, page size 2: the first page is not the last, so it stays.
+    let (status, first) = json_request(port, "GET", "/v2/dbs/default/snapshot?offset=0&limit=2", None);
+    assert_eq!(status, 200, "{first}");
+    let snapshot_id = first["snapshot_id"].as_str().expect("pinned").to_string();
+    assert_eq!(first["count"], json!(2));
+
+    let (status, second) = json_request(
+        port,
+        "GET",
+        &format!("/v2/dbs/default/snapshot?snapshot_id={snapshot_id}&offset=2&limit=2"),
+        None,
+    );
+    assert_eq!(status, 200, "{second}");
+    assert_eq!(second["count"], json!(1), "the final page");
+
+    let (status, body) = json_request(
+        port,
+        "GET",
+        &format!("/v2/dbs/default/snapshot?snapshot_id={snapshot_id}&offset=0&limit=2"),
+        None,
+    );
+    assert_eq!(status, 410, "a finished snapshot is no longer addressable: {body}");
+    assert_eq!(body["error"], "snapshot_expired");
+
+    // Every document fits in one page: complete on its first response.
+    let (status, single) = json_request(port, "GET", "/v2/dbs/default/snapshot?offset=0&limit=50", None);
+    assert_eq!(status, 200, "{single}");
+    let single_id = single["snapshot_id"].as_str().expect("pinned").to_string();
+    assert_eq!(single["count"], json!(3));
+    let (status, body) = json_request(
+        port,
+        "GET",
+        &format!("/v2/dbs/default/snapshot?snapshot_id={single_id}&offset=0&limit=50"),
+        None,
+    );
+    assert_eq!(status, 410, "a single-page snapshot leaves no pin behind: {body}");
+}

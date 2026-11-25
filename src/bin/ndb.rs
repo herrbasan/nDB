@@ -202,7 +202,7 @@ fn print_usage() {
     eprintln!("  --config <file>  JSON config (bind/port/token/persistence/scheduled_ms/");
     eprintln!("                     dir/max_limit/default_limit/dbs)");
     eprintln!("  --persistence <immediate|scheduled|lazy>  Service default (immediate)");
-    eprintln!("  --format <auto|v1|v2>       Format for databases created via POST /v2/dbs (default auto)");
+    eprintln!("  --format <auto|v1|v2|ram>  Format for databases created via POST /v2/dbs or a --db mount of a not-yet-existing path (default auto)");
     eprintln!("  --scheduled-ms <n>  Flush interval for persistence=scheduled (default 5000)");
     eprintln!("  --max-limit <n>     Hard cap for an explicit query limit (default 50000)");
     eprintln!("  --default-limit <n> Page size when a query omits limit (default 1000)");
@@ -372,7 +372,20 @@ fn handle_serve(args: &[String]) {
     }
 
     let registry = DbRegistry::new(root_dir.clone(), persistence, scheduled_ms);
-    registry.set_create_format(cli_format.or(file_format).unwrap_or(ndb::StorageFormat::Auto));
+    let create_format = cli_format.or(file_format).unwrap_or(ndb::StorageFormat::Auto);
+    registry.set_create_format(create_format);
+
+    // A mount of a path that does not exist yet creates the database, and it
+    // must be created in the format this serve was told to use. An existing
+    // folder keeps `Auto`, so detection (v1 `data.jsonl`, v2/v3 `manifest.json`)
+    // — never a format flag — decides what is opened.
+    let mount_format = |path: &str| {
+        if std::path::Path::new(path).exists() {
+            ndb::StorageFormat::Auto
+        } else {
+            create_format
+        }
+    };
 
     if let Some(path) = &positional {
         // Legacy contract: a positional database must already exist.
@@ -387,7 +400,12 @@ fn handle_serve(args: &[String]) {
 
     for (name, path) in &cli_dbs {
         registry
-            .mount_resolved(name, path, persistence.to_persistence(scheduled_ms))
+            .mount_resolved_format(
+                name,
+                path,
+                persistence.to_persistence(scheduled_ms),
+                mount_format(path),
+            )
             .unwrap_or_else(|e| fatal(&format!("mounting '{name}': {e}")));
     }
 
@@ -395,7 +413,7 @@ fn handle_serve(args: &[String]) {
         let mode = mode.unwrap_or(persistence);
         let p = mode.to_persistence(sched.unwrap_or(scheduled_ms));
         registry
-            .mount_resolved(name, path, p)
+            .mount_resolved_format(name, path, p, mount_format(path))
             .unwrap_or_else(|e| fatal(&format!("mounting '{name}': {e}")));
     }
 

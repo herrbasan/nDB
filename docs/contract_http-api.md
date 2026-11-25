@@ -163,7 +163,7 @@ Body (`#[serde(deny_unknown_fields)]` — any extra key is `400 invalid_request`
 ```
 
 - `name` required; `persistence` ∈ `immediate | scheduled | lazy` (default: the
-  service mode); `format` ∈ `auto | v1 | v2` (default: the service create
+  service mode); `format` ∈ `auto | v1 | v2 | ram` (default: the service create
   format). Bad values → `400 invalid_argument`.
 - `201 {"ok":true,"db":<descriptor>}`.
 - `403 create_disabled` — no `--dir` root.
@@ -297,6 +297,11 @@ Errors: `409 cursor_ahead`, `409 cursor_expired` (each with its numbers).
 - Any of `offset > 0`, `limit`, or `snapshot_id` → paginated. Without
   `snapshot_id` the server pins a new snapshot (TTL 300 s) and returns its id;
   subsequent pages pass `snapshot_id` to stay on the same frozen state.
+- The pin is released as soon as it serves the page that completes the read
+  (`offset + count >= total`), including a snapshot that fits in one page: a
+  finished read never reserves change-ring history for the rest of the TTL, and
+  its `snapshot_id` answers `410` afterwards. An unfinished read stays pinned
+  until the TTL reaper releases it.
 - Unknown/expired/foreign id → `410 snapshot_expired`.
 - `400 invalid_offset` / `400 invalid_limit` for non-numeric values.
 - Documents are sorted by `_id`.

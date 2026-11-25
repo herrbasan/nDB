@@ -176,10 +176,13 @@ publishes the generations, writes the manifest, renames `data.jsonl` to
 
 ## HTTP service
 
-`ndb serve --config <file>` accepts `"format": "auto" | "v1" | "v2"` (also
+`ndb serve --config <file>` accepts `"format": "auto" | "v1" | "v2" | "ram"` (also
 `--format`), and `POST /v2/dbs` accepts `{"name": "...", "format": "v2"}` so a
-service can create binary databases directly. `GET /v2/dbs` descriptors report
-`"format": "v1" | "v2"`.
+service can create binary databases directly. The same format applies to a
+`--db name=<path>` mount of a path that does not exist yet, so `--format ram`
+creates a v3 folder instead of falling back to v1; an existing folder is always
+opened by detection (`Auto`). `GET /v2/dbs` descriptors report
+`"format": "v1" | "v2" | "ram"`.
 
 ## Verification and measurement
 

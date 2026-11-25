@@ -234,6 +234,15 @@ impl DbRegistry {
         }
     }
 
+    /// Drop the registry entry for a pin the caller has already released on the
+    /// engine, so a completed read leaves nothing addressable behind.
+    pub fn forget_pin(&self, db: &str, id: &str) {
+        let mut pins = self.snapshots.write();
+        if pins.get(id).is_some_and(|pin| pin.db == db) {
+            pins.remove(id);
+        }
+    }
+
     /// Reap everything a timer must reap so an idle server never holds a pin:
     /// this registry's expired entries (releasing the engine pin behind each)
     /// and every mounted database's own expired pins.
@@ -2703,18 +2712,34 @@ fn handle_ram_snapshot(
     };
 
     match db.pinned_page(pin_id, offset, limit) {
-        Some(page) => (
-            200,
-            json!({
-                "ok": true,
-                "source_epoch_uuid": page.lineage.source_epoch_uuid,
-                "watermark_seq": page.lineage.last_seq,
-                "snapshot_id": snapshot_id,
-                "total": page.total,
-                "count": page.docs.len(),
-                "docs": page.docs,
-            }),
-        ),
+        Some(page) => {
+            // A pin exists to freeze the set across pages. Once the page that
+            // completes the read has left, nothing will ask the engine for this
+            // snapshot again — holding it (and the change-ring retention it
+            // reserves) for the rest of the TTL only costs memory, and a
+            // snapshot that fits in one page would never be released at all.
+            let complete = offset.saturating_add(page.docs.len()) >= page.total;
+            if complete {
+                if let Err(error) = db.release_pin(pin_id) {
+                    // The engine reaps an expired pin itself; a release that
+                    // fails here is that race, not a fault of this request.
+                    report::suppressed("snapshot: release pin on the final page", error);
+                }
+                registry.forget_pin(db_name, &snapshot_id);
+            }
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "source_epoch_uuid": page.lineage.source_epoch_uuid,
+                    "watermark_seq": page.lineage.last_seq,
+                    "snapshot_id": snapshot_id,
+                    "total": page.total,
+                    "count": page.docs.len(),
+                    "docs": page.docs,
+                }),
+            )
+        }
         None => snapshot_expired_error(&snapshot_id),
     }
 }
