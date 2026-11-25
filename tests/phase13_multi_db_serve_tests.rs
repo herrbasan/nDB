@@ -592,7 +592,8 @@ fn crud_prefix_mget_patch_restore_and_query() {
     );
     assert_eq!(status, 400);
 
-    // Full-text belongs to nVDB: neither the index type nor the route exists.
+    // Full-text belongs to nVDB for *advanced* search; NDB's standalone
+    // contract (spec §7, Phase 4A) now owns a basic lexical `/search` route.
     let (status, body) = post(
         p,
         "/v2/dbs/workshop/index",
@@ -600,12 +601,16 @@ fn crud_prefix_mget_patch_restore_and_query() {
     );
     assert_eq!(status, 400, "{}", body);
     assert_eq!(body["error"], "invalid_index_type");
-    let (status, _) = post(
+    let (status, body) = post(
         p,
         "/v2/dbs/workshop/search",
         &json!({"field": "name", "queries": [{"type": "term", "value": "dave"}]}),
     );
-    assert_eq!(status, 404, "/search is gone; nVDB owns full-text");
+    assert_eq!(
+        status, 400,
+        "/search exists now and requires its `text` argument: {body}"
+    );
+    assert_eq!(body["error"], "text_required");
 
     // flush is a synchronous no-drama call.
     let (status, body) = post(p, "/v2/dbs/workshop/flush", &json!({}));

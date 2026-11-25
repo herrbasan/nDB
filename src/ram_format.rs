@@ -151,6 +151,81 @@ impl IndexKind {
 
 // ─── Manifest ───────────────────────────────────────────────────────────────
 
+/// One declared field of the shared field-and-index mapping (spec §3).
+///
+/// A field may carry several capabilities. `hash` asks for exact equality /
+/// membership, `ordered` for ranges and sorting, `text` marks it for the
+/// standalone lexical search, and `project` mirrors the field into an nVDB read
+/// projection when that engine is used.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FieldMapping {
+    /// Field name (dot paths resolve like every other field reference).
+    pub field: String,
+    /// Exact equality and membership lookups.
+    #[serde(default)]
+    pub hash: bool,
+    /// Ranges and sorting.
+    #[serde(default)]
+    pub ordered: bool,
+    /// Included in standalone text search.
+    #[serde(default)]
+    pub text: bool,
+    /// Copied into an nVDB read projection.
+    #[serde(default)]
+    pub project: bool,
+}
+
+impl FieldMapping {
+    /// A mapping entry for `field` with no capability declared yet.
+    pub fn new(field: impl Into<String>) -> Self {
+        FieldMapping {
+            field: field.into(),
+            hash: false,
+            ordered: false,
+            text: false,
+            project: false,
+        }
+    }
+
+    /// The index structure this entry requires, if any.
+    ///
+    /// A field declaring both capabilities is backed by **one** BTree index:
+    /// a BTree answers equality lookups and range scans, so two structures
+    /// would only cost memory and split a single field across two maps.
+    pub fn index_kind(&self) -> Option<IndexKind> {
+        if self.ordered {
+            Some(IndexKind::BTree)
+        } else if self.hash {
+            Some(IndexKind::Hash)
+        } else {
+            None
+        }
+    }
+
+    /// Capability bits, as persisted in a `SetFieldMapping` WAL frame.
+    fn flags(&self) -> u8 {
+        u8::from(self.hash)
+            | (u8::from(self.ordered) << 1)
+            | (u8::from(self.text) << 2)
+            | (u8::from(self.project) << 3)
+    }
+
+    /// Parse capability bits; `None` for a bit this build does not know.
+    fn from_flags(field: String, flags: u8) -> Option<Self> {
+        if flags & !0b1111 != 0 {
+            return None;
+        }
+        Some(FieldMapping {
+            field,
+            hash: flags & 0b0001 != 0,
+            ordered: flags & 0b0010 != 0,
+            text: flags & 0b0100 != 0,
+            project: flags & 0b1000 != 0,
+        })
+    }
+}
+
 /// The generation and lineage authority of a v3 database folder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,6 +247,14 @@ pub struct RamManifest {
     pub min_available_seq: u64,
     /// Persisted secondary index declarations.
     pub indexes: Vec<IndexSpec>,
+    /// Whether the standard classification profile (`domain` + `categories`)
+    /// is enforced on every application write. Absent in older manifests =
+    /// `false`, so every existing database keeps its current contract.
+    #[serde(default)]
+    pub classification_profile: bool,
+    /// The shared field-and-index mapping. Absent in older manifests = empty.
+    #[serde(default)]
+    pub field_mapping: Vec<FieldMapping>,
 }
 
 /// Read and strictly validate `manifest.json` from `dir`.
@@ -250,6 +333,43 @@ fn validate_manifest(manifest: &RamManifest, path: &Path) -> Result<()> {
                 path,
                 format!("manifest declares index {:?} twice", spec.field),
             ));
+        }
+    }
+    let mut mapped: BTreeSet<&str> = BTreeSet::new();
+    for entry in &manifest.field_mapping {
+        if entry.field.is_empty() {
+            return Err(Error::corruption(
+                path,
+                "manifest declares a field mapping with an empty field name",
+            ));
+        }
+        if !mapped.insert(entry.field.as_str()) {
+            return Err(Error::corruption(
+                path,
+                format!("manifest declares field mapping {:?} twice", entry.field),
+            ));
+        }
+    }
+    if manifest.classification_profile {
+        for required in ["domain", "categories"] {
+            let entry = manifest
+                .field_mapping
+                .iter()
+                .find(|entry| entry.field == required);
+            if !entry.map_or(false, |entry| entry.hash) {
+                return Err(Error::corruption(
+                    path,
+                    format!(
+                        "classification profile is enabled but field mapping does not declare {required:?} with hash: true"
+                    ),
+                ));
+            }
+            if !manifest.indexes.iter().any(|spec| spec.field == required) {
+                return Err(Error::corruption(
+                    path,
+                    format!("classification profile is enabled but {required:?} has no index"),
+                ));
+            }
         }
     }
     Ok(())
@@ -669,6 +789,16 @@ pub enum RamWalOp {
         /// Indexed field.
         field: String,
     },
+    /// Enable or disable the standard classification profile. Schema-only.
+    SetClassificationProfile {
+        /// Whether `domain`/`categories` are enforced from now on.
+        enabled: bool,
+    },
+    /// Replace the shared field-and-index mapping. Schema-only.
+    SetFieldMapping {
+        /// The complete mapping, in declaration order.
+        mapping: Vec<FieldMapping>,
+    },
 }
 
 impl RamWalOp {
@@ -681,12 +811,20 @@ impl RamWalOp {
             RamWalOp::Restore { .. } => 5,
             RamWalOp::IndexAdd { .. } => 6,
             RamWalOp::IndexDrop { .. } => 7,
+            RamWalOp::SetClassificationProfile { .. } => 9,
+            RamWalOp::SetFieldMapping { .. } => 10,
         }
     }
 
     /// Whether this operation consumes a document sequence number.
     pub fn consumes_seq(&self) -> bool {
-        !matches!(self, RamWalOp::IndexAdd { .. } | RamWalOp::IndexDrop { .. })
+        !matches!(
+            self,
+            RamWalOp::IndexAdd { .. }
+                | RamWalOp::IndexDrop { .. }
+                | RamWalOp::SetClassificationProfile { .. }
+                | RamWalOp::SetFieldMapping { .. }
+        )
     }
 }
 
@@ -775,6 +913,22 @@ impl RamWalRecord {
         }
     }
 
+    /// A `SetClassificationProfile` (no document sequence).
+    pub fn set_classification_profile(enabled: bool) -> Self {
+        RamWalRecord {
+            seq: 0,
+            op: RamWalOp::SetClassificationProfile { enabled },
+        }
+    }
+
+    /// A `SetFieldMapping` (no document sequence).
+    pub fn set_field_mapping(mapping: Vec<FieldMapping>) -> Self {
+        RamWalRecord {
+            seq: 0,
+            op: RamWalOp::SetFieldMapping { mapping },
+        }
+    }
+
     /// Encoded size of this record's op payload in bytes — the number of bytes
     /// [`encode_op_payload`] writes for it.
     ///
@@ -791,6 +945,13 @@ impl RamWalRecord {
             }
             RamWalOp::IndexAdd { field, .. } => 4 + field.len() + 1,
             RamWalOp::IndexDrop { field } => 4 + field.len(),
+            RamWalOp::SetClassificationProfile { .. } => 1,
+            RamWalOp::SetFieldMapping { mapping } => {
+                4 + mapping
+                    .iter()
+                    .map(|entry| 4 + entry.field.len() + 1)
+                    .sum::<usize>()
+            }
         }
     }
 }
@@ -902,6 +1063,26 @@ fn encode_op_payload(op: &RamWalOp) -> Result<Vec<u8>> {
             out.push(kind.tag());
         }
         RamWalOp::IndexDrop { field } => put_str(&mut out, field, "index field")?,
+        RamWalOp::SetClassificationProfile { enabled } => out.push(u8::from(*enabled)),
+        RamWalOp::SetFieldMapping { mapping } => {
+            if mapping.len() > u32::MAX as usize {
+                return Err(Error::invalid_arg("field mapping exceeds u32 entries"));
+            }
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            for entry in mapping {
+                if !seen.insert(entry.field.as_str()) {
+                    return Err(Error::invalid_arg(format!(
+                        "field mapping declares {:?} twice",
+                        entry.field
+                    )));
+                }
+            }
+            out.extend_from_slice(&(mapping.len() as u32).to_le_bytes());
+            for entry in mapping {
+                put_str(&mut out, &entry.field, "field mapping field")?;
+                out.push(entry.flags());
+            }
+        }
     }
     Ok(out)
 }
@@ -1119,6 +1300,36 @@ fn decode_op(tag: u8, payload: &[u8], path: &Path, frame_offset: u64) -> Result<
         7 => RamWalOp::IndexDrop {
             field: reader.string("index field")?,
         },
+        9 => {
+            let enabled = reader.u8("classification profile enabled")?;
+            match enabled {
+                0 => RamWalOp::SetClassificationProfile { enabled: false },
+                1 => RamWalOp::SetClassificationProfile { enabled: true },
+                other => {
+                    return Err(reader.fail(&format!(
+                        "classification profile flag is {other}, expected 0 or 1"
+                    )))
+                }
+            }
+        }
+        10 => {
+            let count = reader.u32("field mapping count")? as usize;
+            let mut mapping = Vec::with_capacity(count.min(1024));
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            for _ in 0..count {
+                let field = reader.string("field mapping field")?;
+                if !seen.insert(field.clone()) {
+                    return Err(reader.fail(&format!(
+                        "field mapping repeats field {field:?}"
+                    )));
+                }
+                let flags = reader.u8("field mapping flags")?;
+                let entry = FieldMapping::from_flags(field, flags)
+                    .ok_or_else(|| reader.fail(&format!("unknown field mapping flags {flags:#04x}")))?;
+                mapping.push(entry);
+            }
+            RamWalOp::SetFieldMapping { mapping }
+        }
         other => return Err(reader.fail(&format!("unknown WAL op tag {other}"))),
     };
     reader.finish("WAL frame payload")?;
@@ -2013,6 +2224,8 @@ mod tests {
                 field: "tag".to_string(),
                 kind: IndexKind::Hash,
             }],
+            classification_profile: false,
+            field_mapping: Vec::new(),
         }
     }
 
@@ -2191,6 +2404,21 @@ mod tests {
             RamWalRecord::restore(start + 4, "b", br#"{"n":2}"#.to_vec()),
             RamWalRecord::index_add("tag", IndexKind::BTree),
             RamWalRecord::index_drop("legacy"),
+            RamWalRecord::set_classification_profile(true),
+            RamWalRecord::set_field_mapping(vec![
+                FieldMapping {
+                    field: "domain".to_string(),
+                    hash: true,
+                    ..FieldMapping::default()
+                },
+                FieldMapping {
+                    field: "categories".to_string(),
+                    hash: true,
+                    ordered: true,
+                    text: true,
+                    project: true,
+                },
+            ]),
         ]
     }
 
@@ -2648,8 +2876,7 @@ mod tests {
     // ── Manifest ──────────────────────────────────────────────────────────
 
     #[test]
-    fn manifest_round_trips_including_pending_wal_gen() {
-        let dir = temp_dir();
+    fn manifest_round_trips_including_pending_wal_gen() {        let dir = temp_dir();
         let mut value = manifest();
         write_ram_manifest_atomic(dir.path(), &value, &RealIo).expect("write");
         assert_eq!(read_ram_manifest(dir.path()).expect("read"), value);
@@ -2693,6 +2920,49 @@ mod tests {
     }
 
     #[test]
+    fn manifest_without_phase4a_fields_parses_as_defaults() {
+        // A live v3 `manifest.json` written before the standalone contract has
+        // neither field; it must open unchanged (the six migrated production
+        // databases depend on this).
+        let legacy = r#"{
+            "version": 3,
+            "source_epoch_uuid": "6f1c5c1e-0000-4000-8000-000000000009",
+            "base_gen": 2,
+            "wal_gen": 2,
+            "last_seq": 41,
+            "min_available_seq": 3,
+            "indexes": [{"field": "tag", "kind": "hash"}]
+        }"#;
+        let parsed: RamManifest = serde_json::from_str(legacy).expect("legacy manifest parses");
+        assert!(!parsed.classification_profile);
+        assert!(parsed.field_mapping.is_empty());
+        assert_eq!(parsed.last_seq, 41);
+
+        // Both fields survive a full round trip.
+        let mut value = manifest();
+        value.field_mapping = vec![FieldMapping {
+            field: "title".to_string(),
+            text: true,
+            project: true,
+            ..FieldMapping::default()
+        }];
+        let text = serde_json::to_string(&value).expect("serialize");
+        let back: RamManifest = serde_json::from_str(&text).expect("deserialize");
+        assert_eq!(back, value);
+
+        // An enabled profile without its two indexes is corruption, not a
+        // silent half-configured database.
+        let path = PathBuf::from("manifest.json");
+        let mut broken = manifest();
+        broken.classification_profile = true;
+        let error = validate_manifest(&broken, &path).expect_err("enabled without mapping");
+        assert!(
+            error.to_string().contains("field mapping"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn manifest_rejects_pending_equal_to_the_live_wal() {
         let dir = temp_dir();
         let mut value = manifest();
@@ -2732,6 +3002,8 @@ mod tests {
                 field: "tag".to_string(),
                 kind: IndexKind::Hash,
             }],
+            classification_profile: false,
+            field_mapping: Vec::new(),
         };
         write_ram_manifest_atomic(dir.path(), &manifest, &RealIo).expect("manifest");
         (dir, manifest)

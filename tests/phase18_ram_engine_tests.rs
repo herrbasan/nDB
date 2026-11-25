@@ -616,6 +616,7 @@ fn offset_without_limit_is_honoured() {
                 sort_by: Some(("score".to_string(), SortDir::Asc)),
                 offset: Some(2),
                 limit: None,
+                ..QueryOptions::default()
             },
         )
         .expect("query");

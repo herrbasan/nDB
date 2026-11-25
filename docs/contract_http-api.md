@@ -195,15 +195,136 @@ components; percent-decoding applies to query strings (`+` = space, malformed
 - `sort` requires `field`; `dir` ∈ `asc | desc` (default `asc`). Bad values →
   `400 invalid_query`.
 - `limit` absent → `default_limit`; `limit > max_limit` → `400 invalid_query`.
-  **`offset` is applied after sorting.** (Known v2 defect, herrbasan/nDB#15:
-  with no `sort` and no `limit`, `offset` is ignored — see
-  `tests/refdb_oracle_tests.rs`.)
+  **`offset` is applied after sorting**, with or without a `limit`
+  (herrbasan/nDB#15).
 - Without `fields`: raw, pre-serialized documents are streamed:
-  `{"ok":true,"total":N,"count":M,"results":[…],"took_ms":x}`.
+  `{"ok":true,"total":N,"count":M,"results":[…],"took_ms":x,
+  "scanned_docs":S,"used_indexes":[…],"next_cursor":null|"…"}`.
 - With `fields`: `_id` is always included in each projected document.
 
+#### Phase 4A additions (all optional, strictly additive)
+
+```json
+{
+  "filter": {"domain": "work"},
+  "sort_keys": [
+    {"field": "score", "dir": "desc", "missing": "first"},
+    {"field": "title", "dir": "asc"}
+  ],
+  "cursor": "ndbc1:…",
+  "text": {"query": "\"rust belt\" caching", "fields": ["title", "body"]},
+  "max_scan_docs": 5000,
+  "limit": 50
+}
+```
+
+- **`sort_keys`** is a deterministic multi-key order; a final `_id` **ascending**
+  tie-breaker is always appended, so the order is total and pagination is
+  stable. `missing` ∈ `first | last` (default `last`) is absolute — it is not
+  reversed by `desc`. `sort_keys` supersedes `sort`; `sort` keeps its exact
+  legacy behaviour (a missing field sorts as JSON `null`).
+- **`cursor`** is the opaque `next_cursor` of the previous page (an
+  `ndbc1:`-prefixed hex payload holding the last sort-key tuple and `_id`).
+  A cursor and a non-zero `offset` cannot be combined (`400 invalid_query`), and
+  a cursor whose key count disagrees with the order is refused. With no
+  `sort_keys`/`sort` the order is `_id` ascending.
+- **`text`** is a standalone lexical query: whitespace separates terms,
+  `"quoted text"` is a phrase, every term **and** every phrase must match
+  (case-insensitive) in at least one searched string field.
+  `fields` absent → the mapping's `text: true` fields, else every
+  string-valued application field (`_id` excluded unless named).
+  An unterminated quote or an empty query is `400 invalid_argument`.
+- **`max_scan_docs`** is a mandatory scan budget: exceeding it aborts the scan
+  and answers `422 scan_budget_exceeded` (`{scanned,max_scan}`), never a
+  truncated page.
+- **`scanned_docs`** is the number of documents the execution path examined,
+  **`used_indexes`** the indexed fields that actually narrowed the scan (empty =
+  full scan), **`next_cursor`** the continuation token (`null` when the page is
+  the last one).
+
+`{"categories": "rust"}` on a profile-enabled database matches by **array
+membership** (the object is tagged `rust`); an array operand still means the
+whole array. Every other field keeps exact `$eq` semantics.
+
 Errors: `400 invalid_filter | invalid_query | empty_body | invalid_json`,
-`500 internal_error`.
+`422 scan_budget_exceeded`, `500 internal_error`.
+
+### 3.1a `POST /v2/dbs/{name}/search`
+
+The same body and the same response envelope as `…/query`, with `text`
+**required** (`400 text_required` when absent). It is the convenience alias for
+lexical search; everything else — `filter`, `sort`/`sort_keys`, `fields`,
+`offset`, `limit`, `cursor`, `max_scan_docs` — behaves identically.
+
+### 3.1b `GET`/`PUT /v2/dbs/{name}/schema`
+
+```json
+GET  → {"ok":true,"schema":{"classification_profile":false,
+        "field_mapping":[{"field":"score","hash":true,"ordered":true,
+                          "text":false,"project":false}],
+        "indexes":[{"field":"score","kind":"btree"}]}}
+
+PUT  ← {"field_mapping":[{"field":"score","hash":true,"ordered":true},
+                         {"field":"title","text":true,"project":true}]}
+```
+
+- `hash: true` ensures a Hash index; `ordered: true` ensures a BTree index. A
+  field declaring **both** is backed by one BTree, which answers equality and
+  ranges. A mapping entry declaring neither drops any index on the field it
+  names; fields outside the mapping keep their indexes.
+- The mapping persists (manifest + WAL) and drives `text` search defaults.
+- `PUT` while the classification profile is enabled must keep `domain` and
+  `categories` indexed; dropping either is `400 invalid_argument`.
+- Both routes require a v3 (RAM-first) database (`400 invalid_argument`
+  otherwise).
+- Errors: `400 invalid_request` (bad entry/body), `400 invalid_argument`,
+  `500 internal_error`.
+
+### 3.1c `POST /v2/dbs/{name}/profile/classification`
+
+```json
+{"enabled": true, "backfill_empty": true}
+```
+
+The explicit migration for the standard classification profile (spec §2). Every
+live document must carry `domain: string` and `categories: string[]`
+(empty = uncategorized; entries are non-empty and deduplicated).
+
+- Inspects every live document **first**: wrong-shaped fields →
+  `400 invalid_argument`, nothing mutated.
+- Missing fields with `backfill_empty` absent/false → `400 invalid_argument`
+  naming how many documents lack which field.
+- `backfill_empty: true` durably backfills `domain: ""` / `categories: []` (and
+  deduplicates existing `categories`) in one commit, then builds both indexes
+  and records both mapping entries.
+- `enabled: false` is refused (`400 invalid_request`): the profile is a durable
+  contract choice, not a toggle. Enabling an already-enabled profile is
+  `400 invalid_argument`.
+- Success: `200 {"ok":true,"schema":{…}}` (the shape above).
+
+### 3.1d `POST /v2/dbs/{name}/doc/{id}/peek`
+
+`seq`-pinned partial retrieval (`peek_item` / `read_more`).
+
+```json
+{"fields": ["meta.author"], "text_ranges": [{"path": "text", "offset": 0, "limit": 200}],
+ "array_slices": [{"path": "messages", "offset": 100, "limit": 50}],
+ "expected_seq": 412}
+```
+
+`200 {"ok":true,"id":"…","seq":412,"doc":{…},"ranges":{…}}` where each applied
+range reports `{"offset","returned","total","has_more","next_offset"}`.
+
+- `text_ranges` offsets count **Unicode scalar values** (`char`s) — never bytes
+  and never model tokens; `array_slices` count array elements. A page that
+  reports `has_more` continues at `next_offset`.
+- Any path named by a range is always included in `doc`, even with `fields`.
+  Missing paths simply yield no range entry; a range on the wrong type is
+  `400 invalid_argument`.
+- `expected_seq` pins the read: a document that moved answers
+  `409 conflict` with its `current_seq`, so pages never mix versions.
+- Errors: `404 not_found`, `409 conflict`, `400 invalid_argument |
+  invalid_request`.
 
 ### 3.2 `POST /v2/dbs/{name}/find`
 

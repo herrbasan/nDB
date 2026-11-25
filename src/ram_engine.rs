@@ -33,19 +33,20 @@ use crate::io::Io;
 use crate::ram_format::{
     base_file_path, ram_manifest_path, read_ram_base_file, read_ram_manifest, scan_ram_wal,
     truncate_ram_wal_tail, wal_file_name, wal_file_path, write_ram_base_file,
-    write_ram_manifest_atomic, IndexKind, IndexSpec, RamManifest, RamWalOp, RamWalPatchOp,
-    RamWalRecord, RamWalScan, RamWalWriter, RAM_STORAGE_VERSION,
+    write_ram_manifest_atomic, FieldMapping, IndexKind, IndexSpec, RamManifest, RamWalOp,
+    RamWalPatchOp, RamWalRecord, RamWalScan, RamWalWriter, RAM_STORAGE_VERSION,
 };
 use crate::report;
 use crate::storage::{self, ChangeBatch, ChangeEvent, ChangeKind, Snapshot, SourceLineage};
 use crate::{
     id, index_keys, ordered_key_bytes, ordered_value, plan_candidates, validate_query_ast,
-    ApplyOpsResult, BTreeIndex, DbLock, HashIndex, IndexAccess, KeyBound, OrderedValue, PatchOp,
-    QueryOptions, SortDir, INDEX_ENTRY_COST,
+    ApplyOpsResult, BTreeIndex, DbLock, DbSchema, HashIndex, IndexAccess, KeyBound,
+    MissingPlacement, OrderedValue, PatchOp, PeekRequest, PeekResponse, QueryOptions,
+    QueryPageMeta, RangeMeta, SortDir, SortKey, TextQuery, INDEX_ENTRY_COST,
 };
 use parking_lot::{Condvar, Mutex, RwLock};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -411,6 +412,15 @@ enum Job {
         id: String,
         doc: Value,
     },
+    /// Enable the classification profile, optionally backfilling every document
+    /// that omits `domain`/`categories`, in ONE durable commit.
+    EnableClassification {
+        backfill_empty: bool,
+    },
+    /// Replace the shared field-and-index mapping (schema-only).
+    SetFieldMapping {
+        mapping: Vec<FieldMapping>,
+    },
 }
 
 struct QueuedJob {
@@ -456,12 +466,22 @@ enum PubOp {
     },
 }
 
+/// One staged schema mutation, applied to the manifest and the index set in the
+/// same publication that made its WAL record durable.
+enum SchemaChange {
+    ClassificationProfile(bool),
+    FieldMapping(Vec<FieldMapping>),
+    IndexAdd { field: String, kind: IndexKind },
+    IndexDrop { field: String },
+}
+
 /// The staged view of one batch: an overlay of not-yet-committed documents, the
 /// WAL records they produce, and the RAM mutations waiting for the fsync.
 struct Stage {
     overlay: HashMap<String, Option<Arc<DocRecord>>>,
     records: Vec<RamWalRecord>,
     pubs: Vec<PubOp>,
+    schema: Vec<SchemaChange>,
     next_seq: u64,
     live_delta: isize,
     ring_add_bytes: usize,
@@ -473,10 +493,27 @@ impl Stage {
             overlay: HashMap::new(),
             records: Vec::new(),
             pubs: Vec::new(),
+            schema: Vec::new(),
             next_seq: start_seq,
             live_delta: 0,
             ring_add_bytes: 0,
         }
+    }
+
+    /// Stage one schema record: durable in this batch, applied on publication.
+    fn push_schema(&mut self, record: RamWalRecord, change: SchemaChange) {
+        self.records.push(record);
+        self.schema.push(change);
+    }
+
+    /// Whether the classification profile governs jobs in this stage: already
+    /// committed, or enabled earlier in this same batch.
+    fn profile_enabled(&self, state: &RamState) -> bool {
+        state.manifest.classification_profile
+            || self
+                .schema
+                .iter()
+                .any(|change| matches!(change, SchemaChange::ClassificationProfile(true)))
     }
 
     fn current(&self, state: &RamState, id: &str) -> Option<Arc<DocRecord>> {
@@ -515,6 +552,9 @@ impl Stage {
 
     /// Run one job against the current state plus everything staged before it.
     fn run(&mut self, state: &RamState, job: &Job) -> Result<Reply> {
+        // The flag a job must honour: an `EnableClassification` staged earlier
+        // in this same batch already governs everything after it.
+        let profile = self.profile_enabled(state);
         match job {
             Job::Insert { doc, prefix } => {
                 let overlay = &self.overlay;
@@ -533,6 +573,9 @@ impl Stage {
                     .ok_or_else(|| Error::invalid_arg("document must be a JSON object"))?;
                 object.insert("_id".to_string(), Value::String(new_id.clone()));
                 object.remove(storage::SEQ_FIELD);
+                if profile {
+                    docval::enforce_classification_value(&mut doc)?;
+                }
                 let seq = self.take_seq();
                 let json = serde_json::to_vec(&doc)?;
                 let record =
@@ -565,6 +608,9 @@ impl Stage {
                     .ok_or_else(|| Error::invalid_arg("document must be a JSON object"))?;
                 object.insert("_id".to_string(), Value::String(doc_id.clone()));
                 object.remove(storage::SEQ_FIELD);
+                if profile {
+                    docval::enforce_classification_value(&mut doc)?;
+                }
                 let seq = self.take_seq();
                 let json = serde_json::to_vec(&doc)?;
                 let record =
@@ -589,14 +635,18 @@ impl Stage {
                 if !applied {
                     return Ok(Reply::Applied(false));
                 }
+                let (next, delta, mut wal_ops) = Stage::classify_patch(
+                    profile,
+                    next,
+                    delta,
+                    vec![RamWalPatchOp::set(path, serde_json::to_vec(value)?)],
+                )?;
+                if profile && docval::eq_docval(&old.doc, &next) {
+                    return Ok(Reply::Applied(false));
+                }
                 let seq = self.take_seq();
                 let record = DocRecord::with_delta(&old, seq, next, delta);
-                let value_json = serde_json::to_vec(value)?;
-                let wal = RamWalRecord::patch(
-                    seq,
-                    doc_id.clone(),
-                    vec![RamWalPatchOp::set(path, value_json)],
-                );
+                let wal = RamWalRecord::patch(seq, doc_id.clone(), std::mem::take(&mut wal_ops));
                 let ring_bytes = patch_event_bytes(&record, &wal);
                 self.stage_put(state, record, wal, ring_bytes);
                 Ok(Reply::Applied(true))
@@ -609,9 +659,18 @@ impl Stage {
                 if !applied {
                     return Ok(Reply::Applied(false));
                 }
+                let (next, delta, mut wal_ops) = Stage::classify_patch(
+                    profile,
+                    next,
+                    delta,
+                    vec![RamWalPatchOp::remove(path)],
+                )?;
+                if profile && docval::eq_docval(&old.doc, &next) {
+                    return Ok(Reply::Applied(false));
+                }
                 let seq = self.take_seq();
                 let record = DocRecord::with_delta(&old, seq, next, delta);
-                let wal = RamWalRecord::patch(seq, doc_id.clone(), vec![RamWalPatchOp::remove(path)]);
+                let wal = RamWalRecord::patch(seq, doc_id.clone(), std::mem::take(&mut wal_ops));
                 let ring_bytes = patch_event_bytes(&record, &wal);
                 self.stage_put(state, record, wal, ring_bytes);
                 Ok(Reply::Applied(true))
@@ -629,14 +688,18 @@ impl Stage {
                 if !applied {
                     return Ok(Reply::Applied(false));
                 }
+                let (next, delta, mut wal_ops) = Stage::classify_patch(
+                    profile,
+                    next,
+                    delta,
+                    vec![RamWalPatchOp::array_push(field, serde_json::to_vec(value)?)],
+                )?;
+                if profile && docval::eq_docval(&old.doc, &next) {
+                    return Ok(Reply::Applied(false));
+                }
                 let seq = self.take_seq();
                 let record = DocRecord::with_delta(&old, seq, next, delta);
-                let value_json = serde_json::to_vec(value)?;
-                let wal = RamWalRecord::patch(
-                    seq,
-                    doc_id.clone(),
-                    vec![RamWalPatchOp::array_push(field, value_json)],
-                );
+                let wal = RamWalRecord::patch(seq, doc_id.clone(), std::mem::take(&mut wal_ops));
                 let ring_bytes = patch_event_bytes(&record, &wal);
                 self.stage_put(state, record, wal, ring_bytes);
                 Ok(Reply::Applied(true))
@@ -700,6 +763,8 @@ impl Stage {
                     wal_ops.push(wal_op);
                     applied.push(true);
                 }
+                let (tree, total_delta, wal_ops) =
+                    Stage::classify_patch(profile, tree, total_delta, wal_ops)?;
                 let seq = self.take_seq();
                 let record = DocRecord::with_delta(&old, seq, Arc::clone(&tree), total_delta);
                 let doc_value = tree.to_value();
@@ -738,6 +803,9 @@ impl Stage {
                     .ok_or_else(|| Error::invalid_arg("document must be a JSON object"))?;
                 object.insert("_id".to_string(), Value::String(doc_id.clone()));
                 object.remove(storage::SEQ_FIELD);
+                if profile {
+                    docval::enforce_classification_value(&mut doc)?;
+                }
                 let seq = self.take_seq();
                 let json = serde_json::to_vec(&doc)?;
                 let record =
@@ -747,7 +815,233 @@ impl Stage {
                 self.stage_put(state, record, wal, ring_bytes);
                 Ok(Reply::Unit)
             }
+            Job::EnableClassification { backfill_empty } => {
+                self.enable_classification(state, *backfill_empty)
+            }
+            Job::SetFieldMapping { mapping } => self.set_field_mapping(state, mapping),
         }
+    }
+
+    /// Validate one written document against the classification profile and
+    /// deduplicate its `categories`, appending the extra WAL op that makes the
+    /// deduplication survive replay.
+    fn classify_patch(
+        profile: bool,
+        next: Arc<DocVal>,
+        delta: isize,
+        mut wal_ops: Vec<RamWalPatchOp>,
+    ) -> Result<(Arc<DocVal>, isize, Vec<RamWalPatchOp>)> {
+        if !profile {
+            return Ok((next, delta, wal_ops));
+        }
+        let (tree, dedupe_delta, deduped) = docval::enforce_classification_tree(&next)?;
+        if let Some(categories) = deduped {
+            wal_ops.push(RamWalPatchOp::set(
+                docval::CATEGORIES_FIELD,
+                serde_json::to_vec(&categories.to_value())?,
+            ));
+        }
+        Ok((tree, delta + dedupe_delta, wal_ops))
+    }
+
+    /// Enable the profile, backfilling `domain: ""` / `categories: []` on every
+    /// document that omits them — all in the batch this job belongs to.
+    fn enable_classification(&mut self, state: &RamState, backfill_empty: bool) -> Result<Reply> {
+        if self.profile_enabled(state) {
+            return Err(Error::invalid_arg(
+                "the classification profile is already enabled",
+            ));
+        }
+        let mut missing_domain = 0usize;
+        let mut missing_categories = 0usize;
+        let mut audit_failures: Vec<String> = Vec::new();
+        let mut backfills: Vec<(Arc<DocRecord>, Option<Value>, Option<Value>)> = Vec::new();
+
+        // The migration sees everything that will be live after this batch:
+        // committed documents plus documents an earlier job staged.
+        let mut subjects: Vec<String> = state.docs.keys().map(|id| id.to_string()).collect();
+        for (id, staged) in &self.overlay {
+            if staged.is_some() {
+                subjects.push(id.clone());
+            }
+        }
+        subjects.sort();
+        subjects.dedup();
+
+        for id in subjects {
+            let Some(record) = self.current(state, &id) else {
+                continue;
+            };
+            let audit = match docval::audit_classification(&record.doc) {
+                Ok(audit) => audit,
+                Err(Error::InvalidArgument { reason }) => {
+                    audit_failures.push(format!("document {id:?}: {reason}"));
+                    continue;
+                }
+                Err(other) => return Err(other),
+            };
+            if audit.missing_domain {
+                missing_domain += 1;
+            }
+            if audit.missing_categories {
+                missing_categories += 1;
+            }
+            let domain = audit.missing_domain.then(|| Value::String(String::new()));
+            let categories = match (audit.missing_categories, audit.deduped_categories) {
+                (true, _) => Some(Value::Array(Vec::new())),
+                (false, Some(categories)) => Some(categories.to_value()),
+                (false, None) => None,
+            };
+            if domain.is_some() || categories.is_some() {
+                backfills.push((record, domain, categories));
+            }
+        }
+
+        if !audit_failures.is_empty() {
+            return Err(Error::invalid_arg(format!(
+                "cannot enable the classification profile: {} document(s) have a wrong-shaped domain/categories: {}",
+                audit_failures.len(),
+                audit_failures.join("; ")
+            )));
+        }
+        if !backfill_empty && (missing_domain > 0 || missing_categories > 0) {
+            return Err(Error::invalid_arg(format!(
+                "cannot enable the classification profile: {} document(s) lack 'domain' and {} lack 'categories'; pass backfill_empty: true to backfill the empty/uncategorized value",
+                missing_domain, missing_categories
+            )));
+        }
+
+        // The backfill is part of this batch: one fsync covers every document.
+        for (old, domain, categories) in backfills {
+            let mut tree = Arc::clone(&old.doc);
+            let mut delta = 0isize;
+            let mut wal_ops = Vec::new();
+            for (field, value) in [
+                (docval::DOMAIN_FIELD, domain),
+                (docval::CATEGORIES_FIELD, categories),
+            ] {
+                let Some(value) = value else { continue };
+                let (next, applied, step_delta) =
+                    docval::set_path(&tree, field, DocVal::from_value(&value))?;
+                debug_assert!(applied, "a backfilled classification field always differs");
+                delta += step_delta;
+                tree = next;
+                wal_ops.push(RamWalPatchOp::set(field, serde_json::to_vec(&value)?));
+            }
+            let seq = self.take_seq();
+            let record = DocRecord::with_delta(&old, seq, tree, delta);
+            let wal = RamWalRecord::patch(seq, old.id.to_string(), wal_ops);
+            let ring_bytes = patch_event_bytes(&record, &wal);
+            self.stage_put(state, record, wal, ring_bytes);
+        }
+
+        // Enabling owns both indexes and both mapping entries (spec §2, §3).
+        let mut mapping = state.manifest.field_mapping.clone();
+        for field in [docval::DOMAIN_FIELD, docval::CATEGORIES_FIELD] {
+            match mapping.iter_mut().find(|entry| entry.field == field) {
+                Some(entry) => entry.hash = true,
+                None => {
+                    let mut entry = FieldMapping::new(field);
+                    entry.hash = true;
+                    mapping.push(entry);
+                }
+            }
+        }
+        self.push_schema(
+            RamWalRecord::set_classification_profile(true),
+            SchemaChange::ClassificationProfile(true),
+        );
+        for field in [docval::DOMAIN_FIELD, docval::CATEGORIES_FIELD] {
+            if !state.manifest.indexes.iter().any(|spec| spec.field == field) {
+                self.push_schema(
+                    RamWalRecord::index_add(field, IndexKind::Hash),
+                    SchemaChange::IndexAdd {
+                        field: field.to_string(),
+                        kind: IndexKind::Hash,
+                    },
+                );
+            }
+        }
+        self.push_schema(
+            RamWalRecord::set_field_mapping(mapping.clone()),
+            SchemaChange::FieldMapping(mapping),
+        );
+        Ok(Reply::Unit)
+    }
+
+    /// Replace the shared field mapping, creating/dropping the indexes it
+    /// declares. Declarative for the fields it names; other indexes are kept.
+    fn set_field_mapping(&mut self, state: &RamState, mapping: &[FieldMapping]) -> Result<Reply> {
+        let mut seen: Vec<&str> = Vec::with_capacity(mapping.len());
+        for entry in mapping {
+            if entry.field.is_empty() {
+                return Err(Error::invalid_arg(
+                    "field mapping entries must name a field",
+                ));
+            }
+            if seen.contains(&entry.field.as_str()) {
+                return Err(Error::invalid_arg(format!(
+                    "field mapping declares {:?} twice",
+                    entry.field
+                )));
+            }
+            seen.push(entry.field.as_str());
+        }
+        if self.profile_enabled(state) {
+            for field in [docval::DOMAIN_FIELD, docval::CATEGORIES_FIELD] {
+                let declared = mapping
+                    .iter()
+                    .find(|entry| entry.field == field)
+                    .map_or(false, |entry| entry.hash || entry.ordered);
+                if !declared {
+                    return Err(Error::invalid_arg(format!(
+                        "the classification profile is enabled: the field mapping must keep {field:?} indexed (hash: true)"
+                    )));
+                }
+            }
+        }
+
+        let mut drops: Vec<String> = Vec::new();
+        let mut additions: Vec<(String, IndexKind)> = Vec::new();
+        for entry in mapping {
+            match entry.index_kind() {
+                Some(kind) => match state.indexes.get(&entry.field) {
+                    Some(existing) if existing.kind() == kind => {}
+                    Some(_) => {
+                        drops.push(entry.field.clone());
+                        additions.push((entry.field.clone(), kind));
+                    }
+                    None => additions.push((entry.field.clone(), kind)),
+                },
+                None => {
+                    if state.indexes.contains_key(&entry.field) {
+                        drops.push(entry.field.clone());
+                    }
+                }
+            }
+        }
+
+        for field in &drops {
+            self.push_schema(
+                RamWalRecord::index_drop(field),
+                SchemaChange::IndexDrop { field: field.clone() },
+            );
+        }
+        for (field, kind) in &additions {
+            self.push_schema(
+                RamWalRecord::index_add(field, *kind),
+                SchemaChange::IndexAdd {
+                    field: field.clone(),
+                    kind: *kind,
+                },
+            );
+        }
+        let mapping = mapping.to_vec();
+        self.push_schema(
+            RamWalRecord::set_field_mapping(mapping.clone()),
+            SchemaChange::FieldMapping(mapping),
+        );
+        Ok(Reply::Unit)
     }
 }
 
@@ -979,7 +1273,10 @@ impl RamEngine {
                     let approx_bytes = id.len() + DELETE_EVENT_OVERHEAD + retained;
                     (RamChangeKind::Delete, id, approx_bytes)
                 }
-                RamWalOp::IndexAdd { .. } | RamWalOp::IndexDrop { .. } => {
+                RamWalOp::IndexAdd { .. }
+                | RamWalOp::IndexDrop { .. }
+                | RamWalOp::SetClassificationProfile { .. }
+                | RamWalOp::SetFieldMapping { .. } => {
                     return Err(Error::corruption(
                         &primary_path,
                         format!("schema record at document seq {seq} cannot occupy a slot"),
@@ -1032,6 +1329,12 @@ impl RamEngine {
                 }
                 RamWalOp::IndexDrop { field } => {
                     manifest.indexes.retain(|spec| spec.field != *field);
+                }
+                RamWalOp::SetClassificationProfile { enabled } => {
+                    manifest.classification_profile = *enabled;
+                }
+                RamWalOp::SetFieldMapping { mapping } => {
+                    manifest.field_mapping = mapping.clone();
                 }
                 _ => {}
             }
@@ -1142,6 +1445,151 @@ impl RamEngine {
         let mut out = Vec::with_capacity(raw_json_capacity(record.approx_bytes));
         record.doc.write_json(&mut out);
         Ok(out)
+    }
+
+    /// One `seq`-pinned partial read (`peek_item` / `read_more`, spec §4).
+    ///
+    /// Everything runs under one read lock, so the document cannot change
+    /// between the sequence check and the sliced answer. Text offsets are
+    /// Unicode scalar values, never bytes: a German umlaut or an emoji counts
+    /// as one character.
+    pub(crate) fn peek_item(&self, id: &str, req: &PeekRequest) -> Result<PeekResponse> {
+        let state = self.state.read();
+        let record = state.doc(id).ok_or_else(|| Error::not_found(id))?;
+        if let Some(expected) = req.expected_seq {
+            if record.doc_seq != expected {
+                return Err(Error::Conflict {
+                    current_seq: record.doc_seq,
+                    doc: Value::Null,
+                });
+            }
+        }
+
+        let mut ranges: BTreeMap<String, RangeMeta> = BTreeMap::new();
+        let whole_document =
+            req.fields.is_none() && req.text_ranges.is_empty() && req.array_slices.is_empty();
+        if whole_document {
+            return Ok(PeekResponse {
+                id: record.id.to_string(),
+                seq: record.doc_seq,
+                doc: record.doc.to_value(),
+                ranges,
+            });
+        }
+
+        let mut out = serde_json::Map::new();
+        if let Some(id_value) = record.doc.get_path("_id") {
+            DocVal::insert_projected(&mut out, "_id", id_value.to_value());
+        }
+        let mut projected: HashSet<&str> = HashSet::new();
+        if let Some(fields) = &req.fields {
+            for field in fields {
+                if !projected.insert(field.as_str()) {
+                    continue;
+                }
+                if let Some(value) = record.doc.get_path(field) {
+                    DocVal::insert_projected(&mut out, field, value.to_value());
+                }
+            }
+        }
+
+        for spec in &req.text_ranges {
+            let Some(value) = record.doc.get_path(&spec.path) else {
+                continue;
+            };
+            let DocVal::String(text) = value else {
+                return Err(Error::invalid_arg(format!(
+                    "text range path {:?} is {}, not a string",
+                    spec.path,
+                    docval::json_type(value)
+                )));
+            };
+            let total = text.chars().count();
+            let sliced: String = text.chars().skip(spec.offset).take(spec.limit).collect();
+            let returned = sliced.chars().count();
+            let next_offset = spec.offset.saturating_add(returned);
+            ranges.insert(
+                spec.path.clone(),
+                RangeMeta {
+                    offset: spec.offset,
+                    returned,
+                    total,
+                    has_more: next_offset < total,
+                    next_offset,
+                },
+            );
+            DocVal::insert_projected(&mut out, &spec.path, Value::String(sliced));
+        }
+
+        for spec in &req.array_slices {
+            let Some(value) = record.doc.get_path(&spec.path) else {
+                continue;
+            };
+            let DocVal::Array(items) = value else {
+                return Err(Error::invalid_arg(format!(
+                    "array slice path {:?} is {}, not an array",
+                    spec.path,
+                    docval::json_type(value)
+                )));
+            };
+            let total = items.len();
+            let end = spec.offset.saturating_add(spec.limit).min(total);
+            let slice: Vec<Value> = if spec.offset < end {
+                items[spec.offset..end]
+                    .iter()
+                    .map(|item| item.to_value())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let returned = slice.len();
+            let next_offset = spec.offset.saturating_add(returned);
+            ranges.insert(
+                spec.path.clone(),
+                RangeMeta {
+                    offset: spec.offset,
+                    returned,
+                    total,
+                    has_more: next_offset < total,
+                    next_offset,
+                },
+            );
+            DocVal::insert_projected(&mut out, &spec.path, Value::Array(slice));
+        }
+
+        Ok(PeekResponse {
+            id: record.id.to_string(),
+            seq: record.doc_seq,
+            doc: Value::Object(out),
+            ranges,
+        })
+    }
+
+    /// Enable the classification profile (spec §2), optionally backfilling.
+    pub(crate) fn enable_classification_profile(&self, backfill_empty: bool) -> Result<()> {
+        match self.submit(Job::EnableClassification { backfill_empty })? {
+            Reply::Unit => Ok(()),
+            other => Err(unexpected_reply("enable_classification_profile", &other)),
+        }
+    }
+
+    /// Replace the shared field-and-index mapping (spec §3).
+    pub(crate) fn set_field_mapping(&self, mapping: Vec<FieldMapping>) -> Result<()> {
+        match self.submit(Job::SetFieldMapping { mapping })? {
+            Reply::Unit => Ok(()),
+            other => Err(unexpected_reply("set_field_mapping", &other)),
+        }
+    }
+
+    /// The declared schema: classification profile, field mapping and the
+    /// persisted index declarations.
+    pub(crate) fn schema(&self) -> DbSchema {
+        let state = self.state.read();
+        DbSchema {
+            classification_profile: state.manifest.classification_profile,
+            field_mapping: state.manifest.field_mapping.clone(),
+            indexes: state.manifest.indexes.clone(),
+        }
     }
 
     /// Batch read, one entry per requested id (missing ids are `None`).
@@ -1323,8 +1771,9 @@ impl RamEngine {
     }
 
     pub(crate) fn query_with(&self, ast: Value, opts: QueryOptions) -> Result<Vec<Value>> {
-        let (_, page) = self.select_records(&ast, &opts)?;
+        let page = self.select_page(&ast, &opts)?;
         Ok(page
+            .rows
             .into_iter()
             .map(|record| record.doc.to_value())
             .collect())
@@ -1336,9 +1785,10 @@ impl RamEngine {
         opts: QueryOptions,
         fields: Option<&[String]>,
     ) -> Result<(usize, Vec<Value>)> {
-        let (total, page) = self.select_records(&ast, &opts)?;
-        let mut out = Vec::with_capacity(page.len());
-        for record in page {
+        let page = self.select_page(&ast, &opts)?;
+        let total = page.meta.total;
+        let mut out = Vec::with_capacity(page.rows.len());
+        for record in page.rows {
             out.push(match fields {
                 Some(fields) => record.doc.project_to_value(fields),
                 None => record.doc.to_value(),
@@ -1363,65 +1813,169 @@ impl RamEngine {
         opts: QueryOptions,
         fields: Option<&[String]>,
     ) -> Result<(usize, Vec<Arc<[u8]>>)> {
-        let (total, page) = self.select_records(&ast, &opts)?;
-        let mut out = Vec::with_capacity(page.len());
-        for record in page {
-            let mut buf = Vec::with_capacity(raw_json_capacity(record.approx_bytes));
-            match fields {
-                Some(fields) => record.doc.project_write_json(fields, &mut buf),
-                None => record.doc.write_json(&mut buf),
-            }
-            out.push(Arc::from(buf));
-        }
-        Ok((total, out))
+        let page = self.select_page(&ast, &opts)?;
+        Ok((page.meta.total, serialize_rows(page.rows, fields)))
     }
 
-    /// Select the matching page, holding the read lock only for selection:
-    /// the returned `Arc<DocRecord>`s keep their trees alive after the lock is
+    /// The selected page plus the execution accounting the HTTP contract
+    /// exposes (`scanned_docs`, `used_indexes`, `next_cursor`).
+    pub(crate) fn query_raw_page(
+        &self,
+        ast: Value,
+        opts: QueryOptions,
+        fields: Option<&[String]>,
+    ) -> Result<(QueryPageMeta, Vec<Arc<[u8]>>)> {
+        let page = self.select_page(&ast, &opts)?;
+        Ok((page.meta, serialize_rows(page.rows, fields)))
+    }
+
+    /// Select the matching page, holding the read lock only for selection: the
+    /// returned `Arc<DocRecord>`s keep their trees alive after the lock is
     /// released, so serialization never runs under it.
     ///
-    /// `offset` is honoured with or without a `limit` (herrbasan/nDB#15), and a
-    /// set `limit` bounds the work: only `offset + limit` rows survive the
-    /// partial selection before the page is sorted.
-    fn select_records(
-        &self,
-        ast: &Value,
-        opts: &QueryOptions,
-    ) -> Result<(usize, Vec<Arc<DocRecord>>)> {
+    /// One selection covers the whole query surface: the planner narrows by
+    /// index when it can, the text predicate filters candidates, a multi-key
+    /// order (always `_id`-tie-broken) sorts them, an opaque cursor resumes
+    /// where the previous page stopped, and the scan budget aborts loudly
+    /// rather than truncating.
+    fn select_page(&self, ast: &Value, opts: &QueryOptions) -> Result<Page> {
         validate_query_ast(ast)?;
+        if opts.cursor.is_some() && opts.offset.unwrap_or(0) > 0 {
+            return Err(Error::invalid_arg(
+                "a cursor and a non-zero offset cannot be combined: the cursor is the position",
+            ));
+        }
         let state = self.state.read();
-        let mut matches = collect_matches(&state, ast);
-        let total = matches.len();
 
-        if let Some((field, dir)) = &opts.sort_by {
-            let cmp = |a: &Arc<DocRecord>, b: &Arc<DocRecord>| {
-                let left = sort_key(a, field);
-                let right = sort_key(b, field);
-                let ordering = match dir {
-                    SortDir::Asc => left.cmp(&right),
-                    SortDir::Desc => right.cmp(&left),
-                };
-                ordering.then_with(|| a.id.cmp(&b.id))
-            };
+        let text = match &opts.text {
+            Some(query) => Some(parse_text_query(query)?),
+            None => None,
+        };
+        let text_fields: Option<Vec<String>> = text.as_ref().and_then(|parsed| {
+            parsed.fields.clone().or_else(|| {
+                let mapped: Vec<String> = state
+                    .manifest
+                    .field_mapping
+                    .iter()
+                    .filter(|entry| entry.text)
+                    .map(|entry| entry.field.clone())
+                    .collect();
+                (!mapped.is_empty()).then_some(mapped)
+            })
+        });
+
+        // ── Candidate scan, with an honest count of what was examined ──
+        let budget = opts.max_scan_docs;
+        let mut scanned = 0usize;
+        let mut selected: Vec<Arc<DocRecord>> = Vec::new();
+        let plan = plan_candidates(ast, &*state);
+        let used_indexes = match &plan {
+            Some(_) => used_index_fields(ast, &state),
+            None => Vec::new(),
+        };
+        let examine = |record: &Arc<DocRecord>, scanned: &mut usize| -> Result<bool> {
+            *scanned += 1;
+            if let Some(max) = budget {
+                if *scanned > max {
+                    return Err(Error::ScanBudgetExceeded {
+                        scanned: *scanned,
+                        max_scan: max,
+                    });
+                }
+            }
+            if !record.doc.matches_filter(ast) {
+                return Ok(false);
+            }
+            if let Some(parsed) = &text {
+                if !text_matches(&record.doc, &parsed.terms, text_fields.as_deref()) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        match plan {
+            Some(ids) => {
+                let mut ids: Vec<&String> = ids.iter().collect();
+                ids.sort();
+                for id in ids {
+                    let Some(record) = state.doc(id) else {
+                        continue;
+                    };
+                    if examine(record, &mut scanned)? {
+                        selected.push(Arc::clone(record));
+                    }
+                }
+            }
+            None => {
+                let mut records: Vec<&Arc<DocRecord>> = state.docs.values().collect();
+                records.sort_by(|a, b| a.id.cmp(&b.id));
+                for record in records {
+                    if examine(record, &mut scanned)? {
+                        selected.push(Arc::clone(record));
+                    }
+                }
+            }
+        }
+        let total = selected.len();
+
+        // ── Ordering ───────────────────────────────────────────────────
+        let order = SortOrder::of(opts);
+        if let Some(encoded) = &opts.cursor {
+            let cursor = SortCursor::decode(encoded)?;
+            if cursor.values.len() != order.key_count() {
+                return Err(Error::invalid_arg(format!(
+                    "cursor carries {} sort key(s), this query orders by {}",
+                    cursor.values.len(),
+                    order.key_count()
+                )));
+            }
+            selected.retain(|record| {
+                cmp_record_to_cursor(record, &cursor, &order) == std::cmp::Ordering::Greater
+            });
+        }
+        // Rows still in play after the cursor — captured before the partial
+        // sort truncates the vector, because that truncation is what the page
+        // cut would otherwise mistake for "nothing left".
+        let remaining_after_cursor = selected.len();
+        if order.needs_sort() {
+            let cmp = |a: &Arc<DocRecord>, b: &Arc<DocRecord>| cmp_records(a, b, &order);
             let offset = opts.offset.unwrap_or(0);
             let take = match opts.limit {
                 Some(limit) => offset.saturating_add(limit),
-                None => matches.len(),
+                None => selected.len(),
             };
-            if take < matches.len() {
-                matches.select_nth_unstable_by(take, &cmp);
-                matches.truncate(take);
+            if take < selected.len() {
+                selected.select_nth_unstable_by(take, &cmp);
+                selected.truncate(take);
             }
-            matches.sort_by(&cmp);
+            selected.sort_by(&cmp);
         }
 
         let offset = opts.offset.unwrap_or(0);
-        let page: Vec<Arc<DocRecord>> = matches
+        let limit = opts.limit;
+        let remaining_after_offset = remaining_after_cursor.saturating_sub(offset);
+        let page: Vec<Arc<DocRecord>> = selected
             .into_iter()
             .skip(offset)
-            .take(opts.limit.unwrap_or(usize::MAX))
+            .take(limit.unwrap_or(usize::MAX))
             .collect();
-        Ok((total, page))
+        let next_cursor = match (limit, page.last()) {
+            (Some(limit), Some(last)) if remaining_after_offset > limit => Some(
+                SortCursor::from_record(last, &order)
+                    .encode()?,
+            ),
+            _ => None,
+        };
+
+        Ok(Page {
+            meta: QueryPageMeta {
+                total,
+                scanned_docs: scanned,
+                used_indexes,
+                next_cursor,
+            },
+            rows: page,
+        })
     }
 
     pub(crate) fn facet_counts(&self, fields: &[String]) -> Vec<(String, BTreeMap<String, usize>)> {
@@ -1759,6 +2313,14 @@ impl RamEngine {
             let state = self.state.read();
             if !state.manifest.indexes.iter().any(|spec| spec.field == field) {
                 return Err(Error::index_error(field, "index not found"));
+            }
+            if state.manifest.classification_profile
+                && (field == docval::DOMAIN_FIELD || field == docval::CATEGORIES_FIELD)
+            {
+                return Err(Error::index_error(
+                    field,
+                    "the classification profile is enabled: this index cannot be dropped",
+                ));
             }
         }
         self.append_schema_batch(&[RamWalRecord::index_drop(field)])?;
@@ -2118,6 +2680,7 @@ impl RamEngine {
                 let saved_overlay = stage.overlay.clone();
                 let saved_records = stage.records.len();
                 let saved_pubs = stage.pubs.len();
+                let saved_schema = stage.schema.len();
                 let saved_seq = stage.next_seq;
                 let saved_delta = stage.live_delta;
                 let saved_ring = stage.ring_add_bytes;
@@ -2129,6 +2692,7 @@ impl RamEngine {
                         stage.overlay = saved_overlay;
                         stage.records.truncate(saved_records);
                         stage.pubs.truncate(saved_pubs);
+                        stage.schema.truncate(saved_schema);
                         stage.next_seq = saved_seq;
                         stage.live_delta = saved_delta;
                         stage.ring_add_bytes = saved_ring;
@@ -2351,6 +2915,9 @@ impl RamEngine {
         }
         state.lineage.last_seq = state.lineage.last_seq.max(last_seq);
         state.refresh_available_seq();
+        for change in stage.schema {
+            apply_schema_change(&mut state, change);
+        }
     }
 
     fn append_schema_batch(&self, records: &[RamWalRecord]) -> Result<()> {
@@ -2395,6 +2962,39 @@ fn unexpected_reply(op: &str, reply: &Reply) -> Error {
         "ram group commit returned an unexpected {} reply to {op}",
         reply.label()
     ))
+}
+
+/// Apply one staged schema change to the published state.
+///
+/// The manifest and the live index map move together with the documents the
+/// same batch published, so a reader never sees a manifest that promises an
+/// index the state does not hold.
+fn apply_schema_change(state: &mut RamState, change: SchemaChange) {
+    match change {
+        SchemaChange::ClassificationProfile(enabled) => {
+            state.manifest.classification_profile = enabled;
+        }
+        SchemaChange::FieldMapping(mapping) => {
+            state.manifest.field_mapping = mapping;
+        }
+        SchemaChange::IndexAdd { field, kind } => {
+            if state.indexes.contains_key(&field) {
+                return;
+            }
+            let built = RamIndex::build(state.docs.values().cloned(), &field, kind);
+            state.index_bytes += built.approx_bytes();
+            state.indexes.insert(field.clone(), built);
+            if !state.manifest.indexes.iter().any(|spec| spec.field == field) {
+                state.manifest.indexes.push(IndexSpec { field, kind });
+            }
+        }
+        SchemaChange::IndexDrop { field } => {
+            if let Some(removed) = state.indexes.remove(&field) {
+                state.index_bytes = state.index_bytes.saturating_sub(removed.approx_bytes());
+            }
+            state.manifest.indexes.retain(|spec| spec.field != field);
+        }
+    }
 }
 
 fn duplicate_error(error: &Error) -> Error {
@@ -2460,6 +3060,10 @@ fn duplicate_error(error: &Error) -> Error {
             limit_bytes: *limit_bytes,
             needed_bytes: *needed_bytes,
         },
+        Error::ScanBudgetExceeded { scanned, max_scan } => Error::ScanBudgetExceeded {
+            scanned: *scanned,
+            max_scan: *max_scan,
+        },
     }
 }
 
@@ -2481,6 +3085,429 @@ fn sort_key(record: &DocRecord, field: &str) -> OrderedValue {
     match record.doc.get_path(field) {
         Some(value) => value.ordered_key(),
         None => OrderedValue::Null,
+    }
+}
+
+// ─── Enhanced selection: ordering, cursors, text, accounting ────────────────
+
+/// One selected page plus its execution accounting.
+struct Page {
+    meta: QueryPageMeta,
+    rows: Vec<Arc<DocRecord>>,
+}
+
+fn serialize_rows(rows: Vec<Arc<DocRecord>>, fields: Option<&[String]>) -> Vec<Arc<[u8]>> {
+    let mut out = Vec::with_capacity(rows.len());
+    for record in rows {
+        let mut buf = Vec::with_capacity(raw_json_capacity(record.approx_bytes));
+        match fields {
+            Some(fields) => record.doc.project_write_json(fields, &mut buf),
+            None => record.doc.write_json(&mut buf),
+        }
+        out.push(Arc::from(buf));
+    }
+    out
+}
+
+/// The total order a query executes in.
+enum SortOrder<'a> {
+    /// Documents by id ascending — the natural order `collect_matches` produces.
+    IdOnly,
+    /// The pre-existing single-key `sort_by`, whose missing values sort as JSON
+    /// `null`. Kept verbatim so existing callers see byte-identical pages.
+    Legacy { field: &'a str, dir: SortDir },
+    /// Deterministic multi-key ordering with explicit missing placement.
+    Keys(&'a [SortKey]),
+}
+
+impl<'a> SortOrder<'a> {
+    fn of(opts: &'a QueryOptions) -> Self {
+        if !opts.sort_keys.is_empty() {
+            SortOrder::Keys(&opts.sort_keys)
+        } else if let Some((field, dir)) = &opts.sort_by {
+            SortOrder::Legacy {
+                field,
+                dir: *dir,
+            }
+        } else {
+            SortOrder::IdOnly
+        }
+    }
+
+    fn needs_sort(&self) -> bool {
+        !matches!(self, SortOrder::IdOnly)
+    }
+
+    /// Number of cursor key slots this order carries.
+    fn key_count(&self) -> usize {
+        match self {
+            SortOrder::IdOnly => 0,
+            SortOrder::Legacy { .. } => 1,
+            SortOrder::Keys(keys) => keys.len(),
+        }
+    }
+}
+
+fn apply_dir(ordering: std::cmp::Ordering, dir: SortDir) -> std::cmp::Ordering {
+    match dir {
+        SortDir::Asc => ordering,
+        SortDir::Desc => ordering.reverse(),
+    }
+}
+
+fn record_key(record: &DocRecord, field: &str) -> Option<OrderedValue> {
+    record.doc.get_path(field).map(|value| value.ordered_key())
+}
+
+/// Compare one sort key's values, honouring the key's missing placement and
+/// direction. Missing placement is absolute, not reversed by `desc`.
+fn cmp_sort_values(
+    left: Option<&OrderedValue>,
+    right: Option<&OrderedValue>,
+    key: &SortKey,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => match key.missing {
+            MissingPlacement::First => std::cmp::Ordering::Less,
+            MissingPlacement::Last => std::cmp::Ordering::Greater,
+        },
+        (Some(_), None) => match key.missing {
+            MissingPlacement::First => std::cmp::Ordering::Greater,
+            MissingPlacement::Last => std::cmp::Ordering::Less,
+        },
+        (Some(left), Some(right)) => apply_dir(left.cmp(right), key.dir),
+    }
+}
+
+fn cmp_records(a: &DocRecord, b: &DocRecord, order: &SortOrder) -> std::cmp::Ordering {
+    match order {
+        SortOrder::IdOnly => a.id.cmp(&b.id),
+        SortOrder::Legacy { field, dir } => {
+            let left = sort_key(a, field);
+            let right = sort_key(b, field);
+            apply_dir(left.cmp(&right), *dir).then_with(|| a.id.cmp(&b.id))
+        }
+        SortOrder::Keys(keys) => {
+            for key in keys.iter() {
+                let left = record_key(a, &key.field);
+                let right = record_key(b, &key.field);
+                let ordering = cmp_sort_values(left.as_ref(), right.as_ref(), key);
+                if ordering != std::cmp::Ordering::Equal {
+                    return ordering;
+                }
+            }
+            a.id.cmp(&b.id)
+        }
+    }
+}
+
+/// The last returned sort-key tuple plus its `_id`, encoded opaquely.
+struct SortCursor {
+    values: Vec<Option<OrderedValue>>,
+    id: String,
+}
+
+impl SortCursor {
+    fn from_record(record: &DocRecord, order: &SortOrder) -> Self {
+        let values = match order {
+            SortOrder::IdOnly => Vec::new(),
+            SortOrder::Legacy { field, .. } => vec![Some(sort_key(record, field))],
+            SortOrder::Keys(keys) => keys
+                .iter()
+                .map(|key| record_key(record, &key.field))
+                .collect(),
+        };
+        SortCursor {
+            values,
+            id: record.id.to_string(),
+        }
+    }
+
+    fn encode(&self) -> Result<String> {
+        let mut entries = Vec::with_capacity(self.values.len());
+        for value in &self.values {
+            entries.push(match value {
+                None => Value::Object(serde_json::Map::from_iter([(
+                    "p".to_string(),
+                    Value::Bool(false),
+                )])),
+                Some(key) => Value::Object(serde_json::Map::from_iter([
+                    ("p".to_string(), Value::Bool(true)),
+                    ("v".to_string(), ordered_to_value(key)),
+                ])),
+            });
+        }
+        let payload = Value::Object(serde_json::Map::from_iter([
+            ("k".to_string(), Value::Array(entries)),
+            ("id".to_string(), Value::String(self.id.clone())),
+        ]));
+        let bytes = serde_json::to_vec(&payload)?;
+        Ok(format!("ndbc1:{}", hex_encode(&bytes)))
+    }
+
+    fn decode(encoded: &str) -> Result<Self> {
+        let hex = encoded.strip_prefix("ndbc1:").ok_or_else(|| {
+            Error::invalid_arg("cursor is not an nDB cursor (missing 'ndbc1:' prefix)")
+        })?;
+        let bytes = hex_decode(hex)
+            .ok_or_else(|| Error::invalid_arg("cursor has a malformed hex payload"))?;
+        let payload: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::invalid_arg(format!("cursor is not valid JSON: {e}")))?;
+        let object = payload
+            .as_object()
+            .ok_or_else(|| Error::invalid_arg("cursor payload must be an object"))?;
+        let id = object
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| Error::invalid_arg("cursor payload is missing its id"))?
+            .to_string();
+        let entries = object
+            .get("k")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| Error::invalid_arg("cursor payload is missing its key tuple"))?;
+        let mut values = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let entry = entry
+                .as_object()
+                .ok_or_else(|| Error::invalid_arg("cursor key entry must be an object"))?;
+            let present = entry
+                .get("p")
+                .and_then(|value| value.as_bool())
+                .ok_or_else(|| Error::invalid_arg("cursor key entry is missing its presence flag"))?;
+            if present {
+                let value = entry.get("v").ok_or_else(|| {
+                    Error::invalid_arg("cursor key entry is marked present but carries no value")
+                })?;
+                values.push(Some(ordered_value(value)));
+            } else {
+                values.push(None);
+            }
+        }
+        Ok(SortCursor { values, id })
+    }
+}
+
+fn cmp_record_to_cursor(
+    record: &DocRecord,
+    cursor: &SortCursor,
+    order: &SortOrder,
+) -> std::cmp::Ordering {
+    match order {
+        SortOrder::IdOnly => record.id.as_ref().cmp(cursor.id.as_str()),
+        SortOrder::Legacy { field, dir } => {
+            let left = sort_key(record, field);
+            let right = cursor
+                .values
+                .first()
+                .cloned()
+                .flatten()
+                .unwrap_or(OrderedValue::Null);
+            apply_dir(left.cmp(&right), *dir).then_with(|| record.id.as_ref().cmp(cursor.id.as_str()))
+        }
+        SortOrder::Keys(keys) => {
+            for (index, key) in keys.iter().enumerate() {
+                let left = record_key(record, &key.field);
+                let right = cursor.values.get(index).cloned().flatten();
+                let ordering = cmp_sort_values(left.as_ref(), right.as_ref(), key);
+                if ordering != std::cmp::Ordering::Equal {
+                    return ordering;
+                }
+            }
+            record.id.as_ref().cmp(cursor.id.as_str())
+        }
+    }
+}
+
+fn ordered_to_value(key: &OrderedValue) -> Value {
+    match key {
+        OrderedValue::Null => Value::Null,
+        OrderedValue::Bool(flag) => Value::Bool(*flag),
+        OrderedValue::Number(number) => serde_json::Number::from_f64(number.0)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        OrderedValue::String(text) => Value::String(text.clone()),
+        OrderedValue::Composite(text) => serde_json::from_str(text)
+            .unwrap_or_else(|_| Value::String(text.clone())),
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(text.len() / 2);
+    let mut index = 0;
+    while index < bytes.len() {
+        let high = (bytes[index] as char).to_digit(16)?;
+        let low = (bytes[index + 1] as char).to_digit(16)?;
+        out.push((high * 16 + low) as u8);
+        index += 2;
+    }
+    Some(out)
+}
+
+/// A parsed standalone text query.
+struct ParsedText {
+    terms: Vec<String>,
+    fields: Option<Vec<String>>,
+}
+
+/// Parse terms and `"quoted phrases"`; unclosed quotes and empty queries are
+/// caller errors, never silently ignored.
+fn parse_text_query(query: &TextQuery) -> Result<ParsedText> {
+    if let Some(fields) = &query.fields {
+        if fields.is_empty() {
+            return Err(Error::invalid_arg(
+                "text.fields must name at least one field when present",
+            ));
+        }
+        for field in fields {
+            if field.is_empty() {
+                return Err(Error::invalid_arg("text.fields must not contain an empty name"));
+            }
+        }
+    }
+    let mut terms: Vec<String> = Vec::new();
+    let mut buffer = String::new();
+    let mut in_quote = false;
+    for ch in query.query.chars() {
+        match ch {
+            '"' => {
+                if in_quote {
+                    let phrase = buffer.trim();
+                    if !phrase.is_empty() {
+                        terms.push(phrase.to_lowercase());
+                    }
+                    buffer.clear();
+                    in_quote = false;
+                } else {
+                    let term = buffer.trim();
+                    if !term.is_empty() {
+                        terms.push(term.to_lowercase());
+                    }
+                    buffer.clear();
+                    in_quote = true;
+                }
+            }
+            ch if ch.is_whitespace() && !in_quote => {
+                if !buffer.is_empty() {
+                    terms.push(buffer.to_lowercase());
+                    buffer.clear();
+                }
+            }
+            ch => buffer.push(ch),
+        }
+    }
+    if in_quote {
+        return Err(Error::invalid_arg(
+            "text query has an unterminated quoted phrase",
+        ));
+    }
+    let tail = buffer.trim();
+    if !tail.is_empty() {
+        terms.push(tail.to_lowercase());
+    }
+    if terms.is_empty() {
+        return Err(Error::invalid_arg("text query is empty"));
+    }
+    Ok(ParsedText {
+        terms,
+        fields: query.fields.clone(),
+    })
+}
+
+/// Every term and every phrase must appear in the searched string content of
+/// this document. Matching is case-insensitive and deterministic.
+fn text_matches(doc: &DocVal, terms: &[String], fields: Option<&[String]>) -> bool {
+    let mut haystack = String::new();
+    match fields {
+        Some(fields) => {
+            for field in fields {
+                if let Some(value) = doc.get_path(field) {
+                    value.collect_lowercase_strings(&mut haystack);
+                }
+            }
+        }
+        None => {
+            if let DocVal::Object(map) = doc {
+                for (key, value) in map.iter() {
+                    if key.as_ref() == "_id" {
+                        continue;
+                    }
+                    value.collect_lowercase_strings(&mut haystack);
+                }
+            }
+        }
+    }
+    terms
+        .iter()
+        .all(|term| haystack.contains(term.as_str()))
+}
+
+/// Which indexed fields the planner actually consulted for this filter.
+///
+/// Reported only when the planner returned a candidate set: an index that
+/// exists but does not narrow the scan is not "used".
+fn used_index_fields(ast: &Value, state: &RamState) -> Vec<String> {
+    let mut fields: BTreeSet<String> = BTreeSet::new();
+    collect_used_index_fields(ast, state, &mut fields);
+    fields.into_iter().collect()
+}
+
+fn collect_used_index_fields(ast: &Value, state: &RamState, out: &mut BTreeSet<String>) {
+    match ast {
+        Value::Object(map) => {
+            if let Some(children) = map.get("$and").and_then(|value| value.as_array()) {
+                for child in children {
+                    collect_used_index_fields(child, state, out);
+                }
+            }
+            if let Some(children) = map.get("$or").and_then(|value| value.as_array()) {
+                for child in children {
+                    collect_used_index_fields(child, state, out);
+                }
+            }
+            if let Some(child) = map.get("$not") {
+                collect_used_index_fields(child, state, out);
+            }
+            for (field, condition) in map {
+                if field.starts_with('$') {
+                    continue;
+                }
+                let Some(index) = state.indexes.get(field) else {
+                    continue;
+                };
+                let usable = match condition {
+                    Value::Object(ops) => ops.iter().any(|(op, _)| match op.as_str() {
+                        "$eq" | "$in" => true,
+                        "$gt" | "$gte" | "$lt" | "$lte" => index.kind() == IndexKind::BTree,
+                        _ => false,
+                    }),
+                    _ => true,
+                };
+                if usable {
+                    out.insert(field.clone());
+                }
+            }
+        }
+        Value::Array(children) => {
+            for child in children {
+                collect_used_index_fields(child, state, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2540,9 +3567,11 @@ fn index_range(
 
 /// Every matching record, id-ascending.
 ///
-/// The index only narrows: each candidate is re-checked with `matches_filter`,
-/// which is the same predicate the engine has always applied. The id ordering
-/// makes an unsorted page deterministic and ties in a sorted page stable.
+/// Superseded by `select_page`'s inline scan (which also counts what it
+/// examined and applies the text predicate); kept as the reference expression
+/// of the same predicate for the planner-parity tests.
+#[cfg(test)]
+#[allow(dead_code)]
 fn collect_matches(state: &RamState, ast: &Value) -> Vec<Arc<DocRecord>> {
     match plan_candidates(ast, state) {
         Some(ids) => {
@@ -2575,6 +3604,8 @@ fn record_id(op: &RamWalOp) -> String {
         | RamWalOp::Delete { id }
         | RamWalOp::Restore { id, .. } => id.clone(),
         RamWalOp::IndexAdd { field, .. } | RamWalOp::IndexDrop { field } => field.clone(),
+        RamWalOp::SetClassificationProfile { .. } => "classification_profile".to_string(),
+        RamWalOp::SetFieldMapping { .. } => "field_mapping".to_string(),
     }
 }
 
@@ -2673,7 +3704,10 @@ fn apply_record(
             }
             deleted.insert(key);
         }
-        RamWalOp::IndexAdd { .. } | RamWalOp::IndexDrop { .. } => {
+        RamWalOp::IndexAdd { .. }
+        | RamWalOp::IndexDrop { .. }
+        | RamWalOp::SetClassificationProfile { .. }
+        | RamWalOp::SetFieldMapping { .. } => {
             // Schema operations carry no document state; the manifest is
             // their authority and `open_with_io` adopts them there.
         }
@@ -2722,6 +3756,8 @@ fn initialise(dir: &Path, io: &Arc<dyn Io>) -> Result<RamManifest> {
         last_seq: 0,
         min_available_seq: 1,
         indexes: Vec::new(),
+        classification_profile: false,
+        field_mapping: Vec::new(),
     };
     write_ram_manifest_atomic(dir, &manifest, io.as_ref())?;
     Ok(manifest)

@@ -170,6 +170,7 @@ fn planner_probes() -> Vec<Probe> {
             sort_by: Some(("n".to_string(), SortDir::Desc)),
             offset: Some(10),
             limit: Some(25),
+            ..QueryOptions::default()
         },
         fields: None,
     });
@@ -180,6 +181,7 @@ fn planner_probes() -> Vec<Probe> {
             sort_by: Some(("n".to_string(), SortDir::Asc)),
             offset: Some(5),
             limit: Some(20),
+            ..QueryOptions::default()
         },
         fields: Some(vec![
             "n".to_string(),

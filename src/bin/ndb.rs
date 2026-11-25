@@ -762,6 +762,8 @@ fn migrate_to_ram(dir: &Path) {
         // this folder anyway.
         min_available_seq: lineage.last_seq.saturating_add(1),
         indexes: indexes.clone(),
+        classification_profile: false,
+        field_mapping: Vec::new(),
     };
     if let Err(e) = ndb::ram_format::write_ram_manifest_atomic(&staging, &manifest, &io) {
         cleanup_staging(&staging);

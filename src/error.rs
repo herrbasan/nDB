@@ -88,6 +88,12 @@ pub enum Error {
         limit_bytes: usize,
         needed_bytes: usize,
     },
+
+    /// A query's mandatory scan exceeded the caller's scan budget. The scan
+    /// stopped at `scanned` documents instead of appearing to hang; nothing was
+    /// truncated into a silently smaller answer.
+    #[error("scan budget exceeded: scanned {scanned} documents, the budget is {max_scan}")]
+    ScanBudgetExceeded { scanned: usize, max_scan: usize },
 }
 
 impl Error {

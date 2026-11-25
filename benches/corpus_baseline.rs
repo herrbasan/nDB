@@ -475,6 +475,7 @@ fn run_memories() {
         limit: Some(20),
         offset: None,
         sort_by: Some(("confidence".to_string(), SortDir::Desc)),
+        ..QueryOptions::default()
     };
     let mut scan_page = 0;
     for _ in 0..2 {

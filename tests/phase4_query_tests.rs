@@ -438,6 +438,7 @@ fn query_with_sort_limit_offset() {
             limit: Some(2),
             offset: Some(1),
             sort_by: Some(("score".to_string(), SortDir::Desc)),
+            ..QueryOptions::default()
         },
     ).unwrap();
 
@@ -459,6 +460,7 @@ fn query_with_sort_asc() {
             limit: None,
             offset: None,
             sort_by: Some(("age".to_string(), SortDir::Asc)),
+            ..QueryOptions::default()
         },
     ).unwrap();
 

@@ -192,8 +192,20 @@ replaced is retired and preserved only in git history.
 1. **Layer 1 — O(1) CRUD:** `insert`, `get`, `update`, `delete`, `array_push`. Direct HashMap operations.
 2. **Layer 2 — Field Queries:** `find(field, value)`, `find_where()`, `find_range()`. Accelerated by opt-in hash and BTree indexes.
 3. **Layer 3 — JSON AST Queries:** MongoDB-style filter objects with `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$and`, `$or`, `$not`, and dot-notation nested field access.
+4. **Layer 4 — Standalone query contract (Phase 4A):** `QueryOptions` adds `sort_keys` (multi-key, explicit `MissingPlacement`, always `_id`-tie-broken), an opaque `cursor` (`next_cursor` continuation), `text` (AND-of-terms + `"quoted phrases"`, case-insensitive, over `text`-mapped fields or every string field) and `max_scan_docs` (a breach is `Error::ScanBudgetExceeded` → `422 scan_budget_exceeded`). Every page reports `scanned_docs`, `used_indexes` and `next_cursor`; the pre-existing `sort_by`/`sort_dir`/`offset`/`limit` behaviour is unchanged.
 
-> Full-text search is **not** a query layer. `nVDB` owns it (BM25 + dense vectors + rerank); nDB answers structured queries only.
+### Classification profile and field mapping (Phase 4A)
+
+- An **opt-in** profile: when enabled (`Database::enable_classification_profile`, `POST /v2/dbs/{n}/profile/classification`) every application object must carry `domain: string` and `categories: string[]`. Enforced on **every** write path (insert, insert-with-prefix, replace, set, remove, array_push, apply_ops, restore); a violation is `Error::InvalidArgument` and mutates nothing. Entries are non-empty strings and are deduplicated before storage; empty string / empty array mean "uncategorized".
+- Mixed into `crate::evaluate_field_condition`: on `categories` a scalar `$eq` (or implicit equality) matches by **array membership**; an array operand still means the whole array. Every other field keeps exact equality (the indexed-vs-scan oracle asserts this).
+- `{field, hash, ordered, text, project}` is the one shared field/index mapping (`Database::get_schema` / `Database::set_field_mapping`, `GET|PUT /v2/dbs/{n}/schema`). `hash` ensures a Hash index, `ordered` a BTree, both → a single BTree (which answers equality and ranges). `text: true` fields become the default text-search target; `project` is carried for nVDB projections.
+- Persistence: two schema-only WAL ops (`SetClassificationProfile` tag 9, `SetFieldMapping` tag 10) that consume **no** doc sequence; recovery adopts them into `manifest.json`, and both new manifest fields are `#[serde(default)]` so existing v3 folders open unchanged.
+
+### Partial retrieval (`peek` / `read_more`)
+
+`Database::peek_item(id, &PeekRequest)` → `PeekResponse { id, seq, doc, ranges }`, also `POST /v2/dbs/{n}/doc/{id}/peek`. One read lock: projection (`fields`, nested dot paths), `text_ranges` (Unicode **scalar** offsets, never bytes or tokens) and `array_slices` (element indices), each with `{offset, returned, total, has_more, next_offset}`. `expected_seq` pins the read; a moved document answers `409 conflict` with its current seq. Paths named by a range are always present; a range on the wrong type is `400`.
+
+> Advanced full-text (BM25, vectors, hybrid, rerank) remains **nVDB's** job. nDB's standalone lexical search is a correct, honest scan; `nVDB` accelerates it when present. This supersedes the earlier "all full-text belongs exclusively to nVDB" rule (`spec_ndb-standalone-contract.md` §7).
 
 ## File Buckets
 
@@ -231,7 +243,7 @@ Resident daemon (`src/server.rs`) — hand-rolled HTTP/1.1 on `std::net`, no asy
 
 - Mount sources: positional `<path>` (legacy, mounted as `default`), repeatable `--db <name>=<path>`, `--dir <root>` (auto-mounts child folders holding `data.jsonl` or `meta.json`), and `--config <file.json>` (`bind/port/token/persistence/scheduled_ms/dir/max_limit/default_limit/dbs`; unknown fields rejected).
 - Startup refuses: no source at all, an unopenable DB, a duplicate name or canonical path, an invalid DB name (`[a-zA-Z0-9._-]+`, not `.`/`..`), a missing `--dir`.
-- `GET /health`, `GET|POST /v2/dbs`, and per-DB `/v2/dbs/{name}/{stats,lineage,doc,docs/mget,query,find,facets,index,compact,flush,changes,snapshot,files/...}`. `POST /v2/dbs` accepts only `{name, persistence?}` (never a path) and is `403 create_disabled` without `--dir`.
+- `GET /health`, `GET|POST /v2/dbs`, and per-DB `/v2/dbs/{name}/{stats,lineage,doc,docs/mget,query,search,find,facets,index,schema,profile/classification,compact,flush,changes,snapshot,files/...}`. `POST /v2/dbs` accepts only `{name, persistence?}` (never a path) and is `403 create_disabled` without `--dir`.
 - Legacy single-DB routes (`/stats`, `/doc`, `/query`, `/file/...`) keep working against `default`; `/v2/` errors are `{ok:false, error, message}`.
 - **Transport:** `TCP_NODELAY` on every accepted connection; one `write_all` per response frame (head+body for ≤64 KB), binary bodies move into the socket without a clone; `Content-Length` always exact and `Connection: keep-alive` / `close` always truthful.
 - **Keep-alive:** one `BufReader` persists across requests on a socket; the loop ends on `Connection: close`, HTTP/1.0 without keep-alive, clean EOF, a 5 s idle timeout between requests (30 s for a live request), or a shutdown flag.
@@ -243,7 +255,7 @@ Resident daemon (`src/server.rs`) — hand-rolled HTTP/1.1 on `std::net`, no asy
 
 **There is no Node binding.** The `napi/` crate was removed in **v2.0.0** (2026-11-23) along with its committed `.node` prebuilts, `index.js`/`vendor.js`/`setup.js` — zero NAPI anywhere in the ecosystem. Node and Electron consumers use `ndb serve` over HTTP; `mcp_server` and `LLM-Gateway-Chat` are live on it. `ndb serve` keeps one copy of the data in one Rust process instead of one copy per Node process, which is what the binding could never do.
 
-**Full-text search is not part of nDB.** `src/search.rs`, `/search`, `POST /v2/dbs/{n}/search`, `type: "text"` in `/index` and the `text` constraint in `/query` were removed in v2.0.0 — `nVDB` owns all full-text, lexical, vector, hybrid and reranked search. Old `_index_*.fti` files left on disk are warned about and ignored at open, so existing folders mount unchanged.
+**Full-text search belongs to nVDB for the advanced cases.** `src/search.rs`, `type: "text"` in `/index` and the v2 native full-text index were removed in v2.0.0. The Phase 4A standalone contract adds back a **basic, scan-based lexical** `/search` and `query.text` (AND terms + phrases, no ranking/stemming/vectors) so nDB stays useful with nVDB stopped; `nVDB` remains the accelerated and advanced path. Old `_index_*.fti` files left on disk are warned about and ignored at open, so existing folders mount unchanged.
 
 ## Current Implementation Status
 
@@ -268,6 +280,7 @@ Resident daemon (`src/server.rs`) — hand-rolled HTTP/1.1 on `std::net`, no asy
 | Multi-DB HTTP service (`ndb serve`) | Complete (step 1) — `DbRegistry` mounts arbitrary DB paths by name, `--db`/`--dir`/`--config`, `/health` + `/v2/dbs` + per-DB CRUD/query/sync/bucket routes; `tests/phase13_multi_db_serve_tests.rs` |
 | Schema validation from `meta.json` | Not implemented (`meta.json` schemas block ignored) |
 | v3 RAM-first binary backend | Complete (the only binary engine) — authoritative `DocVal` in RAM, op-level WAL with group commit, non-blocking compaction with `pending_wal_gen`, pinned snapshots, `FaultIo` crash matrix; CLI `init` (v3 by default), `migrate` from v1 (staged, doc-by-doc parity before and after publishing, `data.jsonl.v1.bak` preservation), v3 `fsck`/`repair`/`export --jsonl`; `tests/phase18_ram_engine_tests.rs`, `tests/phase19_compaction_and_faults_tests.rs`, `tests/phase20_cli_and_maintenance_tests.rs`, `tests/phase21_ram_http_contract_tests.rs` |
+| Standalone object & query contract (Phase 4A) | Complete — opt-in classification profile (enforced on every write path, explicit `backfill_empty` migration, dedup, `categories` membership equality), shared field mapping (`hash`/`ordered`/`text`/`project` → indexes + text defaults), multi-key `sort_keys` + `_id` tie-breaker, opaque cursor pagination, standalone lexical `text` search, `scanned_docs`/`used_indexes`/`next_cursor` accounting, `422 scan_budget_exceeded`, `seq`-pinned `peek_item` (projection + character ranges + array slices); schema ops as WAL tags 9/10 with `#[serde(default)]` manifest fields; `tests/phase22_standalone_contract_tests.rs` |
 | nURI `link` type enforcement | Not implemented (file refs detected heuristically by string match, not by schema) |
 | Bucket migration script for legacy data | Not bundled here (the consumer's `migrate-ndb-to-folder.js` was used in production) |
 

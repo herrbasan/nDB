@@ -756,7 +756,7 @@ fn query_matches_inner(doc: &DocVal, ast: &Value) -> bool {
                     }
                     false
                 }
-                Some(field_val) => evaluate_condition(field_val, condition),
+                Some(field_val) => evaluate_field_condition(field, field_val, condition),
             })
         }
         // Array at top level = implicit $and.
@@ -809,6 +809,41 @@ fn evaluate_condition(field_val: &DocVal, condition: &Value) -> bool {
     }
 }
 
+/// One field condition with the classification profile's membership rule
+/// (parity with `lib.rs`'s `evaluate_field_condition`).
+fn evaluate_field_condition(field: &str, field_val: &DocVal, condition: &Value) -> bool {
+    if field == CATEGORIES_FIELD {
+        if let DocVal::Array(items) = field_val {
+            let matches_member = |operand: &Value| {
+                if operand.is_array() {
+                    eq_json_value(field_val, operand)
+                } else {
+                    items.iter().any(|item| eq_json_value(item, operand))
+                }
+            };
+            match condition {
+                Value::Object(ops) => {
+                    return ops.iter().all(|(op, operand)| match op.as_str() {
+                        "$eq" => matches_member(operand),
+                        "$ne" => !matches_member(operand),
+                        // Every other operator sees the whole array, exactly as
+                        // the general evaluator handles it.
+                        _ => evaluate_condition(
+                            field_val,
+                            &Value::Object(serde_json::Map::from_iter([(
+                                op.clone(),
+                                operand.clone(),
+                            )])),
+                        ),
+                    });
+                }
+                operand => return matches_member(operand),
+            }
+        }
+    }
+    evaluate_condition(field_val, condition)
+}
+
 // ─── Projection (parity with project_doc) ───────────────────────────────────
 
 impl DocVal {
@@ -851,6 +886,328 @@ impl DocVal {
             value.write_json(out);
         }
         out.push(b'}');
+    }
+}
+
+// ─── Classification profile (spec §2) ───────────────────────────────────────
+
+use serde::{Deserialize, Serialize};
+
+/// The standard classification profile's two fields.
+pub const DOMAIN_FIELD: &str = "domain";
+/// The standard classification profile's plural tag field.
+pub const CATEGORIES_FIELD: &str = "categories";
+
+/// What the classification profile observes about one stored document.
+#[derive(Debug)]
+pub(crate) struct ClassificationAudit {
+    /// `domain` is absent.
+    pub missing_domain: bool,
+    /// `categories` is absent.
+    pub missing_categories: bool,
+    /// The deduplicated `categories` array, when the stored one repeats a tag.
+    pub deduped_categories: Option<Arc<DocVal>>,
+}
+
+/// Audit one document against the classification profile.
+///
+/// Errors name the offending field and the reason; the caller adds the document
+/// id. Deduplication is *reported*, never applied here.
+pub(crate) fn audit_classification(doc: &DocVal) -> Result<ClassificationAudit> {
+    let map = match doc {
+        DocVal::Object(map) => map,
+        _ => {
+            return Err(Error::invalid_arg(
+                "a document under the classification profile must be a JSON object",
+            ))
+        }
+    };
+    match map.get(DOMAIN_FIELD) {
+        None => {}
+        Some(value) => match value.as_ref() {
+            DocVal::String(_) => {}
+            other => {
+                return Err(Error::invalid_arg(format!(
+                    "field '{DOMAIN_FIELD}' must be a string, found {}",
+                    json_type(other)
+                )))
+            }
+        },
+    }
+    let mut deduped_categories = None;
+    match map.get(CATEGORIES_FIELD) {
+        None => {}
+        Some(value) => match value.as_ref() {
+            DocVal::Array(items) => {
+                let mut kept: Vec<&Arc<DocVal>> = Vec::with_capacity(items.len());
+                let mut seen: Vec<&str> = Vec::with_capacity(items.len());
+                for item in items.iter() {
+                    let text = match item.as_ref() {
+                        DocVal::String(text) => {
+                            if text.is_empty() {
+                                return Err(Error::invalid_arg(format!(
+                                    "field '{CATEGORIES_FIELD}' must not contain an empty string"
+                                )));
+                            }
+                            text.as_ref()
+                        }
+                        other => {
+                            return Err(Error::invalid_arg(format!(
+                                "field '{CATEGORIES_FIELD}' must contain only non-empty strings, found {}",
+                                json_type(other)
+                            )))
+                        }
+                    };
+                    if !seen.contains(&text) {
+                        seen.push(text);
+                        kept.push(item);
+                    }
+                }
+                if kept.len() != items.len() {
+                    deduped_categories = Some(Arc::new(DocVal::Array(Arc::new(
+                        kept.into_iter().cloned().collect(),
+                    ))));
+                }
+            }
+            other => {
+                return Err(Error::invalid_arg(format!(
+                    "field '{CATEGORIES_FIELD}' must be an array of non-empty strings, found {}",
+                    json_type(other)
+                )))
+            }
+        },
+    }
+    Ok(ClassificationAudit {
+        missing_domain: !map.contains_key(DOMAIN_FIELD),
+        missing_categories: !map.contains_key(CATEGORIES_FIELD),
+        deduped_categories,
+    })
+}
+
+pub(crate) fn json_type(value: &DocVal) -> &'static str {
+    match value {
+        DocVal::Null => "null",
+        DocVal::Bool(_) => "a boolean",
+        DocVal::Number(_) => "a number",
+        DocVal::String(_) => "a string",
+        DocVal::Array(_) => "an array",
+        DocVal::Object(_) => "an object",
+    }
+}
+
+/// Validate one written document and return it with `categories` deduplicated.
+///
+/// Returns `(tree, delta_bytes, deduped_categories)`; the third element is the
+/// array node a WAL patch must additionally record when deduplication fired.
+pub(crate) fn enforce_classification_tree(
+    doc: &Arc<DocVal>,
+) -> Result<(Arc<DocVal>, isize, Option<Arc<DocVal>>)> {
+    let audit = audit_classification(doc)?;
+    if audit.missing_domain {
+        return Err(Error::invalid_arg(format!(
+            "field '{DOMAIN_FIELD}' is required while the classification profile is enabled"
+        )));
+    }
+    if audit.missing_categories {
+        return Err(Error::invalid_arg(format!(
+            "field '{CATEGORIES_FIELD}' is required while the classification profile is enabled"
+        )));
+    }
+    match audit.deduped_categories {
+        None => Ok((Arc::clone(doc), 0, None)),
+        Some(categories) => {
+            let (next, applied, delta) = set_path(doc, CATEGORIES_FIELD, Arc::clone(&categories))?;
+            debug_assert!(applied, "the deduplicated categories array always differs");
+            Ok((next, delta, Some(categories)))
+        }
+    }
+}
+
+/// Validate `doc` in place against the classification profile, deduplicating
+/// `categories` when the caller supplied repeats.
+pub(crate) fn enforce_classification_value(doc: &mut Value) -> Result<()> {
+    let object = doc
+        .as_object_mut()
+        .ok_or_else(|| Error::invalid_arg("document must be a JSON object"))?;
+    match object.get(DOMAIN_FIELD) {
+        None => {
+            return Err(Error::invalid_arg(format!(
+                "field '{DOMAIN_FIELD}' is required while the classification profile is enabled"
+            )))
+        }
+        Some(Value::String(_)) => {}
+        Some(other) => {
+            return Err(Error::invalid_arg(format!(
+                "field '{DOMAIN_FIELD}' must be a string, found {other}"
+            )))
+        }
+    }
+    let categories = match object.get_mut(CATEGORIES_FIELD) {
+        None => {
+            return Err(Error::invalid_arg(format!(
+                "field '{CATEGORIES_FIELD}' is required while the classification profile is enabled"
+            )))
+        }
+        Some(Value::Array(items)) => items,
+        Some(other) => {
+            return Err(Error::invalid_arg(format!(
+                "field '{CATEGORIES_FIELD}' must be an array of non-empty strings, found {other}"
+            )))
+        }
+    };
+    let mut seen: Vec<&str> = Vec::with_capacity(categories.len());
+    for item in categories.iter() {
+        match item {
+            Value::String(text) if !text.is_empty() => seen.push(text.as_str()),
+            Value::String(_) => {
+                return Err(Error::invalid_arg(format!(
+                    "field '{CATEGORIES_FIELD}' must not contain an empty string"
+                )))
+            }
+            other => {
+                return Err(Error::invalid_arg(format!(
+                    "field '{CATEGORIES_FIELD}' must contain only non-empty strings, found {other}"
+                )))
+            }
+        }
+    }
+    let mut kept: Vec<Value> = Vec::with_capacity(categories.len());
+    for item in categories.iter() {
+        let text = item.as_str().expect("validated above");
+        if !kept.iter().any(|seen| seen.as_str() == Some(text)) {
+            kept.push(item.clone());
+        }
+    }
+    if kept.len() != categories.len() {
+        *categories = kept;
+    }
+    Ok(())
+}
+
+// ─── Partial retrieval (spec §4) ────────────────────────────────────────────
+
+/// A bounded character range of one string field.
+///
+/// Offsets count Unicode scalar values (`char`s) — never bytes, never model
+/// tokens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextRangeSpec {
+    /// Dot path of the string field.
+    pub path: String,
+    /// First character to return (0-based).
+    pub offset: usize,
+    /// Maximum number of characters to return.
+    pub limit: usize,
+}
+
+/// A bounded element range of one array field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArraySliceSpec {
+    /// Dot path of the array field.
+    pub path: String,
+    /// First element index to return (0-based).
+    pub offset: usize,
+    /// Maximum number of elements to return.
+    pub limit: usize,
+}
+
+/// One `peek_item` / `read_more` request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeekRequest {
+    /// Field projection, if any. Paths named by a range are always included.
+    #[serde(default)]
+    pub fields: Option<Vec<String>>,
+    /// Character ranges to return.
+    #[serde(default)]
+    pub text_ranges: Vec<TextRangeSpec>,
+    /// Array slices to return.
+    #[serde(default)]
+    pub array_slices: Vec<ArraySliceSpec>,
+    /// When set, the read is refused with `409` unless the document is at this
+    /// sequence. Every page of a multi-page read pins the same sequence.
+    #[serde(default)]
+    pub expected_seq: Option<u64>,
+}
+
+/// Where one requested range landed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RangeMeta {
+    /// First character / element returned.
+    pub offset: usize,
+    /// Characters / elements actually returned.
+    pub returned: usize,
+    /// Characters / elements the whole field holds.
+    pub total: usize,
+    /// Whether content remains after this range.
+    pub has_more: bool,
+    /// Offset the next page starts at.
+    pub next_offset: usize,
+}
+
+/// The answer to one [`PeekRequest`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeekResponse {
+    /// Document id.
+    pub id: String,
+    /// The document sequence this page was read at.
+    pub seq: u64,
+    /// The partial document.
+    pub doc: Value,
+    /// One entry per applied range, keyed by its path.
+    pub ranges: BTreeMap<String, RangeMeta>,
+}
+
+impl DocVal {
+    /// Insert `value` at a dot path inside `out`, creating intermediate objects.
+    ///
+    /// Only object parents are created: a path that descends into an array is
+    /// never what a projection means (`messages.3.role` addresses one element,
+    /// not a shape), and `get_path` already resolved the value it belongs to.
+    pub(crate) fn insert_projected(out: &mut serde_json::Map<String, Value>, path: &str, value: Value) {
+        let mut segments = path.split('.').peekable();
+        let mut current = out;
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_none() {
+                current.insert(segment.to_string(), value);
+                return;
+            }
+            let entry = current
+                .entry(segment.to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            let Value::Object(next) = entry else {
+                // A short path already claimed this key with a scalar; deepen
+                // nothing and drop the nested value rather than corrupt it.
+                return;
+            };
+            current = next;
+        }
+    }
+
+    /// Append every string value under this node, lowercased, to `out`.
+    ///
+    /// The separator is a newline so a phrase can never match across two
+    /// distinct fields by accident.
+    pub(crate) fn collect_lowercase_strings(&self, out: &mut String) {
+        match self {
+            DocVal::String(text) => {
+                out.push_str(&text.to_lowercase());
+                out.push('\n');
+            }
+            DocVal::Array(items) => {
+                for item in items.iter() {
+                    item.collect_lowercase_strings(out);
+                }
+            }
+            DocVal::Object(map) => {
+                for value in map.values() {
+                    value.collect_lowercase_strings(out);
+                }
+            }
+            _ => {}
+        }
     }
 }
 

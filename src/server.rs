@@ -1366,6 +1366,101 @@ fn parse_query_options(body: &Value, config: &ServerConfig, limit_cap: usize) ->
         opts.sort_by = Some((field.to_string(), dir));
     }
 
+    if let Some(sort_keys) = body.get("sort_keys") {
+        let entries = sort_keys
+            .as_array()
+            .ok_or("sort_keys must be an array")?;
+        for (index, entry) in entries.iter().enumerate() {
+            let object = entry
+                .as_object()
+                .ok_or_else(|| format!("sort_keys[{index}] must be an object"))?;
+            let field = object
+                .get("field")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("sort_keys[{index}].field required"))?;
+            if field.is_empty() {
+                return Err(format!("sort_keys[{index}].field must not be empty"));
+            }
+            let dir = match object.get("dir").and_then(|v| v.as_str()).unwrap_or("asc") {
+                "asc" => SortDir::Asc,
+                "desc" => SortDir::Desc,
+                other => {
+                    return Err(format!(
+                        "sort_keys[{index}].dir must be 'asc' or 'desc', got '{other}'"
+                    ))
+                }
+            };
+            let missing = match object.get("missing").and_then(|v| v.as_str()).unwrap_or("last") {
+                "first" => crate::MissingPlacement::First,
+                "last" => crate::MissingPlacement::Last,
+                other => {
+                    return Err(format!(
+                        "sort_keys[{index}].missing must be 'first' or 'last', got '{other}'"
+                    ))
+                }
+            };
+            opts.sort_keys.push(crate::SortKey {
+                field: field.to_string(),
+                dir,
+                missing,
+            });
+        }
+        if opts.sort_keys.is_empty() {
+            return Err("sort_keys must name at least one key".to_string());
+        }
+    }
+
+    if let Some(cursor) = body.get("cursor") {
+        let cursor = cursor.as_str().ok_or("cursor must be a string")?;
+        opts.cursor = Some(cursor.to_string());
+    }
+
+    if let Some(text) = body.get("text") {
+        opts.text = Some(match text {
+            Value::String(query) => crate::TextQuery {
+                query: query.clone(),
+                fields: None,
+            },
+            Value::Object(map) => {
+                let query = map
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .ok_or("text.query required when text is an object")?;
+                let fields = match map.get("fields") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => {
+                        let names = value
+                            .as_array()
+                            .ok_or("text.fields must be an array of field names")?;
+                        let mut names_out = Vec::with_capacity(names.len());
+                        for name in names {
+                            names_out.push(
+                                name.as_str()
+                                    .ok_or("text.fields must contain only strings")?
+                                    .to_string(),
+                            );
+                        }
+                        Some(names_out)
+                    }
+                };
+                crate::TextQuery {
+                    query: query.to_string(),
+                    fields,
+                }
+            }
+            _ => return Err("text must be a string or {query, fields} object".to_string()),
+        });
+    }
+
+    if let Some(max_scan) = body.get("max_scan_docs") {
+        let max_scan = max_scan
+            .as_u64()
+            .ok_or("max_scan_docs must be a non-negative integer")?;
+        opts.max_scan_docs = Some(usize::try_from(max_scan).map_err(|_| {
+            "max_scan_docs exceeds this platform's usize".to_string()
+        })?);
+    }
+
     if let Some(offset) = body.get("offset") {
         opts.offset = Some(offset.as_u64().ok_or("offset must be a non-negative integer")? as usize);
     }
@@ -1759,6 +1854,16 @@ fn map_db_error(e: Error) -> (u16, Value) {
         ),
         Error::Poisoned { .. } => v2_error(503, "db_poisoned", e.to_string()),
         Error::MemoryLimitExceeded { .. } => v2_error(507, "memory_limit_exceeded", e.to_string()),
+        Error::ScanBudgetExceeded { scanned, max_scan } => (
+            422,
+            json!({
+                "ok": false,
+                "error": "scan_budget_exceeded",
+                "message": e.to_string(),
+                "scanned": scanned,
+                "max_scan": max_scan,
+            }),
+        ),
         _ => v2_error(500, "internal_error", e.to_string()),
     }
 }
@@ -1989,10 +2094,15 @@ fn route_v2(
         }
 
         ("POST", ["query"]) => return respond_v2_query(&db, config, req),
+        ("POST", ["search"]) => return respond_v2_search(&db, config, req),
+        ("GET", ["schema"]) => handle_v2_get_schema(&db),
+        ("PUT", ["schema"]) => handle_v2_put_schema(&db, req),
+        ("POST", ["profile", "classification"]) => handle_v2_classification(&db, req),
         ("POST", ["find"]) => handle_v2_find(&db, req),
         ("POST", ["facets"]) => handle_v2_facets(&db, req),
 
         ("GET", ["doc", id]) => return respond_v2_get_doc(&db, req, id),
+        ("POST", ["doc", id, "peek"]) => handle_v2_peek(&db, req, id),
         ("PUT", ["doc"]) => handle_v2_insert(&db, req),
         ("PUT", ["doc", id]) => handle_v2_replace(&db, req, id),
         ("PATCH", ["doc", id]) => handle_v2_patch(&db, req, id),
@@ -2041,6 +2151,27 @@ fn respond_v2_query(db: &Database, config: &ServerConfig, req: &Request) -> Resp
         Ok(b) => b,
         Err((status, body)) => return Response::Json(status, body),
     };
+    respond_v2_query_body(db, config, body)
+}
+
+/// `POST /v2/dbs/{name}/search` — the query contract with `text` required.
+fn respond_v2_search(db: &Database, config: &ServerConfig, req: &Request) -> Response {
+    let body = match parse_body_v2(req) {
+        Ok(b) => b,
+        Err((status, body)) => return Response::Json(status, body),
+    };
+    if body.get("text").is_none() {
+        let (status, body) = v2_error(
+            400,
+            "text_required",
+            "POST …/search requires a 'text' string or {query, fields} object",
+        );
+        return Response::Json(status, body);
+    }
+    respond_v2_query_body(db, config, body)
+}
+
+fn respond_v2_query_body(db: &Database, config: &ServerConfig, body: Value) -> Response {
     let filter = body.get("filter").cloned().unwrap_or_else(|| json!({}));
     if let Err(e) = crate::validate_query_ast(&filter) {
         return Response::Json(
@@ -2065,10 +2196,10 @@ fn respond_v2_query(db: &Database, config: &ServerConfig, req: &Request) -> Resp
 
     let start = Instant::now();
 
-    match db.query_raw_projected(filter, opts, fields.as_deref()) {
-        Ok((total, rows)) => Response::JsonRaw(
+    match db.query_raw_page(filter, opts, fields.as_deref()) {
+        Ok((meta, rows)) => Response::JsonRaw(
             200,
-            query_raw_body(total, &rows, Some(elapsed_ms(start))),
+            query_raw_body_meta(meta.total, &rows, Some(elapsed_ms(start)), Some(&meta)),
         ),
         Err(e) => {
             let (status, body) = map_db_error(e);
@@ -2080,8 +2211,20 @@ fn respond_v2_query(db: &Database, config: &ServerConfig, req: &Request) -> Resp
 /// Build `{"ok":true,"total":N,"count":M,"results":[<raw>,<raw>]}` from
 /// pre-serialized document bytes.
 fn query_raw_body(total: usize, rows: &[Arc<[u8]>], took_ms: Option<f64>) -> Vec<u8> {
+    query_raw_body_meta(total, rows, took_ms, None)
+}
+
+/// The same envelope plus the Phase 4A accounting: `scanned_docs`,
+/// `used_indexes` and `next_cursor`. Strictly additive — the legacy body is
+/// this function with no metadata.
+fn query_raw_body_meta(
+    total: usize,
+    rows: &[Arc<[u8]>],
+    took_ms: Option<f64>,
+    meta: Option<&crate::QueryPageMeta>,
+) -> Vec<u8> {
     let payload: usize = rows.iter().map(|row| row.len() + 1).sum();
-    let mut body = Vec::with_capacity(payload + 96);
+    let mut body = Vec::with_capacity(payload + 192);
     body.extend_from_slice(b"{\"ok\":true,\"total\":");
     body.extend_from_slice(total.to_string().as_bytes());
     body.extend_from_slice(b",\"count\":");
@@ -2098,12 +2241,173 @@ fn query_raw_body(total: usize, rows: &[Arc<[u8]>], took_ms: Option<f64>) -> Vec
         body.extend_from_slice(b",\"took_ms\":");
         body.extend_from_slice(format!("{took:.3}").as_bytes());
     }
+    if let Some(meta) = meta {
+        body.extend_from_slice(b",\"scanned_docs\":");
+        body.extend_from_slice(meta.scanned_docs.to_string().as_bytes());
+        body.extend_from_slice(b",\"used_indexes\":[");
+        for (index, field) in meta.used_indexes.iter().enumerate() {
+            if index > 0 {
+                body.push(b',');
+            }
+            let encoded = serde_json::to_string(field).expect("a field name is JSON-encodable");
+            body.extend_from_slice(encoded.as_bytes());
+        }
+        body.push(b']');
+        body.extend_from_slice(b",\"next_cursor\":");
+        match &meta.next_cursor {
+            Some(cursor) => {
+                let encoded = serde_json::to_string(cursor).expect("a cursor is JSON-encodable");
+                body.extend_from_slice(encoded.as_bytes());
+            }
+            None => body.extend_from_slice(b"null"),
+        }
+    }
     body.push(b'}');
     body
 }
 
-fn handle_v2_find(db: &Database, req: &Request) -> (u16, Value) {
+/// The schema body shared by `GET`/`PUT …/schema` and the migration response.
+fn schema_json(db: &Database) -> std::result::Result<Value, (u16, Value)> {
+    let schema = db.get_schema().map_err(map_db_error)?;
+    Ok(json!({
+        "classification_profile": schema.classification_profile,
+        "field_mapping": schema.field_mapping,
+        "indexes": schema.indexes,
+    }))
+}
+
+/// `GET /v2/dbs/{name}/schema` — classification profile, field mapping and the
+/// secondary indexes actually persisted.
+fn handle_v2_get_schema(db: &Database) -> (u16, Value) {
+    match schema_json(db) {
+        Ok(schema) => (200, json!({"ok": true, "schema": schema})),
+        Err(error) => error,
+    }
+}
+
+/// `PUT /v2/dbs/{name}/schema` — replace the shared field-and-index mapping.
+///
+/// Body: `{"field_mapping": [{field, hash?, ordered?, text?, project?}, …]}`.
+/// Declaring `hash`/`ordered` ensures the corresponding index; declaring
+/// neither drops any index on a field the mapping names. Fields outside the
+/// mapping keep their indexes.
+fn handle_v2_put_schema(db: &Database, req: &Request) -> (u16, Value) {
     let body = match parse_body_v2(req) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let mapping_value = body.get("field_mapping").cloned().unwrap_or(body);
+    let entries = match mapping_value.as_array() {
+        Some(entries) => entries.clone(),
+        None => {
+            return v2_error(
+                400,
+                "invalid_request",
+                "PUT …/schema requires {\"field_mapping\": [...]}",
+            )
+        }
+    };
+    let mut mapping = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        match serde_json::from_value::<crate::FieldMapping>(entry.clone()) {
+            Ok(parsed) => mapping.push(parsed),
+            Err(e) => {
+                return v2_error(
+                    400,
+                    "invalid_request",
+                    format!("field_mapping[{index}]: {e}"),
+                )
+            }
+        }
+    }
+    match db.set_field_mapping(mapping) {
+        Ok(()) => match schema_json(db) {
+            Ok(schema) => (200, json!({"ok": true, "schema": schema})),
+            Err(error) => error,
+        },
+        Err(e) => map_db_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClassificationProfileRequest {
+    enabled: bool,
+    #[serde(default)]
+    backfill_empty: bool,
+}
+
+/// `POST /v2/dbs/{name}/profile/classification` — the explicit migration.
+///
+/// `{"enabled": true, "backfill_empty"?: bool}`. Inspects every live document
+/// first: a wrong-shaped `domain`/`categories` fails the migration without
+/// touching anything; missing fields need `backfill_empty: true`.
+fn handle_v2_classification(db: &Database, req: &Request) -> (u16, Value) {
+    let body = match parse_body_v2(req) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let request: ClassificationProfileRequest = match serde_json::from_value(body) {
+        Ok(request) => request,
+        Err(e) => {
+            return v2_error(
+                400,
+                "invalid_request",
+                format!("invalid classification request: {e}"),
+            )
+        }
+    };
+    if !request.enabled {
+        return v2_error(
+            400,
+            "invalid_request",
+            "the classification profile can only be enabled; disabling it is not part of the contract",
+        );
+    }
+    match db.enable_classification_profile(request.backfill_empty) {
+        Ok(()) => match schema_json(db) {
+            Ok(schema) => (200, json!({"ok": true, "schema": schema})),
+            Err(error) => error,
+        },
+        Err(e) => map_db_error(e),
+    }
+}
+
+/// `POST /v2/dbs/{name}/doc/{id}/peek` — a `seq`-pinned partial read.
+///
+/// Body: `{fields?, text_ranges?, array_slices?, expected_seq?}`. A mismatched
+/// `expected_seq` answers `409 conflict` with the current sequence.
+fn handle_v2_peek(db: &Database, req: &Request, id: &str) -> (u16, Value) {
+    let request: crate::PeekRequest = if req.body.is_empty() {
+        crate::PeekRequest::default()
+    } else {
+        let body = match parse_body_v2(req) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        match serde_json::from_value(body) {
+            Ok(request) => request,
+            Err(e) => {
+                return v2_error(400, "invalid_request", format!("invalid peek request: {e}"))
+            }
+        }
+    };
+    match db.peek_item(id, &request) {
+        Ok(response) => (
+            200,
+            json!({
+                "ok": true,
+                "id": response.id,
+                "seq": response.seq,
+                "doc": response.doc,
+                "ranges": response.ranges,
+            }),
+        ),
+        Err(e) => map_db_error(e),
+    }
+}
+
+fn handle_v2_find(db: &Database, req: &Request) -> (u16, Value) {    let body = match parse_body_v2(req) {
         Ok(b) => b,
         Err(e) => return e,
     };

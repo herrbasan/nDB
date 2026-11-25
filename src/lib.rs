@@ -45,8 +45,11 @@ pub use item::{ItemBucket, ItemRecord, ItemState};
 pub use storage::{ChangeBatch, ChangeEvent, ChangeKind, Snapshot, SourceLineage};
 pub use ram_engine::{RamConfig, RamStats};
 pub use ram_format::{
-    base_file_name, base_file_path, manifest_path, wal_file_name, wal_file_path, IndexKind,
-    IndexSpec, MANIFEST_FILE, RAM_STORAGE_VERSION,
+    base_file_name, base_file_path, manifest_path, wal_file_name, wal_file_path, FieldMapping,
+    IndexKind, IndexSpec, MANIFEST_FILE, RAM_STORAGE_VERSION,
+};
+pub use docval::{
+    ArraySliceSpec, PeekRequest, PeekResponse, RangeMeta, TextRangeSpec,
 };
 
 use parking_lot::{Mutex, RwLock};
@@ -172,7 +175,100 @@ pub enum SortDir {
 pub struct QueryOptions {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    /// Legacy single-key sort. Kept exactly as it always behaved (missing
+    /// fields sort as JSON `null`); `sort_keys` supersedes it when non-empty.
     pub sort_by: Option<(String, SortDir)>,
+    /// Deterministic multi-key sort, applied in order. A final `_id` ascending
+    /// tie-breaker is always appended by the engine, so the total order — and
+    /// therefore cursor pagination — is stable.
+    pub sort_keys: Vec<SortKey>,
+    /// Opaque continuation token from a previous page (`QueryPageMeta`).
+    pub cursor: Option<String>,
+    /// Standalone lexical full-text query (spec §4).
+    pub text: Option<TextQuery>,
+    /// Mandatory scan budget: exceeding it fails with
+    /// [`Error::ScanBudgetExceeded`] instead of appearing to hang.
+    pub max_scan_docs: Option<usize>,
+}
+
+/// Where a document whose sort field is missing sorts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MissingPlacement {
+    /// Before every present value.
+    First,
+    /// After every present value (the default).
+    #[default]
+    Last,
+}
+
+/// One key of a deterministic multi-key sort.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortKey {
+    /// Field name (dot paths resolve).
+    pub field: String,
+    /// Sort direction.
+    pub dir: SortDir,
+    /// Where documents that omit the field sort.
+    pub missing: MissingPlacement,
+}
+
+impl SortKey {
+    /// An ascending key with missing values last.
+    pub fn asc(field: impl Into<String>) -> Self {
+        SortKey {
+            field: field.into(),
+            dir: SortDir::Asc,
+            missing: MissingPlacement::Last,
+        }
+    }
+
+    /// A descending key with missing values last.
+    pub fn desc(field: impl Into<String>) -> Self {
+        SortKey {
+            field: field.into(),
+            dir: SortDir::Desc,
+            missing: MissingPlacement::Last,
+        }
+    }
+}
+
+/// A standalone lexical full-text query.
+///
+/// Terms are whitespace-separated; `"quoted text"` is a phrase. Every term and
+/// every phrase must match (AND), case-insensitively, in at least one searched
+/// string field of the document.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TextQuery {
+    /// The query text.
+    pub query: String,
+    /// Fields to search; `None` falls back to the mapping's `text` fields, then
+    /// to every string-valued application field.
+    pub fields: Option<Vec<String>>,
+}
+
+/// The declared schema of one database: the classification profile, the shared
+/// field mapping, and the secondary indexes actually persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbSchema {
+    /// Whether `domain`/`categories` are enforced.
+    pub classification_profile: bool,
+    /// The shared field-and-index mapping.
+    pub field_mapping: Vec<FieldMapping>,
+    /// Persisted index declarations.
+    pub indexes: Vec<IndexSpec>,
+}
+
+/// Accounting for one executed query page.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueryPageMeta {
+    /// Documents matching the filter (before pagination).
+    pub total: usize,
+    /// Documents the execution path actually examined.
+    pub scanned_docs: usize,
+    /// Indexed fields that narrowed the scan (empty = full scan).
+    pub used_indexes: Vec<String>,
+    /// Continuation token for the next page, when more rows remain.
+    pub next_cursor: Option<String>,
 }
 
 // ─── Transactional Patches ──────────────────────────────────────────
@@ -646,7 +742,7 @@ pub(crate) fn query_matches(doc: &Value, ast: &Value) -> bool {
                         }
                         false
                     }
-                    Some(val) => evaluate_condition(val, condition),
+                    Some(val) => evaluate_field_condition(field, val, condition),
                 }
             })
         }
@@ -722,6 +818,44 @@ fn evaluate_condition(field_val: &Value, condition: &Value) -> bool {
         // Implicit $eq: {"field": "value"}
         _ => values_equal(field_val, condition),
     }
+}
+
+/// One field condition, with the classification profile's membership rule.
+///
+/// `categories` is a multi-value field: “this object contains category X” is
+/// what a caller means (spec §2), so a scalar `$eq` — explicit or implicit —
+/// matches when any element equals it, while an array operand still means the
+/// whole array. Every other field keeps exact equality, which is what the
+/// reference model and the indexed-vs-scan oracle assert.
+pub(crate) fn evaluate_field_condition(field: &str, field_val: &Value, condition: &Value) -> bool {
+    if field == docval::CATEGORIES_FIELD {
+        if let Value::Array(items) = field_val {
+            let matches_member = |operand: &Value| {
+                if operand.is_array() {
+                    values_equal(field_val, operand)
+                } else {
+                    items.iter().any(|item| values_equal(item, operand))
+                }
+            };
+            match condition {
+                Value::Object(ops) => {
+                    return ops.iter().all(|(op, operand)| match op.as_str() {
+                        "$eq" => matches_member(operand),
+                        "$ne" => !matches_member(operand),
+                        other => evaluate_condition(
+                            field_val,
+                            &Value::Object(serde_json::Map::from_iter([(
+                                other.to_string(),
+                                operand.clone(),
+                            )])),
+                        ),
+                    });
+                }
+                operand => return matches_member(operand),
+            }
+        }
+    }
+    evaluate_condition(field_val, condition)
 }
 
 /// Compare two JSON values for equality.
@@ -3434,6 +3568,93 @@ impl Database {
         Ok((total, out))
     }
 
+    /// The selected page plus the execution accounting the HTTP contract
+    /// exposes: `scanned_docs`, `used_indexes` and `next_cursor`.
+    ///
+    /// The enhanced options (`sort_keys`, `cursor`, `text`, `max_scan_docs`)
+    /// belong to the v3 standalone contract; a v1 database refuses them loudly
+    /// rather than ignoring them.
+    pub fn query_raw_page(
+        &self,
+        ast: Value,
+        opts: QueryOptions,
+        fields: Option<&[String]>,
+    ) -> Result<(QueryPageMeta, Vec<std::sync::Arc<[u8]>>)> {
+        if let Some(ram) = &self.ram {
+            return ram.query_raw_page(ast, opts, fields);
+        }
+        if !opts.sort_keys.is_empty()
+            || opts.cursor.is_some()
+            || opts.text.is_some()
+            || opts.max_scan_docs.is_some()
+        {
+            return Err(Error::invalid_arg(
+                "sort_keys, cursor, text and max_scan_docs require a v3 (RAM-first) database",
+            ));
+        }
+        let scanned = self.len();
+        let (total, rows) = self.query_raw_projected(ast, opts, fields)?;
+        Ok((
+            QueryPageMeta {
+                total,
+                scanned_docs: scanned,
+                used_indexes: Vec::new(),
+                next_cursor: None,
+            },
+            rows,
+        ))
+    }
+
+    /// The declared schema of this database.
+    ///
+    /// The classification profile and the shared field mapping are v3
+    /// (RAM-first) contract state; a v1 database refuses rather than pretending
+    /// to have a schema it cannot persist.
+    pub fn get_schema(&self) -> Result<DbSchema> {
+        match &self.ram {
+            Some(ram) => Ok(ram.schema()),
+            None => Err(Error::invalid_arg(
+                "the schema contract requires a v3 (RAM-first) database",
+            )),
+        }
+    }
+
+    /// Replace the shared field-and-index mapping, creating/dropping the
+    /// indexes it declares.
+    pub fn set_field_mapping(&self, mapping: Vec<FieldMapping>) -> Result<()> {
+        match &self.ram {
+            Some(ram) => ram.set_field_mapping(mapping),
+            None => Err(Error::invalid_arg(
+                "the field mapping requires a v3 (RAM-first) database",
+            )),
+        }
+    }
+
+    /// Enable the standard classification profile (spec §2).
+    ///
+    /// With `backfill_empty` every document that omits `domain`/`categories`
+    /// receives the defined uncategorized value in the same durable commit;
+    /// without it, a single missing field fails the whole migration loudly.
+    pub fn enable_classification_profile(&self, backfill_empty: bool) -> Result<()> {
+        match &self.ram {
+            Some(ram) => ram.enable_classification_profile(backfill_empty),
+            None => Err(Error::invalid_arg(
+                "the classification profile requires a v3 (RAM-first) database",
+            )),
+        }
+    }
+
+    /// One `seq`-pinned partial read: projection, character ranges and array
+    /// slices (spec §4).
+    pub fn peek_item(&self, id: &str, req: &PeekRequest) -> Result<PeekResponse> {
+        match &self.ram {
+            Some(ram) => ram.peek_item(id, req),
+            None => Err(Error::invalid_arg(
+                "peek_item requires a v3 (RAM-first) database",
+            )),
+        }
+    }
+
     /// Term counts per field, single O(n) scan. Array fields count per element
     /// (each category in `categories` counts once); scalar fields count per
     /// value. Only string values are counted (numbers/bools are skipped).
@@ -5278,6 +5499,7 @@ mod tests {
                 limit: Some(3),
                 offset: Some(2),
                 sort_by: Some(("score".to_string(), SortDir::Desc)),
+                ..QueryOptions::default()
             },
         ).unwrap();
         assert_eq!(results.len(), 3);

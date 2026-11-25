@@ -472,6 +472,7 @@ fn query_on_empty_db() {
         limit: Some(10),
         offset: Some(0),
         sort_by: Some(("x".to_string(), SortDir::Asc)),
+        ..QueryOptions::default()
     }).unwrap().len(), 0);
 }
 
