@@ -10,6 +10,7 @@ use ndb::server::{
     serve_multi_in_background, DbRegistry, PersistenceMode, ServeHandle, ServerConfig, ServiceConfig,
 };
 use serde_json::{json, Value};
+use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -307,8 +308,13 @@ fn create_database_under_root_dir() {
     assert_eq!(body["db"]["documents"], 0);
     assert!(body["db"].get("path").is_none());
 
-    // The folder exists under the operator's root, and the mount is live.
-    assert!(root.path().join("fresh").join("data.jsonl").exists());
+    // The folder exists under the operator's root as a v3 (RAM-first) database,
+    // and the mount is live.
+    let manifest = root.path().join("fresh").join("manifest.json");
+    assert!(manifest.is_file(), "POST /v2/dbs defaults to the RAM format");
+    let text = fs::read_to_string(&manifest).unwrap();
+    assert!(text.contains("\"version\": 3"), "{text}");
+    assert_eq!(body["db"]["format"], "ram");
     insert(server.port, "fresh", &json!({"v": 1}));
     let (status, body) = get(server.port, "/v2/dbs/fresh/stats");
     assert_eq!(status, 200, "{}", body);

@@ -19,7 +19,7 @@
 
 ## What nDB Is
 
-nDB is an **embeddable in-memory document database** built in Rust. It stores JSON documents in a `HashMap` for O(1) lookups and persists them to an append-only JSON Lines file (v1) or a binary/mmap generation pair (v2). Since **v2.0.0** it is also the **standalone multi-DB HTTP service `ndb serve`** — the only non-Rust interface. The napi Node binding crate was removed in v2.0.0 (no `.node` prebuilts, zero NAPI); `mcp_server` and `LLM-Gateway-Chat` talk to `ndb serve`. Full-text, lexical, vector and hybrid search belong to `nVDB`, not here.
+nDB is an **embeddable in-memory document database** built in Rust. It stores JSON documents in a `HashMap` for O(1) lookups and persists them to an append-only JSON Lines file (v1) or to the **v3 RAM-first** binary format (`manifest.json` + `base.gen_<N>.ndb` + op-level `wal.gen_<N>.ndb`). Since **v2.0.0** it is also the **standalone multi-DB HTTP service `ndb serve`** — the only non-Rust interface. The napi Node binding crate was removed in v2.0.0 (no `.node` prebuilts, zero NAPI); `mcp_server` and `LLM-Gateway-Chat` talk to `ndb serve`. Full-text, lexical, vector and hybrid search belong to `nVDB`, not here.
 
 ## Core Design
 
@@ -29,54 +29,54 @@ nDB is an **embeddable in-memory document database** built in Rust. It stores JS
 - **Database-as-a-Folder.** One directory per database: `data.jsonl` (documents — the file passed to `open()`), `_files/` (binary storage, created implicitly), `_trash/` (soft-deleted items), and `meta.json` (bucket declarations/policies — written by the CLI/migration, **read by the core at open**: `kind`, `onDocumentDelete`, `ttl_seconds`, `reserved_ttl_seconds`; the `schemas` block is still ignored).
 - **Zero dependencies beyond the Rust standard library plus `serde`, `serde_json`, `parking_lot`, `fastrand`, and `thiserror`.** No external crypto, no external DB engines. SHA-256 for file deduplication is hand-rolled.
 
-## Storage Backends (v1 JSONL / v2 binary)
+## Storage Backends (v1 JSONL / v3 RAM-first)
 
-`Database::open` detects the backend from the folder: `manifest.json` → v2,
-`data.jsonl` → v1, empty → v1 (or v2 when `OpenOptions::format == V2`). The
-public API is identical on both.
+`Database::open` detects the backend from the folder: a `manifest.json` whose
+`version` is 3 opens on the **RAM-first** engine, `data.jsonl` opens on **v1**,
+and an empty folder initialises as v1. The public API is identical on both.
+A `manifest.json` that names the retired **v2 mmap** format (`format_version`)
+is refused loudly — there is no v3 downgrade path and no silent acceptance.
 
-- **v2 files**: `manifest.json` (sole generation/lineage authority),
-  `base.gen_<N>.ndb` (immutable mmap'ed snapshot with persisted Hash/BTree
-  index sections), `wal.gen_<N>.ndb` (CRC-32 framed append log). Every parser
-  validates its CRC and structure; a torn WAL tail is truncated at open, any
-  other corruption fails loud.
-- **In-memory**: the mapping is the store. `V2State` holds `Arc<MmapBase>`, a
-  `superseded` bitset (one bit per base slot) and a `wal_overlay` of
-  post-compaction writes only — never a per-document map and never heap `Value`
-  trees. A cold open allocates nothing per document; reads binary-search the
-  mapped directory. Persisted indexes are probed in place (binary search over
-  encoded keys, `&[u32]` slot views); only the small WAL overlay carries an
-  in-memory index.
-- **Queries**: filters and sort keys are read from document bytes
-  (`src/v2_json_scan.rs`); `sort_by`+`limit` is a bounded top-K and only the
-  returned page (or its requested fields) is materialized. `/query` without
-  `fields` streams stored bytes into the response.
-- **Writes**: per-database leader/follower group commit coalesces concurrent
-  mutations into one `append_batch_and_sync`; RAM (overlay, bitset, indexes,
-  change ring, `last_seq`) is published only after the fsync, and a failed fsync
-  publishes nothing.
-- **Feed**: the RAM change ring is capped at 1024 events; older cursors are
-  answered by streaming the WAL from disk.
-- **Compaction** is non-blocking: freeze under a short lock (manifest + `Arc` +
-  bitset + overlay — a few KB, not the document set), write the new base with a
-  mirror WAL capturing concurrent writes, then swap the manifest and the live
-  mapping in a second short lock.
+- **v3 files**: `manifest.json` (sole generation/lineage authority, `version:
+  3`), `base.gen_<N>.ndb` (streamed immutable snapshot, every record CRC-32
+  framed), `wal.gen_<N>.ndb` (op-level append log whose batches end in a
+  `Commit` frame). Every parser validates CRC and structure; a torn WAL tail is
+  cleared at open with a warning, anything at or before a `Commit` fails loud.
+- **In-memory**: RAM is the store — `DocVal`/`DocRecord` trees plus Hash/BTree
+  indexes; nothing is mmap'ed and no index section is read from disk. A cold
+  open replays base + WAL into RAM once, then serves every read from `RwLock`
+  state.
+- **Queries**: filters and sort keys read the `DocVal` tree directly; the HTTP
+  raw path serializes out of RAM (`query_raw`) and a field projection writes
+  straight out of the tree (`project_write_json`).
+- **Writes**: per-database group commit coalesces concurrent mutations into one
+  `write_all` + `sync_all` of op frames plus one `Commit`; RAM is published only
+  after the fsync, and a failed fsync publishes nothing.
+- **Feed**: a bounded change ring (1024 events); older cursors are answered from
+  the WAL.
+- **Compaction** is non-blocking: freeze under a short lock (manifest + `Arc`
+  handles), serialize the new base with no lock held, then publish with an
+  atomic manifest swap.
 
-Engine: `src/v2_engine.rs`; on-disk format: `src/v2_format.rs`, raw-JSON scan:
-`src/v2_json_scan.rs`, mapping: `src/mmap.rs`, checksums: `src/crc32.rs`.
-CLI: `ndb init --v2|--ram`, `migrate [--ram]`, `fsck`, `repair`, `export
---jsonl`. Full reference: `documentation/v2-storage.md` (v2) and
-`documentation/cli.md` (all formats); benchmark and gate verdicts:
-`docs/phase3-benchmark-v1-vs-v2.md`.
+Index declarations live in `ram_format::{IndexSpec, IndexKind}`
+(`{"field": ..., "kind": "hash"|"btree"}` — the shape the live
+`manifest.json` files already carry) and are rebuilt into RAM at open.
+Checksums: `src/crc32.rs`. CLI: `ndb init [--ram]`, `migrate [--ram]`, `fsck`,
+`repair`, `export --jsonl`. Reference: `documentation/cli.md`.
 
-### RAM-first engine (Phase 1, slice 1C landed)
+**v2 mmap was retired (2026-11-25).** `src/v2_engine.rs`, `src/v2_format.rs`,
+`src/v2_json_scan.rs` and `src/mmap.rs` are gone; the code stays in git history
+(`9118718` and earlier). A v2 folder must be converted by the preserved
+v2/transition binary (`ndb migrate <path> --ram`) before this build can open it.
+`StorageFormat::parse("v2")` and `ndb init --v2` both fail with that
+instruction, and `Database::open` refuses a v2 manifest by name.
 
-The v2 mmap backend is the baseline being replaced by a RAM-first engine
-(authoritative `DocVal`/`DocRecord` in RAM, op-level WAL with group commit,
-single visibility lock, bounded change ring, non-blocking compaction). Phase 0
-froze the contracts and built the trust harness; **slice 1C adds the engine as a
-third storage format** — v1 and v2 are untouched and still the default for
-existing folders.
+### RAM-first engine (the only binary backend)
+
+The RAM-first engine is the shipped binary backend (authoritative
+`DocVal`/`DocRecord` in RAM, op-level WAL with group commit, single visibility
+lock, bounded change ring, non-blocking compaction). The v2 mmap engine it
+replaced is retired and preserved only in git history.
 
 - `docs/contract_ram-first-engine.md` — normative: RAM state, durability and
   group commit, failure/poison rules, the recovery+compaction crash matrix,
@@ -136,34 +136,37 @@ existing folders.
   delegated call and run the same before/after delta the v1 path uses.
   `ensure_ram_file_refs` reconciles the counters with the live set once (a v3
   folder opened on existing data starts empty), so `DELETE /doc/:id` moves the
-  files only that document held into the bucket trash in the same call, exactly
-  as v2 does, and `release_file` / `DELETE /files/…` sees live and restorable
-  references identically on every backend.
-- `StorageFormat::{Auto,V1,V2,Ram}` — `ram`/`v3` parse; `Auto` routes a folder
-  whose `manifest.json` is version 3 to the engine (v2 manifests carry
-  `format_version`, v1 folders hold `data.jsonl`); `Database::open_ram`,
-  `open_ram_with_config`, `open_ram_with_io` (test/`fault-io`),
-  `open_with_ram_config` (serve), `is_ram`, `ram_stats`, `pin_snapshot` /
-  `pinned_page` / `release_pin` / `reap_expired_pins`.
-  `ndb serve --format auto|v1|v2|ram` sets the create format and also decides
-  the format of a `--db name=<path>` mount whose path does not exist yet (a new
-  mount is v1 by default, v3 with `--format ram`); an existing folder is always
-  opened by detection, never by the flag.
+  files only that document held into the bucket trash in the same call, and
+  `release_file` / `DELETE /files/…` sees live and restorable references
+  identically on every backend.
+- `StorageFormat::{Auto,V1,Ram}` — `ram`/`v3` parse, `v2` fails with the
+  retirement notice; `Auto` routes a folder whose `manifest.json` is version 3
+  to the engine and a v2 manifest to a loud error (v1 folders hold
+  `data.jsonl`); `Database::open_ram`, `open_ram_with_config`,
+  `open_ram_with_io` (test/`fault-io`), `open_with_ram_config` (serve),
+  `is_ram`, `ram_stats`, `pin_snapshot` / `pinned_page` / `release_pin` /
+  `reap_expired_pins`.
+  `ndb serve --format auto|v1|ram` sets the create format (**`ram` is the
+  default** when the flag and the config file are silent) and also decides the
+  format of a `--db name=<path>` mount whose path does not exist yet; an
+  existing folder is always opened by detection, never by the flag.
   `GET /stats` and `GET /v2/dbs/{name}/stats` add a `ram` block
   (live/index/ring bytes, oldest retained seq, expired cursors, pins, poison,
   WAL bytes, stage timings); `/v2/dbs` reports `"format": "ram"`.
-- **CLI (slice 2B).** `ndb init <path> --ram` (alias `--v3`); `ndb migrate
-  <path> --ram|--v3|--to ram` from **v1 or v2** — staged in `.migrating_ram/`,
-  verified document-by-document (count, ids, JSON values, lineage, indexes)
-  before *and* after publishing, with `data.jsonl.v1.bak` / `_v2_backup/`
-  preserving the source backend; the manifest is written with
+- **CLI.** `ndb init <path>` initialises **v3 RAM-first by default** (`--ram` /
+  `--v3` accepted and redundant; `--v2` is refused with the retirement notice);
+  `ndb migrate <path>` converts a **v1** journal to v3 — staged in
+  `.migrating_ram/`, verified document-by-document (count, ids, JSON values,
+  lineage, indexes) before *and* after publishing, with `data.jsonl.v1.bak`
+  preserving the source; the manifest is written with
   `min_available_seq = last_seq + 1` because every document is folded into
-  `base.gen_1.ndb` and no event history carries over; `ndb fsck` auto-detects
-  the folder by manifest version and runs `fsck_ram_dir` + bucket checks;
-  `ndb repair` quarantines and truncates each WAL generation (including
-  `pending_wal_gen`) under the maintenance lock and prints the surviving seq;
-  `ndb export --jsonl` is id-sorted with a `_meta` lineage line. `ndb migrate
-  <path>` **without** a flag still means v1 → v2 (phase16 CLI contract).
+  `base.gen_1.ndb` and no event history carries over. A folder already on **v2**
+  is refused: the conversion must run on the preserved v2/transition binary.
+  `ndb fsck` auto-detects the folder by manifest version and runs
+  `fsck_ram_dir` + bucket checks; `ndb repair` quarantines and truncates each
+  WAL generation (including `pending_wal_gen`) under the maintenance lock and
+  prints the surviving seq; `ndb export --jsonl` is id-sorted with a `_meta`
+  lineage line.
 - `tests/support/refdb.rs` — `RefDb`, a sequential reference model used as the
   differential oracle; `tests/support/crash_child.rs` — out-of-process crash
   runner (`current_exe()` + `NDB_CRASH_CHILD_ROLE`).
@@ -240,7 +243,7 @@ Resident daemon (`src/server.rs`) — hand-rolled HTTP/1.1 on `std::net`, no asy
 
 **There is no Node binding.** The `napi/` crate was removed in **v2.0.0** (2026-11-23) along with its committed `.node` prebuilts, `index.js`/`vendor.js`/`setup.js` — zero NAPI anywhere in the ecosystem. Node and Electron consumers use `ndb serve` over HTTP; `mcp_server` and `LLM-Gateway-Chat` are live on it. `ndb serve` keeps one copy of the data in one Rust process instead of one copy per Node process, which is what the binding could never do.
 
-**Full-text search is not part of nDB.** `src/search.rs`, `/search`, `POST /v2/dbs/{n}/search`, `type: "text"` in `/index` and the `text` constraint in `/query` were removed in v2.0.0 — `nVDB` owns all full-text, lexical, vector, hybrid and reranked search. Old `_index_*.fti` files left on disk are warned about and ignored at v2 open, so existing folders mount unchanged.
+**Full-text search is not part of nDB.** `src/search.rs`, `/search`, `POST /v2/dbs/{n}/search`, `type: "text"` in `/index` and the `text` constraint in `/query` were removed in v2.0.0 — `nVDB` owns all full-text, lexical, vector, hybrid and reranked search. Old `_index_*.fti` files left on disk are warned about and ignored at open, so existing folders mount unchanged.
 
 ## Current Implementation Status
 
@@ -264,8 +267,7 @@ Resident daemon (`src/server.rs`) — hand-rolled HTTP/1.1 on `std::net`, no asy
 | Item buckets (`kind: "items"`) | Complete — item folders + `items.jsonl` journal, reserve/commit/trash/restore, reserved sweep, `verify` integrity; CLI wired |
 | Multi-DB HTTP service (`ndb serve`) | Complete (step 1) — `DbRegistry` mounts arbitrary DB paths by name, `--db`/`--dir`/`--config`, `/health` + `/v2/dbs` + per-DB CRUD/query/sync/bucket routes; `tests/phase13_multi_db_serve_tests.rs` |
 | Schema validation from `meta.json` | Not implemented (`meta.json` schemas block ignored) |
-| v2 binary/mmap storage backend (Phase 3, slice 3D) | Complete — `manifest.json` + mmap base generations + CRC32 WAL; zero-copy directory and persisted index sections (fixed-stride offset tables, O(1) slot access, O(log n) id lookup, `&[u32]` slot views); no per-document slot map (superseded bitset + WAL overlay, empty at cold boot); raw-JSON filter/sort-key scanning with bounded top-K and projected/raw materialization (`src/v2_json_scan.rs`); per-DB leader/follower group commit (one fsync per batch, RAM published only after fsync), bounded 1024-entry change ring with on-disk WAL fallback, non-blocking compaction with a mirror WAL and a few-KB freeze; `StorageFormat::{Auto,V1,V2}` gains `Database::open_v2*`; CLI `init --v2`, `migrate`, `fsck`, v2 `repair`, `export --jsonl`; `POST /v2/dbs` accepts `format: "v2"`. Reference: `documentation/v2-storage.md`; benchmark and gate verdicts: `docs/phase3-benchmark-v1-vs-v2.md`; tests: `tests/phase3_slice3b_v2_tests.rs`, `tests/phase16_v2_storage_tests.rs`, `tests/phase15_perf_and_planner_tests.rs` |
-| RAM-first engine (v3, slices 1–2B) | Complete — authoritative `DocVal` in RAM, op-level WAL with group commit, non-blocking compaction with `pending_wal_gen`, pinned snapshots, `FaultIo` crash matrix; CLI `init --ram`/`--v3`, `migrate --ram` from v1 and v2 (staged, doc-by-doc parity before and after publishing, `data.jsonl.v1.bak`/`_v2_backup` preservation), v3 `fsck`/`repair`/`export --jsonl`; `tests/phase18_ram_engine_tests.rs`, `tests/phase19_compaction_and_faults_tests.rs`, `tests/phase20_cli_and_maintenance_tests.rs` |
+| v3 RAM-first binary backend | Complete (the only binary engine) — authoritative `DocVal` in RAM, op-level WAL with group commit, non-blocking compaction with `pending_wal_gen`, pinned snapshots, `FaultIo` crash matrix; CLI `init` (v3 by default), `migrate` from v1 (staged, doc-by-doc parity before and after publishing, `data.jsonl.v1.bak` preservation), v3 `fsck`/`repair`/`export --jsonl`; `tests/phase18_ram_engine_tests.rs`, `tests/phase19_compaction_and_faults_tests.rs`, `tests/phase20_cli_and_maintenance_tests.rs`, `tests/phase21_ram_http_contract_tests.rs` |
 | nURI `link` type enforcement | Not implemented (file refs detected heuristically by string match, not by schema) |
 | Bucket migration script for legacy data | Not bundled here (the consumer's `migrate-ndb-to-folder.js` was used in production) |
 

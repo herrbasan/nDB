@@ -7,15 +7,13 @@
 //! the simplest possible code, so any disagreement with `Database` is either an
 //! engine bug or a contract ambiguity — never a bug in the model's cleverness.
 //!
-//! Semantics are matched against the **v2 backend** (`Database::open_v2`),
-//! which is what the RAM-first engine replaces. Where v1 and v2 differ today,
-//! the v2 behaviour wins.
+//! Semantics are matched against the **RAM-first engine**
+//! (`Database::open_ram`), which is the only binary backend nDB ships. Where
+//! v1 and the RAM-first engine differ, the RAM-first behaviour wins.
 //!
-//! Ordering model: a v2 database that has not been compacted keeps every
-//! document in the WAL overlay, whose scan order is id-ascending, and a sorted
-//! query breaks ties by that scan position. `RefDb` therefore scans
-//! id-ascending and breaks sort ties by id. Compaction (which can reorder the
-//! scan) is Phase 2 territory and outside this model's contract.
+//! Ordering model: an unsorted scan is id-ascending, and a sorted query breaks
+//! ties by that scan position. `RefDb` therefore scans id-ascending and breaks
+//! sort ties by id.
 
 use ndb::{ChangeBatch, ChangeEvent, ChangeKind, QueryOptions, Snapshot, SortDir, SourceLineage};
 use serde_json::{Map, Value};
@@ -563,12 +561,6 @@ impl RefDb {
         let doc = self.trash[position].clone();
         self.deleted.remove(id);
         Ok(self.commit_upsert(id, doc))
-    }
-
-    /// Mirror a v2 index create/drop: the engine burns one seq on the WAL
-    /// record that declares the index, and that seq carries no change event.
-    pub fn note_index_seq(&mut self) {
-        self.last_seq += 1;
     }
 
     // ── reads ───────────────────────────────────────────────────────────

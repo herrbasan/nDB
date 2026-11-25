@@ -172,7 +172,7 @@ impl DbRegistry {
             root_dir,
             default_persistence,
             scheduled_ms,
-            create_format: RwLock::new(crate::StorageFormat::Auto),
+            create_format: RwLock::new(crate::StorageFormat::Ram),
             snapshots: RwLock::new(HashMap::new()),
             ram_config: crate::RamConfig::server_default(),
         }
@@ -344,8 +344,8 @@ impl DbRegistry {
         self.mount_resolved_format(name, path, persistence, crate::StorageFormat::Auto)
     }
 
-    /// Mount a database with an explicit storage format (used by creation:
-    /// a new folder asked to be v2 must initialise as v2).
+    /// Mount a database with an explicit storage format (used by creation: a
+    /// new folder is initialised in the requested format).
     pub fn mount_resolved_format(
         &self,
         name: &str,
@@ -616,7 +616,7 @@ pub struct ServiceConfig {
     pub dir: Option<PathBuf>,
     pub max_limit: Option<usize>,
     pub default_limit: Option<usize>,
-    /// Storage format new databases are created with (`auto` | `v1` | `v2`).
+    /// Storage format new databases are created with (`auto` | `v1` | `ram`).
     pub format: Option<String>,
     pub dbs: Option<HashMap<String, DbSpec>>,
 }
@@ -1828,13 +1828,7 @@ fn elapsed_ms(start: Instant) -> f64 {
 
 fn db_descriptor(name: &str, db: &Database) -> Value {
     let lineage = db.lineage();
-    let format = if db.is_ram() {
-        "ram"
-    } else if db.is_v2() {
-        "v2"
-    } else {
-        "v1"
-    };
+    let format = if db.is_ram() { "ram" } else { "v1" };
     json!({
         "name": name,
         "format": format,
@@ -1845,7 +1839,7 @@ fn db_descriptor(name: &str, db: &Database) -> Value {
     })
 }
 
-/// The RAM-first counters as JSON, or `None` for a v1/v2 database.
+/// The RAM-first counters as JSON, or `None` for a v1 database.
 fn ram_stats_json(db: &Database) -> Option<Value> {
     db.ram_stats().map(|stats| {
         json!({
@@ -1897,8 +1891,9 @@ struct CreateDbRequest {
     name: String,
     #[serde(default)]
     persistence: Option<String>,
-    /// `auto` | `v1` | `v2` | `ram` (`v3`); `v2` initialises a binary/mmap
-    /// folder database, `ram` a RAM-first v3 folder.
+    /// `auto` | `v1` | `ram` (`v3`); `ram` (the default) initialises a
+    /// RAM-first v3 folder, `v1` a JSONL journal. `v2` is refused: that engine
+    /// was retired.
     #[serde(default)]
     format: Option<String>,
 }

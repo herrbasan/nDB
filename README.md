@@ -6,7 +6,7 @@ nDB is an **in-memory document database** with JSON Lines persistence, layered q
 
 > **v2.0.0 (2026-11-23) — breaking:**
 > - The `napi/` crate and its `.node` prebuilts are **gone**. There is no native Node binding; consumers talk to `ndb serve` over HTTP (`mcp_server` and `LLM-Gateway-Chat` already do).
-> - The in-crate full-text search engine (`src/search.rs`, `/search`, `text` indexes) is **gone**. Full-text, lexical, vector and hybrid search is owned by **nVDB**; nDB keeps structured query/filter/sort/projection/pagination, typed Hash/BTree indexes, v2 binary/mmap storage with group commit, and the multi-DB HTTP service.
+> - The in-crate full-text search engine (`src/search.rs`, `/search`, `text` indexes) is **gone**. Full-text, lexical, vector and hybrid search is owned by **nVDB**; nDB keeps structured query/filter/sort/projection/pagination, typed Hash/BTree indexes, the v3 RAM-first binary storage with group commit, and the multi-DB HTTP service.
 > - Stray `_index_*.fti` files left in a folder by older versions are ignored with a warning, so existing databases mount unchanged.
 
 
@@ -20,7 +20,7 @@ nDB is an **in-memory document database** with JSON Lines persistence, layered q
 > This removes the need for upper-layer management wrappers (like the deprecated nGDB). nDB natively handles **Delta patch operations** (e.g. `array_push`) for large objects and **bucket garbage collection**. Schema enforcement and nURI link-type validation remain unimplemented — the core reads `meta.json`'s `buckets` policy block (kind, lifecycle, TTLs) but ignores the `schemas` block.
 
 ## What's New in v2.0.0
-- **Standalone multi-DB service** — one `ndb serve` process mounts independent database folders by name (`--db name=path`, `--dir <root>`, `--config`), with per-DB v2 binary/mmap storage and group-commit durability.
+- **Standalone multi-DB service** — one `ndb serve` process mounts independent database folders by name (`--db name=path`, `--dir <root>`, `--config`), with per-DB v3 RAM-first storage and group-commit durability.
 - **Zero NAPI** — the `napi/` crate and committed Windows prebuilts were removed; Node consumers use the HTTP API, which keeps one copy of the data in one Rust process instead of one copy per Node process.
 - **Full-text search moved out** — the in-crate inverted index was deleted (zero production callers); `nVDB` owns all full-text, lexical, vector and hybrid search. Structured query, filters, sort, projection, pagination, typed Hash/BTree indexes and file buckets are unchanged.
 

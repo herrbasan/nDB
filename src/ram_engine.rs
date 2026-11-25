@@ -33,12 +33,11 @@ use crate::io::Io;
 use crate::ram_format::{
     base_file_path, ram_manifest_path, read_ram_base_file, read_ram_manifest, scan_ram_wal,
     truncate_ram_wal_tail, wal_file_name, wal_file_path, write_ram_base_file,
-    write_ram_manifest_atomic, RamManifest, RamWalOp, RamWalPatchOp, RamWalRecord, RamWalScan,
-    RamWalWriter, RAM_STORAGE_VERSION,
+    write_ram_manifest_atomic, IndexKind, IndexSpec, RamManifest, RamWalOp, RamWalPatchOp,
+    RamWalRecord, RamWalScan, RamWalWriter, RAM_STORAGE_VERSION,
 };
 use crate::report;
 use crate::storage::{self, ChangeBatch, ChangeEvent, ChangeKind, Snapshot, SourceLineage};
-use crate::v2_format::{V2IndexKind, V2IndexSpec};
 use crate::{
     id, index_keys, ordered_key_bytes, ordered_value, plan_candidates, validate_query_ast,
     ApplyOpsResult, BTreeIndex, DbLock, HashIndex, IndexAccess, KeyBound, OrderedValue, PatchOp,
@@ -169,10 +168,10 @@ enum RamIndex {
 }
 
 impl RamIndex {
-    fn build(docs: impl Iterator<Item = Arc<DocRecord>>, field: &str, kind: V2IndexKind) -> Self {
+    fn build(docs: impl Iterator<Item = Arc<DocRecord>>, field: &str, kind: IndexKind) -> Self {
         let mut index = match kind {
-            V2IndexKind::Hash => RamIndex::Hash(HashIndex::new()),
-            V2IndexKind::BTree => RamIndex::BTree(BTreeIndex::new()),
+            IndexKind::Hash => RamIndex::Hash(HashIndex::new()),
+            IndexKind::BTree => RamIndex::BTree(BTreeIndex::new()),
         };
         for record in docs {
             let keys = field_keys(&record.doc, field);
@@ -183,10 +182,10 @@ impl RamIndex {
         index
     }
 
-    fn kind(&self) -> V2IndexKind {
+    fn kind(&self) -> IndexKind {
         match self {
-            RamIndex::Hash(_) => V2IndexKind::Hash,
-            RamIndex::BTree(_) => V2IndexKind::BTree,
+            RamIndex::Hash(_) => IndexKind::Hash,
+            RamIndex::BTree(_) => IndexKind::BTree,
         }
     }
 
@@ -1025,7 +1024,7 @@ impl RamEngine {
             match &record.op {
                 RamWalOp::IndexAdd { field, kind } => {
                     if !manifest.indexes.iter().any(|spec| spec.field == *field) {
-                        manifest.indexes.push(V2IndexSpec {
+                        manifest.indexes.push(IndexSpec {
                             field: field.clone(),
                             kind: *kind,
                         });
@@ -1724,7 +1723,7 @@ impl RamEngine {
 
     // â”€â”€â”€ Indexes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    pub(crate) fn create_index(&self, field: &str, kind: V2IndexKind) -> Result<()> {
+    pub(crate) fn create_index(&self, field: &str, kind: IndexKind) -> Result<()> {
         self.refuse_if_poisoned()?;
         let _commit = self.commit_lock.lock();
         {
@@ -1744,7 +1743,7 @@ impl RamEngine {
         self.append_schema_batch(&[RamWalRecord::index_add(field, kind)])?;
 
         let mut state = self.state.write();
-        state.manifest.indexes.push(V2IndexSpec {
+        state.manifest.indexes.push(IndexSpec {
             field: field.to_string(),
             kind,
         });
@@ -1780,7 +1779,7 @@ impl RamEngine {
             .read()
             .indexes
             .get(field)
-            .map(|index| index.kind() == V2IndexKind::Hash)
+            .map(|index| index.kind() == IndexKind::Hash)
             .unwrap_or(false)
     }
 
@@ -1789,7 +1788,7 @@ impl RamEngine {
             .read()
             .indexes
             .get(field)
-            .map(|index| index.kind() == V2IndexKind::BTree)
+            .map(|index| index.kind() == IndexKind::BTree)
             .unwrap_or(false)
     }
 

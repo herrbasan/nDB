@@ -1,38 +1,29 @@
-//! Real-corpus workloads for the RAM-first refactor — v2 mmap vs v3 RAM-first.
+//! Real-corpus workloads for the RAM-first engine (v3).
 //!
-//!     cargo run --release --example corpus_baseline -- --engine both --corpus all
-//!     cargo run --release --example corpus_baseline -- --engine ram  --corpus chat
+//!     cargo run --release --example corpus_baseline -- --corpus all
+//!     cargo run --release --example corpus_baseline -- --corpus chat
 //!     cargo run --release --example corpus_baseline -- --corpus memories
 //!
-//! `--engine v2|ram|both` (default `both`) selects the backend, `--corpus
-//! memories|chat|all` (default `all`) the corpus. The flags compose, and every
-//! engine runs the *identical* workload set so the rows are comparable.
+//! `--corpus memories|chat|all` (default `all`) selects the corpus. v3
+//! RAM-first is the only binary engine nDB ships, so there is no engine flag
+//! and every number describes exactly what production runs.
 //!
 //! Every measurement runs against a **copy** of a live production database made
 //! into a `tempfile::tempdir()` that is deleted on exit. Only the database files
 //! are copied (`manifest.json`, `base.gen_*.ndb`, `wal.gen_*.ndb`, `meta.json`);
 //! the source folder is only ever read, and `.lock` is never copied. The live
-//! folders are production state — this program cannot write to them.
+//! folders are production state â€” this program cannot write to them.
 //!
-//! `--engine ram` copies the corpus a second time and converts *that* copy with
-//! the shipped CLI, `ndb migrate <copy> --ram`, which verifies document-by-
-//! document parity against the source twice (staged, then published) before it
-//! exits 0. Only then is the copy opened with `Database::open_ram`.
-//!
-//! Every corpus opens through `Persistence::Immediate`, so every `set`, `update`
-//! and `array_push` here pays the real durable-before-ack cost: the call returns
-//! only after the WAL fsync. (The Phase 0 plan names
-//! `Database::open_v2_with_persistence`; the shipped API is
-//! `Database::open_v2_with_options` with `Persistence::Immediate` in
-//! `OpenOptions` — the same handle behaviour. The RAM engine is always durable
-//! per commit; the v3 API has no other mode.)
+//! Every corpus opens through `Database::open_ram`; the engine is durable per
+//! commit, so every `set`, `update` and `array_push` here pays the real
+//! durable-before-ack cost (there is no other mode).
 //!
 //! Workloads (all warm, after an untimed warm-up):
 //!
 //!   memories (5k docs)   get (5,000), mget-style batch of 20 (500),
 //!                        hash-indexed `$eq` (200), unindexed scan+sort+limit20
 //!                        (200), durable `set` / `update` (50 each)
-//!   chat (907 docs)      largest-5 get (200), largest-5 get_raw — the HTTP
+//!   chat (907 docs)      largest-5 get (200), largest-5 get_raw â€” the HTTP
 //!                        JSON-bytes path (200), random get (500), 20 durable
 //!                        `array_push` on the largest conversation (+ RSS,
 //!                        WAL-growth and `live_doc_bytes`/`ring_bytes` deltas),
@@ -43,14 +34,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ndb::{
-    ram_format, Database, OpenOptions, Persistence, QueryOptions, RamStats, SortDir, StorageFormat,
-};
+use ndb::{ram_format, Database, QueryOptions, RamStats, SortDir};
 use serde_json::{json, Value};
 
 const MEM_SRC: &str = r"D:\DEV\mcp_server\data\memories";
@@ -71,47 +59,10 @@ const CHAT_RANDOM_GET_OPS: usize = 500;
 const CHAT_PUSH_OPS: usize = 20;
 const CHAT_READERS: usize = 4;
 const SOAK_PUSHES: usize = 100;
-/// Minimum reader observation window for the concurrency rows. A v2 writer needs
-/// ~1.5 s for its 20 pushes, but a RAM writer finishes in ~60 ms — too short to
-/// rank a p99 over. Readers therefore keep sampling to this floor on both
-/// engines; the v2 window already exceeds it, so its numbers stay as measured.
+/// Minimum reader observation window for the concurrency rows. The 20-push
+/// writer finishes in ~60 ms — too short to rank a p99 over — so readers keep
+/// sampling to this floor.
 const READER_WINDOW_FLOOR_MS: u64 = 500;
-
-// ─── Engine selection ───────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Engine {
-    /// v2 binary generations behind an mmap base + WAL overlay.
-    V2,
-    /// v3 RAM-first: documents live in RAM, the WAL is an op log.
-    Ram,
-}
-
-impl Engine {
-    fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "v2" => Some(Engine::V2),
-            "ram" => Some(Engine::Ram),
-            _ => None,
-        }
-    }
-
-    /// Short tag used in paths and prose.
-    fn tag(self) -> &'static str {
-        match self {
-            Engine::V2 => "v2",
-            Engine::Ram => "ram",
-        }
-    }
-
-    /// Human label for the report header.
-    fn label(self) -> &'static str {
-        match self {
-            Engine::V2 => "v2 (mmap + WAL overlay, Imm)",
-            Engine::Ram => "v3 (RAM-first, Imm)",
-        }
-    }
-}
 
 // ─── Deterministic RNG (std only) ───────────────────────────────────────────
 
@@ -286,7 +237,7 @@ fn rss_delta(before: usize, after: usize) -> f64 {
 
 // ─── Safe corpus copy ───────────────────────────────────────────────────────
 
-/// The only files a v2 database needs. Anything else in the folder (`_trash/`,
+/// The only files a v3 database needs. Anything else in the folder (`_trash/`,
 /// `_files/`, legacy `.jsonl` backups, `.lock`) stays behind — and `.lock` in
 /// particular must never travel, or the copy would claim to be the live owner.
 fn is_database_file(name: &str) -> bool {
@@ -324,7 +275,7 @@ fn copy_database(src: &Path, dst: &Path) -> Vec<(String, u64)> {
     names.sort();
     assert!(
         names.iter().any(|n| n == "manifest.json"),
-        "corpus source '{}' holds no manifest.json — not a v2 database",
+        "corpus source '{}' holds no manifest.json — not a database folder",
         src.display()
     );
 
@@ -353,78 +304,12 @@ fn copy_database(src: &Path, dst: &Path) -> Vec<(String, u64)> {
     copied
 }
 
-fn open_corpus(dir: &Path, engine: Engine) -> Database {
-    match engine {
-        Engine::V2 => Database::open_v2_with_options(
-            dir,
-            OpenOptions {
-                format: StorageFormat::V2,
-                persistence: Persistence::Immediate,
-            },
-        )
-        .unwrap_or_else(|e| panic!("open v2 corpus '{}': {e}", dir.display())),
-        Engine::Ram => Database::open_ram(dir)
-            .unwrap_or_else(|e| panic!("open v3 corpus '{}': {e}", dir.display())),
-    }
+fn open_corpus(dir: &Path) -> Database {
+    Database::open_ram(dir).unwrap_or_else(|e| panic!("open RAM corpus '{}': {e}", dir.display()))
 }
 
-/// The `ndb` binary the example must migrate with: same cargo profile as this
-/// example, so `--engine ram` never tests a different build than the one built.
-fn ndb_exe() -> PathBuf {
-    let exe = std::env::current_exe().expect("resolve the running example path");
-    let examples = exe
-        .parent()
-        .unwrap_or_else(|| panic!("example path '{}' has no parent", exe.display()));
-    let profile = examples
-        .parent()
-        .unwrap_or_else(|| panic!("'{}' has no profile directory", examples.display()));
-    let name = if cfg!(windows) { "ndb.exe" } else { "ndb" };
-    let path = profile.join(name);
-    assert!(
-        path.is_file(),
-        "'{}' does not exist — build it with: cargo build --release --bin ndb --example corpus_baseline",
-        path.display()
-    );
-    path
-}
-
-/// Convert the copied corpus with the shipped CLI, which is also the migration
-/// path a production folder takes. It verifies document-by-document parity
-/// (ids, every JSON value, lineage, every index declaration) against the source
-/// on the staged folder *and* again after publication, so a zero exit status is
-/// the parity verdict — there is no separate check this program could strengthen.
-fn migrate_to_ram(dir: &Path) -> f64 {
-    let exe = ndb_exe();
-    let started = Instant::now();
-    let output = Command::new(&exe)
-        .arg("migrate")
-        .arg(dir)
-        .arg("--ram")
-        .output()
-        .unwrap_or_else(|e| panic!("spawn '{} migrate --ram': {e}", exe.display()));
-    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
-        println!("    migrate: {line}");
-    }
-    assert!(
-        output.status.success(),
-        "'{} migrate {} --ram' failed (exit {:?}): {stderr}",
-        exe.display(),
-        dir.display(),
-        output.status.code(),
-    );
-    println!(
-        "  migrate {elapsed_ms:.0} ms   parity: PASS (ndb migrate verified staged + live copies document-by-document)"
-    );
-    elapsed_ms
-}
-
-/// Total bytes of the WAL generations sitting in `dir`, by filename.
-///
-/// Both engines name their active log `wal.gen_<N>.ndb`, so this measures the
-/// same thing on both sides of the comparison without trusting engine internals.
+/// The active log is always `wal.gen_<N>.ndb`, so this measures WAL growth
+/// without trusting engine internals.
 fn wal_file_bytes(dir: &Path) -> u64 {
     fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("list '{}': {e}", dir.display()))
@@ -450,10 +335,10 @@ fn print_ram_stats(when: &str, stats: &RamStats) {
     );
 }
 
-fn prepare_corpus(label: &str, src: &Path, engine: Engine) -> (tempfile::TempDir, PathBuf) {
+fn prepare_corpus(label: &str, src: &Path) -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir()
         .unwrap_or_else(|e| panic!("create tempdir for '{label}': {e}"));
-    let dir = tmp.path().join(format!("db-{}", engine.tag()));
+    let dir = tmp.path().join(format!("db-{label}"));
     let started = Instant::now();
     let copied = copy_database(src, &dir);
     let copy_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -499,21 +384,18 @@ fn most_common_scalar(sample: &[Value], field: &str) -> Option<Value> {
         .map(|(value, _)| value)
 }
 
-fn run_memories(engine: Engine) {
-    println!("═══ memories — engine {} ({MEM_SRC}) ═══", engine.label());
-    let (_tmp, dir) = prepare_corpus("memories", Path::new(MEM_SRC), engine);
-    if engine == Engine::Ram {
-        migrate_to_ram(&dir);
-    }
+fn run_memories() {
+    println!("═══ memories — v3 RAM-first ({MEM_SRC}) ═══");
+    let (_tmp, dir) = prepare_corpus("memories", Path::new(MEM_SRC));
     let rss_before_open = rss_bytes().expect("RSS before open");
 
     let started = Instant::now();
-    let db = open_corpus(&dir, engine);
+    let db = open_corpus(&dir);
     let open_ms = started.elapsed().as_secs_f64() * 1000.0;
     let docs = db.len();
     let ids = {
-        // Sorted so the sampled `$eq` category and the random-get id set are the
-        // same on both engines — `get_all_ids` order is an engine detail.
+        // Sorted so the sampled `$eq` category and the random-get id set are
+        // stable across runs — `get_all_ids` order is an engine detail.
         let mut ids = db.get_all_ids();
         ids.sort();
         ids
@@ -525,12 +407,9 @@ fn run_memories(engine: Engine) {
         rss_mb(),
         rss_delta(rss_before_open, rss_bytes().expect("RSS after open")),
     );
-    let indexes = match engine {
-        Engine::V2 => ndb::read_manifest(&dir).expect("read the copied v2 manifest").indexes,
-        Engine::Ram => ram_format::read_ram_manifest(&dir)
-            .expect("read the migrated v3 manifest")
-            .indexes,
-    };
+    let indexes = ram_format::read_ram_manifest(&dir)
+        .expect("read the copied v3 manifest")
+        .indexes;
     println!(
         "  indexes: {}",
         indexes
@@ -662,16 +541,13 @@ fn chat_message(i: usize) -> Value {
     })
 }
 
-fn run_chat(engine: Engine) {
-    println!("═══ chat_herrbasan — engine {} ({CHAT_SRC}) ═══", engine.label());
-    let (_tmp, dir) = prepare_corpus("chat_herrbasan", Path::new(CHAT_SRC), engine);
-    if engine == Engine::Ram {
-        migrate_to_ram(&dir);
-    }
+fn run_chat() {
+    println!("═══ chat_herrbasan — v3 RAM-first ({CHAT_SRC}) ═══");
+    let (_tmp, dir) = prepare_corpus("chat_herrbasan", Path::new(CHAT_SRC));
     let rss_before_open = rss_bytes().expect("RSS before open");
 
     let started = Instant::now();
-    let db = Arc::new(open_corpus(&dir, engine));
+    let db = Arc::new(open_corpus(&dir));
     let open_ms = started.elapsed().as_secs_f64() * 1000.0;
     let docs = db.len();
     let ids = db.get_all_ids();
@@ -732,7 +608,7 @@ fn run_chat(engine: Engine) {
     });
     top_get.print("warm get, largest 5 docs");
 
-    // The HTTP serialization path itself: v2 copies the stored bytes out of the
+    // The HTTP serialization path itself: the engine hands out the stored bytes
     // mapping, v3 writes the DocVal tree into a pre-sized buffer. No `Value`
     // exists on either side, so this isolates encode cost from materialisation.
     let mut raw_rng = Rng::new(0x0C4A_75EE_D001);
@@ -1126,13 +1002,6 @@ fn main() {
             .unwrap_or_else(|| panic!("--corpus needs a value: memories | chat | all"))
             .clone(),
     };
-    let engine_arg = match args.iter().position(|a| a == "--engine") {
-        None => "both".to_string(),
-        Some(p) => args
-            .get(p + 1)
-            .unwrap_or_else(|| panic!("--engine needs a value: v2 | ram | both"))
-            .clone(),
-    };
     let run_memories_corpus = match corpus.as_str() {
         "all" | "memories" => true,
         "chat" => false,
@@ -1143,25 +1012,14 @@ fn main() {
         "memories" => false,
         other => panic!("unknown --corpus '{other}' (want memories | chat | all)"),
     };
-    let engines: Vec<Engine> = match engine_arg.as_str() {
-        "both" => vec![Engine::V2, Engine::Ram],
-        other => vec![Engine::parse(other).unwrap_or_else(|| {
-            panic!("unknown --engine '{other}' (want v2 | ram | both)")
-        })],
-    };
-
-    println!("nDB real-corpus workloads — v2 mmap vs v3 RAM-first (release)");
+    println!("nDB real-corpus workloads — v3 RAM-first (release)");
     println!("source folders are opened read-only; every copy lives in a tempdir deleted on exit");
     println!();
-    for engine in engines {
-        println!("############ engine {} ############", engine.tag());
-        println!();
-        if run_memories_corpus {
-            run_memories(engine);
-        }
-        if run_chat_corpus {
-            run_chat(engine);
-        }
+    if run_memories_corpus {
+        run_memories();
     }
-    println!("done (corpus {corpus}, engine {engine_arg})");
+    if run_chat_corpus {
+        run_chat();
+    }
+    println!("done (corpus {corpus})");
 }

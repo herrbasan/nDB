@@ -68,6 +68,12 @@ pub trait Io: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RealIo;
 
+/// `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`: a database file is
+/// opened for append while readers and the maintenance tooling hold their own
+/// handles, so every open must share.
+#[cfg(windows)]
+pub(crate) const FILE_SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
+
 impl RealIo {
     pub fn new() -> Self {
         RealIo
@@ -80,7 +86,7 @@ fn open_for_read_write(path: &Path) -> io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(crate::mmap::FILE_SHARE_ALL);
+        options.share_mode(crate::io::FILE_SHARE_ALL);
     }
     options.open(path)
 }
@@ -92,7 +98,7 @@ impl Io for RealIo {
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
-            options.share_mode(crate::mmap::FILE_SHARE_ALL);
+            options.share_mode(crate::io::FILE_SHARE_ALL);
         }
         options.open(path)
     }

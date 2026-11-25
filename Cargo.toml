@@ -49,9 +49,5 @@ name = "doc_perf"
 path = "benches/doc_perf.rs"
 
 [[example]]
-name = "phase3_corpus_bench"
-path = "benches/phase3_corpus_bench.rs"
-
-[[example]]
 name = "corpus_baseline"
 path = "benches/corpus_baseline.rs"

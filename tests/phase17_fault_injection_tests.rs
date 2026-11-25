@@ -169,9 +169,9 @@ fn abrupt_exit_keeps_every_acknowledged_write_recoverable() {
         "child must report all five acknowledged ids, got {acknowledged:?}"
     );
 
-    // Recovery: a fresh process opens the same folder. Every acknowledged
-    // write was fsynced (Persistence::Immediate), so none may be missing.
-    let db = ndb::Database::open_v2(dir.path()).expect("reopen the crashed database");
+    // Recovery: a fresh process opens the same folder. The RAM engine fsyncs
+    // every acknowledged batch, so none may be missing.
+    let db = ndb::Database::open_ram(dir.path()).expect("reopen the crashed database");
     assert_eq!(db.len(), acknowledged.len());
     for (n, id) in acknowledged.iter().enumerate() {
         let doc = db.get(id).expect("acknowledged document survives the crash");

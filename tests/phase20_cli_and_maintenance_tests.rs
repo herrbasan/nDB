@@ -10,7 +10,7 @@ use ndb::ram_format::{
     base_file_name, base_file_path, read_ram_manifest, wal_file_name, wal_file_path,
     RAM_STORAGE_VERSION,
 };
-use ndb::{Database, OpenOptions, Persistence, StorageFormat};
+use ndb::Database;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -54,17 +54,6 @@ fn stderr_of(output: &Output) -> String {
 
 fn path_str(path: &Path) -> &str {
     path.to_str().expect("utf-8 temp path")
-}
-
-fn v2_db(dir: &Path) -> Database {
-    Database::open_v2_with_options(
-        dir,
-        OpenOptions {
-            format: StorageFormat::V2,
-            persistence: Persistence::Immediate,
-        },
-    )
-    .expect("open v2")
 }
 
 fn now_secs() -> u64 {
@@ -136,7 +125,7 @@ fn init_ram_creates_a_complete_v3_folder() {
 }
 
 #[test]
-fn init_accepts_v3_as_an_alias_and_refuses_two_formats_at_once() {
+fn init_accepts_v3_as_an_alias_and_refuses_the_retired_v2_flag() {
     let parent = TempDir::new().unwrap();
     let dir = parent.path().join("alias_db");
     run_cli(&["init", path_str(&dir), "--v3"]);
@@ -145,13 +134,14 @@ fn init_accepts_v3_as_an_alias_and_refuses_two_formats_at_once() {
         RAM_STORAGE_VERSION
     );
 
-    let other = parent.path().join("conflict_db");
+    let other = parent.path().join("retired_db");
     let out = Command::new(ndb_exe())
-        .args(["init", path_str(&other), "--v2", "--ram"])
+        .args(["init", path_str(&other), "--v2"])
         .output()
         .expect("spawn ndb init");
     assert!(!out.status.success());
-    assert!(stderr_of(&out).contains("mutually exclusive"));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("retired binary/mmap backend"), "{stderr}");
     assert!(!other.exists(), "a refused init creates nothing");
 }
 
@@ -285,113 +275,56 @@ fn migrate_to_ram_accepts_the_to_flag_and_rejects_impossible_targets() {
         .output()
         .expect("spawn migrate");
     assert!(!bad.status.success());
-    assert!(stderr_of(&bad).contains("--to accepts v2 | ram"));
+    assert!(stderr_of(&bad).contains("--to accepts ram (v3) only"));
     assert!(
         other.path().join("data.jsonl").exists(),
         "a refused migration leaves the source untouched"
     );
 }
 
-// ─── `ndb migrate --ram` from v2 ────────────────────────────────────────────
+// ─── v2 mmap retirement ───────────────────────────────────────────
 
 #[test]
-fn migrate_v2_to_ram_preserves_lineage_indexes_and_v2_backup() {
+fn migrate_refuses_a_v2_mmap_folder_and_points_at_the_transition_binary() {
     let dir = TempDir::new().unwrap();
-    let (epoch, last_seq, source_indexes) = {
-        let db = v2_db(dir.path());
-        db.create_index("kind").unwrap();
-        db.create_btree_index("score").unwrap();
-        for i in 0..60 {
-            db.insert(json!({
-                "kind": if i % 3 == 0 { "alpha" } else { "beta" },
-                "score": i,
-                "payload": {"deep": [i, i + 1], "text": "round-trip me"},
-            }))
-            .unwrap();
-        }
-        let ids = db.get_all_ids();
-        db.set(&ids[0], "kind", json!("mutated")).unwrap();
-        db.delete(&ids[1]).unwrap();
-        let lineage = db.lineage();
-        let indexes: Vec<(String, String)> = db
-            .v2_manifest()
-            .expect("v2 manifest")
-            .indexes
-            .iter()
-            .map(|spec| (spec.field.clone(), format!("{:?}", spec.kind)))
-            .collect();
-        let docs = db.snapshot_at().docs;
-        (lineage.source_epoch_uuid, lineage.last_seq, (indexes, docs))
-    };
-    let (indexes, docs) = source_indexes;
-    assert_eq!(indexes.len(), 2, "both index declarations are visible");
+    fs::write(
+        dir.path().join("manifest.json"),
+        serde_json::to_string_pretty(&json!({
+            "format_version": 2,
+            "base_gen": 1,
+            "wal_gen": 1,
+            "source_epoch_uuid": "00000000-0000-4000-8000-000000000000",
+            "base_seq": 0,
+            "min_available_seq": 1,
+            "doc_count": 0,
+            "indexes": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
-    let v2_manifest_text =
-        fs::read_to_string(dir.path().join("manifest.json")).expect("v2 manifest text");
-
-    let out = run_cli(&["migrate", path_str(dir.path()), "--ram"]);
-    let text = stdout_of(&out);
-    assert!(text.contains("to v3 (RAM-first)"), "{text}");
-    assert!(text.contains("Source: v2 binary generations"), "{text}");
-
-    // Source artefacts preserved, byte for byte, before the swap.
-    let backup = dir.path().join("_v2_backup");
-    assert_eq!(
-        fs::read_to_string(backup.join("manifest.json")).unwrap(),
-        v2_manifest_text,
-        "the v2 manifest is preserved verbatim"
-    );
-    assert!(backup.join("base.gen_1.ndb").is_file());
-    assert!(backup.join("wal.gen_1.ndb").is_file());
-
-    let manifest = read_ram_manifest(dir.path()).expect("v3 manifest");
-    assert_eq!(manifest.version, RAM_STORAGE_VERSION);
-    assert_eq!(manifest.source_epoch_uuid, epoch);
-    assert_eq!(manifest.last_seq, last_seq);
-    let written: Vec<(String, String)> = manifest
-        .indexes
-        .iter()
-        .map(|spec| (spec.field.clone(), format!("{:?}", spec.kind)))
-        .collect();
-    assert_eq!(written, indexes, "every index definition survives");
-
-    let db = Database::open_ram(dir.path()).expect("open the migrated database");
-    assert_eq!(db.len(), docs.len());
-    assert_eq!(db.lineage().source_epoch_uuid, epoch);
-    assert_eq!(db.lineage().last_seq, last_seq);
-    for (id, expected) in &docs {
-        assert_eq!(
-            &db.get(id).unwrap_or_else(|e| panic!("missing {id:?}: {e}")),
-            expected,
-            "document {id} round-trips through the v2 → v3 migration"
-        );
-    }
-    drop(db);
-
-    // The indexes are rebuilt from the manifest, so a query still plans on them.
-    let db = Database::open_ram(dir.path()).unwrap();
-    assert!(db.has_hash_index("kind"));
-    assert!(db.has_btree_index("score"));
-    let known = db.get_all_ids()[0].clone();
-    assert!(db.get(&known).is_ok());
-    drop(db);
-
-    let fsck = run_cli(&["fsck", path_str(dir.path())]);
-    let fsck_text = stdout_of(&fsck);
-    assert!(fsck_text.contains("indexes: 2"), "{fsck_text}");
-    assert!(fsck_text.contains("OK"), "{fsck_text}");
-
-    // And a second run is refused rather than migrating again.
-    let again = Command::new(ndb_exe())
-        .args(["migrate", path_str(dir.path()), "--ram"])
+    let out = Command::new(ndb_exe())
+        .args(["migrate", path_str(dir.path())])
         .output()
-        .expect("spawn second migrate");
-    assert!(!again.status.success());
-    assert!(stderr_of(&again).contains("already a v3 (RAM-first) database"));
+        .expect("spawn migrate");
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("engine was retired"), "{stderr}");
+    assert!(stderr.contains("v2/transition binary"), "{stderr}");
+
+    // The library refuses the same folder instead of degrading silently.
+    let error = match Database::open(dir.path()) {
+        Ok(_) => panic!("a v2 folder must not open"),
+        Err(e) => e,
+    };
+    assert!(
+        error.to_string().contains("engine was retired"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
-fn migrate_without_a_flag_still_targets_v2() {
+fn migrate_without_a_flag_targets_v3_ram_first() {
     let dir = TempDir::new().unwrap();
     let db = Database::open(dir.path().join("data.jsonl")).unwrap();
     for i in 0..5 {
@@ -400,11 +333,15 @@ fn migrate_without_a_flag_still_targets_v2() {
     drop(db);
 
     let out = run_cli(&["migrate", path_str(dir.path())]);
-    assert!(stdout_of(&out).contains("to v2"), "{}", stdout_of(&out));
-    // A v2 manifest names the field `format_version`, not `version`.
+    assert!(
+        stdout_of(&out).contains("to v3 (RAM-first)"),
+        "{}",
+        stdout_of(&out)
+    );
+    // A v3 manifest names the field `version`, not `format_version`.
     let raw = fs::read_to_string(dir.path().join("manifest.json")).unwrap();
-    assert!(raw.contains("\"format_version\""));
-    assert!(Database::open_v2(dir.path()).is_ok());
+    assert!(raw.contains("\"version\": 3"), "{raw}");
+    assert!(Database::open_ram(dir.path()).is_ok());
 }
 
 // ─── `ndb fsck` / `ndb repair` on v3 ────────────────────────────────────────

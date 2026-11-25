@@ -27,7 +27,6 @@ use crate::crc32::{crc32, Crc32Hasher};
 use crate::docval::{DocRecord, DocVal};
 use crate::error::{Error, Result};
 use crate::io::Io;
-use crate::v2_format::{V2IndexKind, V2IndexSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
@@ -103,6 +102,53 @@ pub fn ram_manifest_path(dir: &Path) -> PathBuf {
     dir.join(MANIFEST_FILE)
 }
 
+/// Full path of `manifest.json` inside `dir` (unprefixed alias).
+pub fn manifest_path(dir: &Path) -> PathBuf {
+    ram_manifest_path(dir)
+}
+
+/// One persisted secondary index declaration.
+///
+/// The JSON shape is fixed by `manifest.json`: `{"field": ..., "kind": ...}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexSpec {
+    /// Document field the index is built on.
+    pub field: String,
+    /// Index structure.
+    pub kind: IndexKind,
+}
+
+/// The two index structures nDB persists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexKind {
+    /// O(1) equality lookups.
+    #[serde(rename = "hash")]
+    Hash,
+    /// Ordered range scans.
+    #[serde(rename = "btree")]
+    BTree,
+}
+
+impl IndexKind {
+    /// Binary tag used in the persisted index section.
+    pub fn tag(self) -> u8 {
+        match self {
+            IndexKind::Hash => 1,
+            IndexKind::BTree => 2,
+        }
+    }
+
+    /// Parse the binary tag; `None` for an unknown value.
+    pub fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(IndexKind::Hash),
+            2 => Some(IndexKind::BTree),
+            _ => None,
+        }
+    }
+}
+
 // ─── Manifest ───────────────────────────────────────────────────────────────
 
 /// The generation and lineage authority of a v3 database folder.
@@ -125,7 +171,7 @@ pub struct RamManifest {
     /// Oldest sequence still replayable through the change feed.
     pub min_available_seq: u64,
     /// Persisted secondary index declarations.
-    pub indexes: Vec<V2IndexSpec>,
+    pub indexes: Vec<IndexSpec>,
 }
 
 /// Read and strictly validate `manifest.json` from `dir`.
@@ -616,7 +662,7 @@ pub enum RamWalOp {
         /// Indexed field.
         field: String,
         /// Index structure.
-        kind: V2IndexKind,
+        kind: IndexKind,
     },
     /// Drop a secondary index. Consumes **no** document sequence.
     IndexDrop {
@@ -709,7 +755,7 @@ impl RamWalRecord {
     }
 
     /// An `IndexAdd` (no document sequence).
-    pub fn index_add(field: impl Into<String>, kind: V2IndexKind) -> Self {
+    pub fn index_add(field: impl Into<String>, kind: IndexKind) -> Self {
         RamWalRecord {
             seq: 0,
             op: RamWalOp::IndexAdd {
@@ -1066,7 +1112,7 @@ fn decode_op(tag: u8, payload: &[u8], path: &Path, frame_offset: u64) -> Result<
         6 => {
             let field = reader.string("index field")?;
             let kind_tag = reader.u8("index kind")?;
-            let kind = V2IndexKind::from_tag(kind_tag)
+            let kind = IndexKind::from_tag(kind_tag)
                 .ok_or_else(|| reader.fail(&format!("unknown index kind tag {kind_tag}")))?;
             RamWalOp::IndexAdd { field, kind }
         }
@@ -1733,7 +1779,7 @@ pub struct RamFsckReport {
     /// Batches in the pending WAL, when one is declared.
     pub pending_batches: Option<usize>,
     /// Declared secondary indexes.
-    pub indexes: Vec<V2IndexSpec>,
+    pub indexes: Vec<IndexSpec>,
     /// Non-fatal findings (torn tails that recovery will truncate).
     pub warnings: Vec<String>,
 }
@@ -1868,7 +1914,7 @@ fn open_append(path: &Path) -> Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(crate::mmap::FILE_SHARE_ALL);
+        options.share_mode(crate::io::FILE_SHARE_ALL);
     }
     options
         .open(path)
@@ -1963,9 +2009,9 @@ mod tests {
             pending_wal_gen: None,
             last_seq: 7,
             min_available_seq: 1,
-            indexes: vec![V2IndexSpec {
+            indexes: vec![IndexSpec {
                 field: "tag".to_string(),
-                kind: V2IndexKind::Hash,
+                kind: IndexKind::Hash,
             }],
         }
     }
@@ -2143,7 +2189,7 @@ mod tests {
             ),
             RamWalRecord::delete(start + 3, "b"),
             RamWalRecord::restore(start + 4, "b", br#"{"n":2}"#.to_vec()),
-            RamWalRecord::index_add("tag", V2IndexKind::BTree),
+            RamWalRecord::index_add("tag", IndexKind::BTree),
             RamWalRecord::index_drop("legacy"),
         ]
     }
@@ -2194,7 +2240,7 @@ mod tests {
         let mut writer =
             RamWalWriter::create_or_open(&path, 0, Arc::new(RealIo)).expect("create writer");
         let batch = vec![
-            RamWalRecord::index_add("tag", V2IndexKind::Hash),
+            RamWalRecord::index_add("tag", IndexKind::Hash),
             RamWalRecord::index_drop("legacy"),
         ];
         assert_eq!(writer.append_batch_and_sync(&batch).expect("append"), 0);
@@ -2682,9 +2728,9 @@ mod tests {
             pending_wal_gen: None,
             last_seq: 5,
             min_available_seq: 1,
-            indexes: vec![V2IndexSpec {
+            indexes: vec![IndexSpec {
                 field: "tag".to_string(),
-                kind: V2IndexKind::Hash,
+                kind: IndexKind::Hash,
             }],
         };
         write_ram_manifest_atomic(dir.path(), &manifest, &RealIo).expect("manifest");

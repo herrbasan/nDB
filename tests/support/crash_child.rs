@@ -93,18 +93,10 @@ pub fn run(role: &str) -> ! {
         // Abrupt death after acknowledged writes: the parent must find every
         // acknowledged document after reopening the database.
         "db-abrupt-exit" => {
-            use ndb::{Database, OpenOptions, Persistence, StorageFormat};
             use std::io::Write;
             use serde_json::json;
 
-            let db = Database::open_v2_with_options(
-                dir(),
-                OpenOptions {
-                    format: StorageFormat::V2,
-                    persistence: Persistence::Immediate,
-                },
-            )
-            .expect("open the child database");
+            let db = ndb::Database::open_ram(dir()).expect("open the child database");
             // The test harness writes "test crash_child_entrypoint ... "
             // without a newline, so start the id stream on a clean line.
             println!();

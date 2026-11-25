@@ -1,5 +1,5 @@
-﻿//! Seeded differential oracle: the RAM-first semantics as implemented by the
-//! v2 backend must equal the sequential reference model, exactly, on every
+//! Seeded differential oracle: the RAM-first semantics must equal the
+//! sequential reference model, exactly, on every
 //! observable â€” return values, error classes, stored documents, sequence
 //! numbers, query pages (indexed and unindexed), facets, snapshots and the
 //! change feed.
@@ -13,8 +13,8 @@ use serde_json::{json, Value};
 use std::path::Path;
 use support::refdb::{sample_doc, RefDb, RefError, RefOp};
 
-fn open_v2(dir: &Path) -> Database {
-    Database::open_v2(dir).expect("open a v2 database")
+fn open_ram(dir: &Path) -> Database {
+    Database::open_ram(dir).expect("open a RAM-first database")
 }
 
 fn ref_error(error: &ndb::Error) -> RefError {
@@ -241,14 +241,16 @@ fn query_battery() -> Vec<Value> {
 }
 
 fn option_battery() -> Vec<QueryOptions> {
-    // NOTE: `offset` without `limit` is deliberately absent. The v2 backend
-    // ignores `offset` in that combination (see
-    // `v2_ignores_offset_without_a_limit_known_defect` below), while the
-    // reference model â€” and v1 â€” honour it.
     vec![
         QueryOptions::default(),
         QueryOptions {
             limit: Some(3),
+            ..QueryOptions::default()
+        },
+        // `offset` without `limit` must page exactly like the reference model
+        // (herrbasan/nDB#15): the v2 engine got this wrong, v3 does not.
+        QueryOptions {
+            offset: Some(2),
             ..QueryOptions::default()
         },
         QueryOptions {
@@ -373,7 +375,7 @@ fn compare_snapshot(db: &Database, reference: &RefDb, label: &str) {
 
 fn run_seed(seed: u64, steps: usize) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let db = open_v2(dir.path());
+    let db = open_ram(dir.path());
     let mut reference = RefDb::new();
     let mut rng = fastrand::Rng::with_seed(seed);
 
@@ -566,7 +568,7 @@ fn randomized_mutations_match_the_reference_model() {
 #[test]
 fn indexed_queries_match_unindexed_queries_and_the_reference_model() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let db = open_v2(dir.path());
+    let db = open_ram(dir.path());
     let mut reference = RefDb::new();
     let mut rng = fastrand::Rng::with_seed(0xC0FFEE);
 
@@ -580,11 +582,10 @@ fn indexed_queries_match_unindexed_queries_and_the_reference_model() {
     let unindexed = compare_queries(&db, &reference, "unindexed");
     assert!(unindexed > 0);
 
-    // A v2 index declaration consumes one WAL seq and emits no change event.
+    // Index DDL is a schema-only batch: it consumes no document seq and emits
+    // no change event (herrbasan/nDB#17).
     db.create_index("score").expect("hash index on score");
-    reference.note_index_seq();
     db.create_btree_index("kind").expect("btree index on kind");
-    reference.note_index_seq();
     assert_in_sync(&db, &reference, "after index creation");
 
     // Same state, same queries: the planner must not change the answer.
@@ -617,7 +618,7 @@ fn indexed_queries_match_unindexed_queries_and_the_reference_model() {
 #[test]
 fn error_classes_match_the_reference_model() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let db = open_v2(dir.path());
+    let db = open_ram(dir.path());
     let mut reference = RefDb::new();
 
     // Insert rejects a non-object the same way on both sides.
@@ -699,7 +700,7 @@ fn error_classes_match_the_reference_model() {
 #[test]
 fn no_op_writes_move_neither_seq_nor_the_feed() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let db = open_v2(dir.path());
+    let db = open_ram(dir.path());
     let mut reference = RefDb::new();
 
     let id = db
@@ -745,7 +746,7 @@ fn no_op_writes_move_neither_seq_nor_the_feed() {
 #[test]
 fn cursor_contract_matches_the_reference_model() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let db = open_v2(dir.path());
+    let db = open_ram(dir.path());
     let mut reference = RefDb::new();
     let id = db.insert(json!({"n": 1})).expect("insert");
     reference.insert_with_id(&id, json!({"n": 1})).expect("insert");
@@ -756,40 +757,3 @@ fn cursor_contract_matches_the_reference_model() {
     compare_changes(&db, &reference, u64::MAX, "cursor far ahead");
 }
 
-/// A recorded v2 defect, pinned so it cannot be forgotten (herrbasan/nDB#15).
-///
-/// An unsorted v2 query applies `offset` only inside the `limit` window
-/// (`cap.map_or(true, |cap| index >= offset && index < cap)` in
-/// `V2Engine::select_matches`), so `offset` with no `limit` is ignored and the
-/// page starts at the first match. v1 and the contract both skip `offset`
-/// matches. Phase 1's engine must follow the contract; when it does, this test
-/// fails and should be deleted.
-#[test]
-fn v2_ignores_offset_without_a_limit_known_defect() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db = open_v2(dir.path());
-    let mut reference = RefDb::new();
-    for n in 0..5 {
-        let doc = json!({"n": n});
-        let id = db.insert(doc.clone()).expect("insert");
-        reference.insert_with_id(&id, doc).expect("insert");
-    }
-
-    let opts = QueryOptions {
-        offset: Some(2),
-        ..QueryOptions::default()
-    };
-    let actual = db.query_with(json!({}), opts.clone()).expect("query");
-    let expected = reference.query_with(&json!({}), &opts).expect("query");
-    assert_eq!(
-        actual.len(),
-        5,
-        "v2 currently ignores offset without a limit"
-    );
-    assert_eq!(
-        expected.len(),
-        3,
-        "the contract skips the offset matches"
-    );
-    assert_ne!(doc_ids(&actual), doc_ids(&expected));
-}

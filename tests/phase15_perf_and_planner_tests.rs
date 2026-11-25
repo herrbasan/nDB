@@ -289,13 +289,12 @@ fn planner_keeps_indexes_in_sync_through_mutations() {
 }
 
 #[test]
-fn planner_equals_full_scan_on_a_compacted_v2_database() {
-    use ndb::{OpenOptions, Persistence, StorageFormat};
+fn planner_equals_full_scan_on_a_compacted_ram_database() {
     use std::fs;
 
     // The v1 reference: the same corpus with the same in-memory indexes.
     let reference_dir = TempDir::new().unwrap();
-    let reference = seeded("v2-reference", &reference_dir);
+    let reference = seeded("ram-reference", &reference_dir);
     for field in ["n", "s", "flag", "nil", "meta.score", "meta.kind"] {
         reference.create_index(field).unwrap();
         reference.create_btree_index(field).unwrap();
@@ -303,40 +302,31 @@ fn planner_equals_full_scan_on_a_compacted_v2_database() {
     reference.create_index("tags").unwrap();
     reference.create_btree_index("f").unwrap();
 
-    // The v2 leg: 500 documents, both index kinds, then compaction — so every
-    // index probed below is a zero-copy section read straight from the mmap.
-    let v2_root = TempDir::new().unwrap();
-    let v2_dir = v2_root.path().join("db");
-    fs::create_dir_all(&v2_dir).unwrap();
-    let v2 = Database::open_v2_with_options(
-        &v2_dir,
-        OpenOptions {
-            format: StorageFormat::V2,
-            persistence: Persistence::Immediate,
-        },
-    )
-    .unwrap();
+    // The RAM-first leg: 500 documents, both index kinds, then compaction.
+    let ram_root = TempDir::new().unwrap();
+    let ram_dir = ram_root.path().join("db");
+    fs::create_dir_all(&ram_dir).unwrap();
+    let ram = Database::open_ram(&ram_dir).unwrap();
     for i in 0..500 {
-        v2.insert(corpus_doc(i)).unwrap();
+        ram.insert(corpus_doc(i)).unwrap();
     }
-    // v2 declares one index kind per field: BTree where the probes exercise a
-    // range, Hash where they exercise equality/$in. Both kinds are therefore
-    // read zero-copy from the mapping.
+    // One index kind per field: BTree where the probes exercise a range, Hash
+    // where they exercise equality/$in.
     for field in ["n", "f", "s", "meta.score"] {
-        v2.create_btree_index(field).unwrap();
+        ram.create_btree_index(field).unwrap();
     }
     for field in ["flag", "nil", "meta.kind", "tags"] {
-        v2.create_index(field).unwrap();
+        ram.create_index(field).unwrap();
     }
-    v2.compact().unwrap();
-    assert!(v2.is_v2());
-    assert!(v2.has_index("n") && v2.has_index("meta.score") && v2.has_index("f"));
+    ram.compact().unwrap();
+    assert!(ram.is_ram());
+    assert!(ram.has_index("n") && ram.has_index("meta.score") && ram.has_index("f"));
 
     for p in planner_probes() {
         let expected = reference
             .query_projected(p.filter.clone(), p.opts.clone(), p.fields.as_deref())
             .unwrap();
-        let actual = v2
+        let actual = ram
             .query_projected(p.filter.clone(), p.opts.clone(), p.fields.as_deref())
             .unwrap();
         assert_eq!(expected.0, actual.0, "probe '{}': total mismatch", p.label);
@@ -350,20 +340,20 @@ fn planner_equals_full_scan_on_a_compacted_v2_database() {
         let reference_docs = reference
             .query_with(p.filter.clone(), p.opts.clone())
             .unwrap();
-        let v2_docs = v2.query_with(p.filter.clone(), p.opts.clone()).unwrap();
+        let ram_docs = ram.query_with(p.filter.clone(), p.opts.clone()).unwrap();
         assert_eq!(
             fingerprint(reference_docs),
-            fingerprint(v2_docs),
+            fingerprint(ram_docs),
             "probe '{}': query_with mismatch",
             p.label
         );
 
         // The HTTP raw fast path must select exactly the same page as the
         // unprojected query (projection is a separate path).
-        let (raw_total, raw_docs) = v2
+        let (raw_total, raw_docs) = ram
             .query_raw(p.filter.clone(), p.opts.clone())
             .unwrap();
-        let unprojected = v2
+        let unprojected = ram
             .query_projected(p.filter.clone(), p.opts.clone(), None)
             .unwrap();
         assert_eq!(raw_total, unprojected.0, "probe '{}': query_raw total", p.label);
@@ -379,24 +369,24 @@ fn planner_equals_full_scan_on_a_compacted_v2_database() {
         );
     }
 
-    // Indexed range + equality probes directly against the mapped sections.
+    // Indexed range + equality probes directly against the built indexes.
     let plain_range = reference.find_range("n", &json!(-5), &json!(10));
-    let v2_range = v2.find_range("n", &json!(-5), &json!(10));
+    let ram_range = ram.find_range("n", &json!(-5), &json!(10));
     assert_eq!(plain_range.len(), 16, "-5..=10 is 16 integers");
-    assert_eq!(fingerprint(plain_range), fingerprint(v2_range));
+    assert_eq!(fingerprint(plain_range), fingerprint(ram_range));
     assert_eq!(
         fingerprint(reference.find("meta.kind", &json!("beta"))),
-        fingerprint(v2.find("meta.kind", &json!("beta")))
+        fingerprint(ram.find("meta.kind", &json!("beta")))
     );
 
-    // Writes after the compaction land in the WAL overlay and still resolve
-    // through both the mapped base index and the overlay index.
-    let id = v2.insert(json!({"n": 10_000, "s": "z"})).unwrap();
-    assert_eq!(v2.find("n", &json!(10_000)).len(), 1);
-    assert_eq!(v2.find_range("n", &json!(9_999), &json!(10_001)).len(), 1);
-    v2.delete(&id).unwrap();
-    assert_eq!(v2.find("n", &json!(10_000)).len(), 0);
-    assert!(v2.deleted_ids().contains(&id));
+    // Writes after the compaction land in the WAL and still resolve through
+    // the rebuilt indexes.
+    let id = ram.insert(json!({"n": 10_000, "s": "z"})).unwrap();
+    assert_eq!(ram.find("n", &json!(10_000)).len(), 1);
+    assert_eq!(ram.find_range("n", &json!(9_999), &json!(10_001)).len(), 1);
+    ram.delete(&id).unwrap();
+    assert_eq!(ram.find("n", &json!(10_000)).len(), 0);
+    assert!(ram.deleted_ids().contains(&id));
 }
 
 // ─── Indexed speed sanity ──────────────────────────────────────────
