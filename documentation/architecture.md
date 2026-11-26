@@ -8,17 +8,36 @@
 
 **Three interfaces until v2.0.0, two now.** The napi Node binding crate was removed in v2.0.0. nDB is consumed two ways: the Rust crate (`Database::open`) and the **HTTP daemon** (`ndb serve`, design: `docs/ndb-serve-design.md`) — a resident process that owns one or many named databases in memory and serves queries to any client over HTTP. The daemon exists for large shared databases (multi-GB) where N apps must not each hold the data in their own heap: data and computation stay in Rust, only results cross the wire. Node consumers (`mcp_server`, `LLM-Gateway-Chat`) use this HTTP API.
 
-**Database-as-a-Folder.** nDB's intended and production structure is one **directory per database**. The convention used by the primary consumer (LLM-Gateway-Chat) and produced by the CLI is:
+**Storage engines (v3.0.0).** RAM-first is the only binary backend: authoritative
+`DocVal`/`DocRecord` trees in RAM, an op-level WAL (`wal.gen_<N>.ndb`, each batch
+ending in a `Commit` frame) with per-database group commit, a bounded change ring,
+non-blocking compaction and pinned snapshots. Nothing is mmap'ed and no index
+section is read from disk; a cold open replays base + WAL into RAM once. The v2
+mmap engine was retired 2026-11-25 (`v2-storage.md` is archaeology). `v1`
+(`data.jsonl`) remains supported; `ndb init` creates v3. Normative detail:
+`docs/contract_ram-first-engine.md`; summary: `documentation/ram-storage.md`.
+
+**Database-as-a-Folder.** nDB's intended and production structure is one **directory per database**. A **v3** folder holds the RAM-first artefacts; a **v1** folder holds `data.jsonl`. Both carry `_files/`, `_trash/` and `meta.json`:
 
 ```
 my-app/
-├── data.jsonl     # The append-only document store (this file is passed to Database::open)
-├── _files/        # Managed binary buckets (SHA-256 deduplication)
-├── _trash/        # Soft-deleted documents and files
-└── meta.json      # Schema/bucket metadata — written by the CLI/migration; the core reads the `buckets` policy block at open (schema validation still not implemented)
+├── manifest.json   # v3 only — sole generation/lineage authority (`version: 3`)
+├── base.gen_1.ndb  # v3 only — streamed immutable snapshot (CRC-32 framed records)
+├── wal.gen_1.ndb   # v3 only — op-level append log, one `Commit` frame per batch
+├── data.jsonl      # v1 only — the append-only document store
+├── _files/         # Managed binary buckets (SHA-256 deduplication)
+├── _trash/         # Soft-deleted documents and files
+└── meta.json       # Schema/bucket metadata — written by the CLI/migration; the core reads the `buckets` policy block at open (schema validation still not implemented)
 ```
 
-**Important nuance:** the Rust core's `Database::open(path)` takes the **`data.jsonl` file itself**, not the folder. The library derives the folder as the file's parent and creates `_files/` and `_trash/` as siblings of the `.jsonl`. So a "folder database" is a *container convention* imposed by the caller (or the CLI), not something `open()` sets up for you. `meta.json` is present in real folders; the core reads the `buckets` policy block at open (see below) but does not write the file, and schema validation is not implemented.
+**Important nuance:** the Rust core's `Database::open(path)` takes the folder (v3
+manifest) or the **`data.jsonl` file itself** (v1); a folder argument detects the
+backend. The library derives the folder as the file's parent and creates `_files/`
+and `_trash/` as siblings of the `.jsonl`. So a "folder database" is a *container
+convention* imposed by the caller (or the CLI), not something `open()` sets up for
+you. `meta.json` is present in real folders; the core reads the `buckets` policy
+block at open (see below) but does not write the file, and schema validation is
+not implemented.
 
 ### Layout convention: database-as-a-folder
 

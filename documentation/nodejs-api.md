@@ -1,6 +1,6 @@
 # nDB Node.js API Reference (REMOVED in v2.0.0)
 
-> ⚠️ **This API no longer exists.** The `napi/` native addon, its `.node` prebuilts, `index.js`, `vendor.js` and `setup.js` were **deleted in nDB v2.0.0** (2026-11-23). Node and Electron consumers use the `ndb serve` HTTP API instead — see `documentation/cli.md` and `docs/ndb-serve-design.md`.
+> ⚠️ **This API no longer exists.** The `napi/` native addon, its `.node` prebuilts, `index.js`, `vendor.js` and `setup.js` were **deleted in nDB v2.0.0** (2026-11-23). Node and Electron consumers use the `ndb serve` HTTP API instead — see `documentation/cli.md`, `docs/contract_http-api.md` and `docs/ndb-serve-design.md`. (Current release: **v3.0.0**, RAM-first engine + standalone query contract; there is still no Node binding.)
 >
 > What follows is the historical reference for v1.x, kept only so old call sites can be migrated. Do not treat any method here as available.
 
@@ -263,7 +263,7 @@ Get all active (non-deleted) documents.
 const allDocs = db.iter();
 ```
 
-> ⚠️ **Size limit (v1.x only):** `iter()` marshalled the entire database as one JSON string across the (now removed) napi boundary. Node consumers on v2.0.0 use `POST /v2/dbs/{name}/query` with `limit`/`offset` paging.
+> ⚠️ **Size limit (v1.x only):** `iter()` marshalled the entire database as one JSON string across the (now removed) napi boundary. Node consumers use `POST /v2/dbs/{name}/query` with `limit`/`offset` (or `cursor`) paging.
 
 ---
 

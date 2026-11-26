@@ -19,7 +19,7 @@
 
 ## What nDB Is
 
-nDB is an **embeddable in-memory document database** built in Rust. It stores JSON documents in a `HashMap` for O(1) lookups and persists them to an append-only JSON Lines file (v1) or to the **v3 RAM-first** binary format (`manifest.json` + `base.gen_<N>.ndb` + op-level `wal.gen_<N>.ndb`). Since **v2.0.0** it is also the **standalone multi-DB HTTP service `ndb serve`** — the only non-Rust interface. The napi Node binding crate was removed in v2.0.0 (no `.node` prebuilts, zero NAPI); `mcp_server` and `LLM-Gateway-Chat` talk to `ndb serve`. Full-text, lexical, vector and hybrid search belong to `nVDB`, not here.
+nDB is an **embeddable in-memory document database** built in Rust. It stores JSON documents in a `HashMap` for O(1) lookups and persists them to an append-only JSON Lines file (v1) or to the **v3 RAM-first** binary format (`manifest.json` + `base.gen_<N>.ndb` + op-level `wal.gen_<N>.ndb`). Since **v2.0.0** it is also the **standalone multi-DB HTTP service `ndb serve`** — the only non-Rust interface. The napi Node binding crate was removed in v2.0.0 (no `.node` prebuilts, zero NAPI); `mcp_server` and `LLM-Gateway-Chat` talk to `ndb serve`. **v3.0.0 (2026-11-25)** retired the v2 mmap engine and made RAM-first the only binary backend; it also added the standalone object/query contract (Phase 4A: lexical `/search` + `query.text`, `sort_keys`, cursor pagination, schema/field mapping, classification profile, `peek`). Advanced full-text (BM25, vectors, hybrid, rerank) belongs to `nVDB`; nDB's own lexical search is a correct scan that keeps the database useful with nVDB stopped. `mcp_server` coordinates both through `src/lib/ndb-query-facade.js`.
 
 ## Core Design
 
@@ -62,7 +62,8 @@ Index declarations live in `ram_format::{IndexSpec, IndexKind}`
 (`{"field": ..., "kind": "hash"|"btree"}` — the shape the live
 `manifest.json` files already carry) and are rebuilt into RAM at open.
 Checksums: `src/crc32.rs`. CLI: `ndb init [--ram]`, `migrate [--ram]`, `fsck`,
-`repair`, `export --jsonl`. Reference: `documentation/cli.md`.
+`repair`, `export --jsonl`. Reference: `documentation/ram-storage.md` (v3
+engine) and `documentation/cli.md`.
 
 **v2 mmap was retired (2026-11-25).** `src/v2_engine.rs`, `src/v2_format.rs`,
 `src/v2_json_scan.rs` and `src/mmap.rs` are gone; the code stays in git history
@@ -98,12 +99,13 @@ replaced is retired and preserved only in git history.
   (`Insert`/`Replace`/`Patch`/`Delete`/`Restore`) plus one `Commit` in a single
   `write_all` + `sync_all`, and only then publishes. Transient I/O
   (`Interrupted`, Windows 32) retries after truncating the batch back to its
-  start offset; anything else poisons the DB (`Error::Poisoned`, HTTP 503) with
-  nothing published. Index DDL is a schema-only batch that consumes **no**
-  document seq (#17); `offset` is honoured without `limit` (#15); the fsync is
-  unconditional (#16). Memory is governed by `RamConfig` (unpinned ring
-  eviction first, then `Error::MemoryLimitExceeded` / HTTP 507 before the WAL is
-  touched).
+  start offset; anything else poisons the DB (`Error::Poisoned` / HTTP
+  `503 db_poisoned`) with nothing published. Index DDL is a schema-only batch
+  that consumes **no** document seq (#17); `offset` is honoured without `limit`
+  (#15); the fsync is unconditional (#16). Memory is governed by `RamConfig` —
+  `max_memory_bytes` (unpinned ring eviction first, then
+  `Error::MemoryLimitExceeded` / HTTP `507 memory_limit_exceeded` before the WAL
+  is touched).
 - **Compaction (slice 2A) is non-blocking.** Three phases, serialised by a
   dedicated `compaction_lock`, never holding the commit or state lock across
   base serialization: (1) *freeze & durable rotate* under `commit_lock` —
@@ -255,7 +257,16 @@ Resident daemon (`src/server.rs`) — hand-rolled HTTP/1.1 on `std::net`, no asy
 
 **There is no Node binding.** The `napi/` crate was removed in **v2.0.0** (2026-11-23) along with its committed `.node` prebuilts, `index.js`/`vendor.js`/`setup.js` — zero NAPI anywhere in the ecosystem. Node and Electron consumers use `ndb serve` over HTTP; `mcp_server` and `LLM-Gateway-Chat` are live on it. `ndb serve` keeps one copy of the data in one Rust process instead of one copy per Node process, which is what the binding could never do.
 
-**Full-text search belongs to nVDB for the advanced cases.** `src/search.rs`, `type: "text"` in `/index` and the v2 native full-text index were removed in v2.0.0. The Phase 4A standalone contract adds back a **basic, scan-based lexical** `/search` and `query.text` (AND terms + phrases, no ranking/stemming/vectors) so nDB stays useful with nVDB stopped; `nVDB` remains the accelerated and advanced path. Old `_index_*.fti` files left on disk are warned about and ignored at open, so existing folders mount unchanged.
+Node consumers that want coordination with `nVDB` use an embedded **query facade**
+rather than a new service (`mcp_server/src/lib/ndb-query-facade.js`, spec
+`spec_ndb-standalone-contract.md` §1/§5): objects, writes, peeks and schema always
+go to nDB; `listItems` prefers nVDB only when the class allows it, the field
+mapping projects every requested field, nVDB is online and its `as_of_seq` covers
+the read-your-writes watermark; `lexical` search uses nVDB when fresh and nDB's
+standalone scan otherwise; `vector`/`hybrid`/`rerank` require nVDB and raise
+`NvdbUnavailableError` — never a silent downgrade.
+
+**Full-text search: nDB's own lexical scan, nVDB's advanced engines.** `src/search.rs`, `type: "text"` in `/index` and the native full-text inverted index were removed in v2.0.0. The Phase 4A standalone contract adds **basic, scan-based lexical** `/search` and `query.text` (AND terms + phrases, no ranking/stemming/vectors) so nDB stays useful with nVDB stopped; `nVDB` remains the accelerated and advanced path (BM25, vectors, hybrid, rerank). Old `_index_*.fti` files left on disk are warned about and ignored at open, so existing folders mount unchanged.
 
 ## Current Implementation Status
 
@@ -284,7 +295,7 @@ Resident daemon (`src/server.rs`) — hand-rolled HTTP/1.1 on `std::net`, no asy
 | nURI `link` type enforcement | Not implemented (file refs detected heuristically by string match, not by schema) |
 | Bucket migration script for legacy data | Not bundled here (the consumer's `migrate-ndb-to-folder.js` was used in production) |
 
-## Release Path (v2.0.0, standalone service)
+## Release Path (v3.0.0, RAM-first + standalone service)
 
 **The git tag is the version truth.** Cutting a release:
 

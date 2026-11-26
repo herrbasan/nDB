@@ -89,7 +89,7 @@ An already-v3 folder is refused (`already a v3 (RAM-first) database`), as is a f
 
 ## `ndb serve`
 
-Long-running HTTP daemon: loads the database once, keeps it in memory, serves queries until killed. Design and rationale: `docs/ndb-serve-design.md`.
+Long-running HTTP daemon: loads the database once, keeps it in memory, serves queries until killed. Design and rationale: `docs/ndb-serve-design.md`. Frozen route contract (incl. the `/v2/dbs/{name}/{search,schema,profile/classification,doc/{id}/peek}` surface): `docs/contract_http-api.md`.
 
 ```
 ndb serve <path/to/data.jsonl> [--bind 127.0.0.1|0.0.0.0] [--port 8323] [--token <secret>]
@@ -106,7 +106,7 @@ Routes (all JSON unless noted):
 
 | Route | Description |
 |-------|-------------|
-| `POST /query` | `{filter, fields, sort: {field, dir}, limit, offset}` — Layer-3 AST, server-side projection, default limit 1000. Response `{ok, total, count, results}` — `total` is the pre-pagination match count |
+| `POST /query` | `{filter, fields, sort: {field, dir}, limit, offset}` — Layer-3 AST, server-side projection, default limit 1000. Response `{ok, total, count, results}` — `total` is the pre-pagination match count. Also accepts the standalone-contract options (`sort_keys`, `cursor`, `text`, `max_scan_docs`); pages report `scanned_docs`, `used_indexes`, `next_cursor` |
 | `POST /facets` | `{fields: [...]}` → `{ok, facets: {field: {term: count}}}` — array fields count per element, scalars per value, strings only |
 | `POST /find` | `{field, value}` or `{field, min, max}` |
 | `GET /doc/:id[?fields=a,b]` | Fetch one doc, optional projection |
@@ -122,9 +122,11 @@ Routes (all JSON unless noted):
 
 Limits: 64 concurrent connections (503 over), 64 MB request bodies (413), 30 s read timeout, query limit capped at 1000. Unknown query operators are rejected on every path — 400 over HTTP, an error from the library — never silently-match.
 
-### No full-text search (v2.0.0)
+This table is the **legacy single-DB** surface (`default`). The `/v2/dbs/{name}` surface adds the same routes per database plus `POST …/search` (lexical, `text` required), `GET|PUT …/schema`, `POST …/profile/classification`, `POST …/doc/{id}/peek` and `GET …/snapshot`. Frozen shapes: `docs/contract_http-api.md`.
 
-`POST /search`, `type: "text"` in `POST /index`, the `text` parameter in `POST /query` and the `--text-index` flag were **removed in v2.0.0** along with `src/search.rs`. Full-text, lexical, vector and hybrid search are owned by **`nVDB`** (`nvdb serve`). nDB answers structured filters, sort, projection and pagination only. A folder holding old `_index_*.fti` files still opens: they are warned about and ignored.
+### Lexical search (standalone contract, Phase 4A)
+
+The native inverted index (`src/search.rs`, `type: "text"` in `POST /index`, the `--text-index` flag) was **removed in v2.0.0** (zero production callers). The standalone contract adds back a **basic, scan-based lexical** `POST /v2/dbs/{name}/search` and the `text` option on `POST …/query`: AND-of-terms plus `"quoted phrases"`, case-insensitive, over `text`-mapped fields or every string field. There is no ranking, stemming, vector or hybrid scoring — those are **`nVDB`'s** job (`nvdb serve`), which `mcp_server`'s query facade (`src/lib/ndb-query-facade.js`) prefers when it is online and fresh. A folder holding old `_index_*.fti` files still opens: they are warned about and ignored.
 
 `$in` on array fields matches elements (`{"categories": {"$in": ["A"]}}` finds docs whose `categories` contains `A`).
 

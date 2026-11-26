@@ -204,11 +204,55 @@ let results = db.query_with(
         sort_by: Some(("age".to_string(), SortDir::Desc)),
         offset: Some(10),
         limit: Some(20),
-    }
+        ..Default::default()
+    },
 );
 ```
 
 This returns active users, sorted by age descending, skipping the first 10, limited to 20 results.
+
+---
+
+## Standalone query contract (Phase 4A)
+
+`QueryOptions` carries the contract options in addition to `sort_by`/`offset`/`limit`:
+
+| Option | Meaning |
+|---|---|
+| `sort_keys: Vec<SortKey>` | Deterministic multi-key order (`{field, dir, missing}`). Supersedes `sort_by`; a final `_id` ascending tie-breaker is always appended. |
+| `cursor: Option<String>` | Opaque `next_cursor` from the previous page. Cannot be combined with a non-zero `offset`; a cursor whose key count disagrees with the order is refused. With no sort the order is `_id` ascending. |
+| `text: Option<TextQuery>` | Basic lexical search — whitespace terms are ANDed, `"quoted text"` is a phrase, case-insensitive, over `TextQuery::fields` → the mapping's `text` fields → every string field. |
+| `max_scan_docs: Option<usize>` | Scan budget: exceeding it fails with `Error::ScanBudgetExceeded` (HTTP `422 scan_budget_exceeded`) instead of appearing to hang. |
+
+These options require a **v3 (RAM-first)** database; a v1 database refuses them loudly
+(`sort_keys, cursor, text and max_scan_docs require a v3 (RAM-first) database`), never
+silently ignoring them.
+
+```rust
+use ndb::{QueryOptions, SortKey, SortDir, TextQuery, MissingPlacement};
+
+let page = db.query_raw_page(
+    json!({"status": "active"}),
+    QueryOptions {
+        sort_keys: vec![
+            SortKey { field: "score".into(), dir: SortDir::Desc, missing: MissingPlacement::Last },
+            SortKey::asc("name"),
+        ],
+        text: Some(TextQuery { query: "rust \"document database\"".into(), fields: None }),
+        max_scan_docs: Some(50_000),
+        limit: Some(25),
+        ..Default::default()
+    },
+    None,
+)?;
+// page.0 = QueryPageMeta { total, scanned_docs, used_indexes, next_cursor }
+// page.1 = the encoded rows
+```
+
+`query_with`/`query_projected` return rows only; `query_raw_page` is the entry
+point that also reports the execution accounting (`QueryPageMeta`).
+`POST /v2/dbs/{name}/search` is the same contract with `text` required.
+`POST /v2/dbs/{name}/query` executes an AST (filter object) — described below.
 
 ---
 
@@ -303,9 +347,9 @@ let page = db.query_with(
 | `find(field, value)` | No index | O(n) linear scan |
 | `find_range(field, min, max)` | BTree index | O(log n + k) |
 | `find_range(field, min, max)` | No index | O(n) linear scan |
-| `query(ast)` | N/A | Always O(n) full scan |
+| `query(ast)` | Planner narrows via Hash/BTree `$eq`/`$in`/range conjuncts | O(k) candidates re-checked, else O(n) full scan |
 
-The JSON AST query evaluator always performs a full scan over all documents. For hot queries, create an index and use `find()` instead.
+The JSON AST evaluator always re-checks every candidate with the full AST; the planner only narrows the candidate set. Unindexed queries are a full scan. For hot equality lookups, create an index and use `find()`.
 
 ```rust
 // Slow: full scan every time
@@ -315,3 +359,5 @@ db.query(json!({"email": {"$eq": "alice@example.com"}}))
 db.create_index("email")?;
 db.find("email", &json!("alice@example.com"))
 ```
+
+For lexical search use `QueryOptions::text` (or `POST …/search`): it is an honest scan, so bound it with `max_scan_docs` and read `scanned_docs`. Advanced ranking (BM25, vectors, hybrid, rerank) is nVDB's job.

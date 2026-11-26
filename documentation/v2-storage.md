@@ -4,7 +4,8 @@
 > nDB no longer ships. `src/v2_engine.rs`, `src/v2_format.rs`,
 > `src/v2_json_scan.rs` and `src/mmap.rs` were deleted; the code is preserved in
 > git history (`9118718` and earlier). v3 RAM-first (`src/ram_format.rs` +
-> `src/ram_engine.rs`, see `AGENTS.md`) is the only binary engine.
+> `src/ram_engine.rs`) is the only binary engine — see `ram-storage.md` and
+> `AGENTS.md`.
 >
 > A folder holding a v2 `manifest.json` (`format_version: 2`) is refused loudly at
 > open. Convert it with the preserved v2/transition binary

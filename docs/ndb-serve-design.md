@@ -4,8 +4,13 @@
 > Decisions agreed 2026-08-26 (herrbasan + Copilot session). Reviewed 2026-08-27 (Kimi) — prerequisites landed before the server.
 > **v2.0.0 (2026-11-23):** `ndb serve` is the only interface besides the CLI and the embeddable Rust crate.
 > The napi Node binding crate was removed; `mcp_server` and `LLM-Gateway-Chat` speak this HTTP API.
-> Full-text search (`/search`, `text` indexes, `text` query constraint) was removed with it — full-text,
-> lexical, vector and hybrid search are owned by `nVDB`.
+> **v3.0.0 (2026-11-25):** RAM-first is the only binary engine, and the standalone
+> object/query contract (Phase 4A) adds lexical `POST …/search` + `query.text`,
+> `sort_keys`, cursor pagination, `max_scan_docs`, `GET|PUT …/schema`,
+> `POST …/profile/classification` and `POST …/doc/{id}/peek`. The old native
+> full-text index stays removed — advanced search (BM25, vectors, hybrid, rerank)
+> is `nVDB`'s job; nDB's lexical scan keeps it useful with nVDB stopped.
+> Frozen route/shape contract: `docs/contract_http-api.md`.
 > Change via this file, not memory.
 
 ## Motivation

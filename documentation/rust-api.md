@@ -339,9 +339,11 @@ let mid_range = db.find_range("score", &json!(50), &json!(100));
 
 ---
 
-## Layer 4: Full-Text Search — removed in v2.0.0
+## Layer 4: Standalone lexical search (Phase 4A)
 
-There is no full-text layer in nDB. `create_text_index`, `create_text_index_with_threads`, `drop_text_index`, `has_text_index`, `text_search`, `TextSearch`/`TextQuery`/`TextMode` and `src/search.rs` were deleted in **v2.0.0** (zero production callers). Full-text, lexical, vector, hybrid and reranked search belong to **`nVDB`**. Structured filters, sort, projection, pagination and the typed Hash/BTree indexes are unchanged.
+The **native inverted index** is gone: `create_text_index`, `create_text_index_with_threads`, `drop_text_index`, `has_text_index`, `text_search`, `TextSearch`/`TextQuery`/`TextMode` and `src/search.rs` were deleted in **v2.0.0** (zero production callers), and `type: "text"` is no longer accepted by `/index`.
+
+The standalone contract readds a **basic, scan-based lexical** query — `QueryOptions::text: Some(TextQuery { query, fields })`, served over HTTP as `POST /v2/dbs/{name}/search` and as the `text` option on `POST /query`. Semantics: whitespace-separated terms are ANDed, `"quoted text"` is a phrase, matching is case-insensitive, over `TextQuery::fields` → the field mapping's `text` fields → every string-valued application field. **No** ranking, BM25, stemming, vectors or reranking — those belong to **`nVDB`** (BM25, vectors, hybrid, rerank), which `mcp_server`'s query facade prefers when it is online and fresh. A lexical scan reports its cost on every page (`QueryPageMeta::scanned_docs`), and `max_scan_docs` turns a runaway scan into `Error::ScanBudgetExceeded` (`422 scan_budget_exceeded`).
 
 ---
 
@@ -704,6 +706,9 @@ All operations return `ndb::Result<T>` which is `std::result::Result<T, ndb::Err
 | `CursorExpired` | Sync cursor predates the oldest replayable seq | `changes_since` across a compaction |
 | `CursorAhead` | Sync cursor is past the last committed seq | `changes_since(last_seq + 1)` |
 | `Conflict` | `if_seq` / `If-Match` did not match the document's current seq | A concurrent edit landed first; carries `current_seq` + `doc` |
+| `Poisoned` | A non-transient I/O failure left the DB unusable | HTTP `503 db_poisoned`; nothing after the failure was published |
+| `MemoryLimitExceeded` | The RAM budget (`RamConfig::max_memory_bytes`) is exhausted | HTTP `507 memory_limit_exceeded`; raised before the WAL is touched |
+| `ScanBudgetExceeded` | A query exceeded `max_scan_docs` | HTTP `422 scan_budget_exceeded`; carries `scanned`, `max_scan` |
 
 ```rust
 match db.get(&id) {
@@ -750,9 +755,87 @@ pub enum SortDir {
 ### `QueryOptions`
 
 ```rust
+#[derive(Debug, Clone, Default)]
 pub struct QueryOptions {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    /// Legacy single-key sort (missing fields sort as JSON null).
+    /// `sort_keys` supersedes it when non-empty.
     pub sort_by: Option<(String, SortDir)>,
+    /// Deterministic multi-key sort; a final `_id` ascending tie-breaker is
+    /// always appended, so cursor pagination is stable.
+    pub sort_keys: Vec<SortKey>,
+    /// Opaque continuation token from a previous page (`QueryPageMeta`).
+    pub cursor: Option<String>,
+    /// Standalone lexical full-text query (Phase 4A).
+    pub text: Option<TextQuery>,
+    /// Scan budget: exceeding it fails with `Error::ScanBudgetExceeded`.
+    pub max_scan_docs: Option<usize>,
 }
 ```
+
+A cursor and a non-zero `offset` cannot be combined; a cursor whose key count
+disagrees with the effective order is refused. With no `sort_keys`/`sort_by`
+the order is `_id` ascending.
+
+`sort_keys`/`cursor`/`text`/`max_scan_docs` require a **v3 (RAM-first)** database;
+a v1 database refuses them with `InvalidArgument` rather than ignoring them.
+`query_with`/`query_projected` return rows; `query_raw_page(ast, opts, fields)`
+returns `(QueryPageMeta, rows)` and is the entry point that reports
+`total`/`scanned_docs`/`used_indexes`/`next_cursor`.
+
+### `SortKey` / `MissingPlacement`
+
+```rust
+pub struct SortKey {
+    pub field: String,               // dot paths resolve
+    pub dir: SortDir,
+    pub missing: MissingPlacement,   // First | Last (default)
+}
+SortKey::asc("name")                 // ascending, missing last
+SortKey::desc("meta.views")          // descending, missing last
+```
+
+### `TextQuery`
+
+```rust
+pub struct TextQuery {
+    pub query: String,                 // terms ANDed; "quotes" = phrase
+    pub fields: Option<Vec<String>>,   // None → mapping `text` fields → all strings
+}
+```
+
+### `QueryPageMeta`
+
+```rust
+pub struct QueryPageMeta {
+    pub total: usize,                    // matches before pagination
+    pub scanned_docs: usize,             // documents the execution path examined
+    pub used_indexes: Vec<String>,       // empty = full scan
+    pub next_cursor: Option<String>,     // None when the page is last
+}
+```
+
+### `DbSchema` / `FieldMapping`
+
+`get_schema()` / `set_field_mapping(Vec<FieldMapping>)` (`GET|PUT /v2/dbs/{n}/schema`)
+carry the one shared mapping: `{field, hash, ordered, text, project}` — `hash`
+ensures a Hash index, `ordered` a BTree (both → one BTree), `text` marks the
+default lexical target, `project` is carried for nVDB projections.
+`DbSchema { classification_profile, field_mapping, indexes }`.
+
+### `enable_classification_profile(backfill_empty: bool)`
+
+Opt-in profile (`POST /v2/dbs/{n}/profile/classification`): while enabled every
+application object must carry `domain: String` and `categories: Vec<String>` on
+every write path (insert, insert-with-prefix, replace, set, remove, array_push,
+apply_ops, restore); a violation is `Error::InvalidArgument` and mutates
+nothing. On `categories`, a scalar `$eq` matches by array membership.
+
+### `peek_item(id, &PeekRequest) -> PeekResponse`
+
+`seq`-pinned partial retrieval (`POST /v2/dbs/{n}/doc/{id}/peek`): projection
+(`fields`, nested dot paths), `text_ranges` (Unicode scalar offsets) and
+`array_slices`, each with `{offset, returned, total, has_more, next_offset}`.
+`expected_seq` pins the read; a moved document answers `409 conflict` with its
+current seq.
