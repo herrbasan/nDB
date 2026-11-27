@@ -28,7 +28,7 @@ fastrand = "2.0"
 thiserror = "1.0"
 # Transport lives only in the HTTP edge (src/server.rs). Core engines stay
 # synchronous; every database call is handed to the blocking pool.
-nhttp = { git = "https://github.com/herrbasan/nHttp", tag = "v0.1.0" }
+nhttp = { git = "https://github.com/herrbasan/nHttp", tag = "v0.2.0" }
 nlogger = { git = "https://github.com/herrbasan/nLogger", tag = "v0.1.0", features = ["serde_json"] }
 # `time` is required by the serve loop's shutdown poll; nhttp already enables
 # it on the same tokio instance, this declaration just keeps it honest.

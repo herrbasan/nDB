@@ -500,8 +500,8 @@ dependencies = [
 
 [[package]]
 name = "nhttp"
-version = "0.1.0"
-source = "git+https://github.com/herrbasan/nHttp?tag=v0.1.0#edfa6daed6270d3ae35ac5eff7e1587b14b8103a"
+version = "0.2.0"
+source = "git+https://github.com/herrbasan/nHttp?tag=v0.2.0#59aab5cfaa70a2ae2d1e235fda93631391380337"
 dependencies = [
  "bytes",
  "http",
