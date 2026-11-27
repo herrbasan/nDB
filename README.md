@@ -40,7 +40,7 @@ Release history: **v2.0.0** (2026-11-23) removed the Node binding and the in-cra
 - **File buckets** — Binary storage with SHA-256 deduplication
 - **Soft delete & trash** — Recoverable deletes with compaction
 - **Multi-DB HTTP service** — `ndb serve`: one resident Rust process, many named databases, HTTP/1.1 + keep-alive
-- **Zero dependencies** — Minimal Rust crate, no external crypto/DB libs
+- **Lean core, shared edge** — The engine runs on the Rust standard library plus `serde`, `serde_json`, `parking_lot`, `fastrand` and `thiserror`; the HTTP edge uses the shared `nhttp` (bare `tokio` + `hyper` 1.x) and `nlogger` crates — no axum/tower framework bloat, no external crypto/DB libs, zero NAPI
 
 ## Quick Start
 

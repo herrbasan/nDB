@@ -1,7 +1,7 @@
 ---
 title: Contract — nDB HTTP API (ndb serve)
-status: frozen — derived from src/server.rs at 2026-11-25
-date: 2026-11-25
+status: frozen — derived from src/server.rs at 2026-11-27
+date: 2026-11-27
 scope: docs/contract_http-api.md
 complements: docs/contract_ram-first-engine.md, docs/ndb-serve-design.md
 ---
@@ -12,9 +12,16 @@ Derived line by line from `src/server.rs`. This is what the server *does*, not
 what would be convenient. Where the RAM-first dev plan adds behaviour that does
 not exist yet (memory limits, poisoning), the row says so explicitly.
 
-Transport: HTTP/1.1 on `std::net` (no async runtime), one `BufReader` per
-socket, keep-alive, `TCP_NODELAY`, `Content-Length` always exact, one
-`write_all` per response frame.
+Transport: shared `nhttp` (bare `tokio` + `hyper` 1.x behind a lean facade, no
+axum/tower). The core engine stays **100% synchronous** — every handler is a plain
+fn dispatched through `nhttp::spawn_blocking`, so a reactor thread never waits on a
+lock, an fsync or a compaction. `Content-Length` is always exact, `TCP_NODELAY` is
+on, and `Connection: keep-alive` / `close` is always truthful.
+
+Logging: `nlogger` writes structured JSONL to `--logs-dir` (config `logsDir`,
+default `./logs`) — the rotated `main-0.log` … `main-9.log` stream plus one
+`ndb-<session>.log` per process. A `ServerConfig` built without `logs_dir`
+(embedders, tests) logs nothing to disk.
 
 ---
 
@@ -24,13 +31,23 @@ socket, keep-alive, `TCP_NODELAY`, `Content-Length` always exact, one
 |---|---|
 | Bind / port | `agents`-free default `127.0.0.1:8323` (CLI/config) |
 | Auth | Static bearer token when configured: `Authorization: Bearer <token>`, constant-time compare, checked **before** the body is read |
-| Max concurrent connections | `max_connections` (default 64). A full queue answers `503` on the socket and closes |
+| Max concurrent connections | `max_connections` (default 1024). A connection over the cap answers `503` immediately — there is no blocking queue |
+| I/O timeouts | 30 s read, 30 s idle, 30 s write, enforced by the transport |
+| Graceful drain | 10 s for in-flight requests on shutdown, then every mounted database is `flush()`ed |
 | Max request body | `max_body` (default 64 MiB) → `413` |
 | Query default limit | `default_limit` (default 1000) when `limit` is absent |
 | Query hard cap | `max_limit` (default 50000); a larger explicit `limit` is `400`, never truncated |
-| Keep-alive idle timeout | 5 s between requests, 30 s for a live request |
 | Duplicate DB mount | Refused at startup (name or canonical path) |
 | DB names | `[a-zA-Z0-9._-]+`, not `.`/`..`, Windows reserved names rejected, case-folded uniqueness |
+
+> **`max_connections` scope.** The cap is settable only through the Rust
+> `ndb::server::ServerConfig` API. It is **not** exposed in `--config` JSON or any
+> CLI flag yet — the default is 1024.
+
+**`GET /metrics`.** When no ndb route claims the path, the transport serves its own
+counter snapshot: `active_connections`, `total_requests`, `rejected_503`,
+`status_2xx`, `status_4xx`, `status_5xx`, `uptime_ms`. In `ndb serve` the path is
+token-gated like every other path (there are no auth-exempt routes).
 
 ### 1.1 Two error envelopes
 

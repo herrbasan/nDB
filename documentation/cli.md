@@ -93,12 +93,22 @@ Long-running HTTP daemon: loads the database once, keeps it in memory, serves qu
 
 ```
 ndb serve <path/to/data.jsonl> [--bind 127.0.0.1|0.0.0.0] [--port 8323] [--token <secret>]
-       [--threads <n>]
+       [--threads <n>] [--logs-dir <dir>] [--persistence immediate|scheduled|lazy]
+       [--scheduled-ms <n>] [--max-limit <n>] [--default-limit <n>] [--format auto|v1|ram]
+
+ndb serve --db <name>=<path> ...       # mount named databases (repeatable)
+ndb serve --dir <root>                 # mount every child DB folder; enables POST /v2/dbs
+ndb serve --config <file.json>         # bind/port/token/persistence/scheduled_ms/dir/
+                                       # max_limit/default_limit/logsDir/dbs; CLI flags win
 ```
 
-- `--threads <n>`: worker threads — the HTTP connection pool size and the index (re)build thread count. `0` (default) = all logical cores (pool floor: 4). The pool pulls from a bounded queue (`--max-connections` deep); a full queue answers `503`.
+- `--threads <n>`: tokio runtime worker threads (`0`, the default, means one per core). The transport's connection cap (`max_connections`, default 1024) is separate and settable **only** through the Rust `ServerConfig` API — it is not a CLI flag.
+- `--logs-dir <dir>`: `nlogger` JSONL output — the rotated `main-0.log` … `main-9.log` stream plus one `ndb-<session>.log` per process (default `./logs`).
+- `--persistence immediate|scheduled|lazy` (default `immediate`); `--scheduled-ms <n>` sets the flush interval for `scheduled` (default 5000).
+- `--max-limit <n>` (default 50000) is the hard cap for an explicit query `limit`; `--default-limit <n>` (default 1000) is the page size when `limit` is omitted.
+- `--format auto|v1|ram` (default `ram`) selects the format for databases created via `POST /v2/dbs` or a `--db` mount of a not-yet-existing path.
 
-- The file must already exist (`ndb init` first) — serve fails fast on a missing path.
+- The positional path must already exist (`ndb init` first) — serve fails fast on a missing path.
 - `--token <secret>`: clients must send `Authorization: Bearer <secret>`. Required for LAN binds; 401 otherwise.
 - `--bind 0.0.0.0` exposes the server on the LAN. Windows Firewall prompts (or needs a `netsh advfirewall` rule) on first run. Never forward the port to the internet.
 
@@ -120,7 +130,7 @@ Routes (all JSON unless noted):
 | `PUT /file/:bucket` | Store file (body = raw bytes, `Content-Type` used as MIME) |
 | `GET /file/:bucket/:hash.ext` | Fetch file — raw bytes with real Content-Type |
 
-Limits: 64 concurrent connections (503 over), 64 MB request bodies (413), 30 s read timeout, query limit capped at 1000. Unknown query operators are rejected on every path — 400 over HTTP, an error from the library — never silently-match.
+Limits: 1024 concurrent connections (503 over, no queue), 64 MB request bodies (413), 30 s read/idle/write bounds, a 10 s graceful drain that flushes every mounted database, and a query limit capped at `--max-limit` (default 50000). Unknown query operators are rejected on every path — 400 over HTTP, an error from the library — never silently-match.
 
 This table is the **legacy single-DB** surface (`default`). The `/v2/dbs/{name}` surface adds the same routes per database plus `POST …/search` (lexical, `text` required), `GET|PUT …/schema`, `POST …/profile/classification`, `POST …/doc/{id}/peek` and `GET …/snapshot`. Frozen shapes: `docs/contract_http-api.md`.
 

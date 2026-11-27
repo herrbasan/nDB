@@ -12,6 +12,14 @@
 > is `nVDB`'s job; nDB's lexical scan keeps it useful with nVDB stopped.
 > Frozen route/shape contract: `docs/contract_http-api.md`.
 > Change via this file, not memory.
+>
+> **Phase 2 (2026-11-27, `@5adcddd`) — transport superseded.** The initial
+> hand-rolled `std::net` transport was replaced by shared `nhttp` (bare `tokio` +
+> `hyper` 1.x) plus Rust `nlogger`, to eliminate idle keep-alive socket starvation.
+> The core engine stays **100% synchronous** behind `nhttp::spawn_blocking`. The
+> Transport/Concurrency/Dependencies rows below are updated to the live design;
+> where the older Implementation notes still describe Phase-1 mechanics, the
+> Phase-2 section wins.
 
 ## Motivation
 
@@ -25,13 +33,13 @@ nDB has two interfaces: CLI (one-shot) and the embeddable Rust crate. Neither fi
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Transport | Hand-rolled HTTP/1.1 on `std::net::TcpListener` | Zero new crates. ~400 lines. curl + fetch + every language for free. Sync I/O is sufficient for a handful of local/LAN clients. |
-| Concurrency | Bounded worker pool over a queue (`config.threads` workers, `max_connections` deep) | Reads are already concurrent (`RwLock`); writes serialize on the write lock — maps 1:1 onto nDB's single-writer model. A burst fills the queue instead of spawning unbounded OS threads; a full queue is `503`. No async runtime. |
+| Transport | `nhttp` (bare `tokio` + `hyper` 1.x behind a lean facade) | Phase 2 (2026-11-27, `@5adcddd`) replaced the hand-rolled `std::net` loop: a connection is a task, not a thread, so idle keep-alive sockets can no longer starve the workers. No axum/tower. |
+| Concurrency | Every handler is a plain fn dispatched through `nhttp::spawn_blocking`; the connection cap (`max_connections`, default 1024) answers `503` instead of queueing | Reads stay concurrent (`RwLock`), writes serialize on the write lock — the synchronous core maps 1:1 onto nDB's single-writer model, and no reactor thread ever waits on a lock, fsync or compaction. |
 | API shape | Query-oriented, not CRUD-mirrored | The point is computation in Rust. One powerful `/query` beats mirroring 20 methods. |
 | Framing | `Content-Length` only, keep-alive | We control both ends; no chunked encoding needed. |
 | Process model | Resident daemon, loads JSONL once at boot, never exits on its own | Boot replay is a one-time cost. The server IS the database process (redis-server model). |
 | Network | Bind `0.0.0.0` (configurable to `127.0.0.1`), static bearer token, no TLS | Trusted LAN only, no internet exposure, no user management. Token is a door, not access control: holder = trusted. |
-| Dependencies | Zero new crates | Longevity rule. tokio/hyper/axum explicitly rejected. |
+| Dependencies | Shared `nhttp` + `nlogger` + `tokio` in the HTTP edge only | Core stays on std + `serde`/`serde_json`/`parking_lot`/`fastrand`/`thiserror`. Framework stacks (axum/tower) remain rejected; longevity still drives the core. |
 
 ## API
 
@@ -106,12 +114,12 @@ Minor core-adjacent: `set`/`remove` silently skip unresolvable paths — over HT
 - HTTP parsing: request line + headers, read `Content-Length` body, route, respond, keep-alive loop. Reject anything malformed with 400 — fail loud, no lenient recovery.
 - **`Expect: 100-continue`:** curl sends it for bodies over ~1 KB; a server that doesn't answer `100 Continue` stalls every curl PUT for a second. Must handle — "curl for free" is a stated rationale.
 - **Check the token BEFORE reading the request body.**
-- **Read timeout** on every connection (`set_read_timeout`) — kills the slow-loris class and reclaims threads from crashed clients holding half-open connections out of the small pool.
+- **Read timeout** on every connection (the transport's 30 s read bound) — kills the slow-loris class and reclaims capacity from crashed clients holding half-open connections.
 - **Body cap** (generous, e.g. 64 MB) on `PUT /doc` / `PATCH` — fail loud 413 on excess `Content-Length` rather than OOM on a client bug.
-- **Thread-cap exhaustion → 503**, fail loud, no queueing.
+- **Connection-cap exhaustion → 503**, fail loud, no queueing.
 - **Hot path:** `TCP_NODELAY` per accepted connection; the response is one `write_all` (head+body) for bodies ≤64 KB and head-then-body above it, with `Response::Binary` moved into the socket rather than cloned.
-- **Keep-alive** uses one `BufReader` per socket; a socket ends on `Connection: close`, HTTP/1.0 without keep-alive, clean EOF, 5 s idle between requests (30 s for a live one), or a shutdown flag.
-- **Shutdown (M3):** `server::request_process_shutdown()` is set by the `ndb serve` OS signal hook (Windows `SetConsoleCtrlHandler`, Unix `signal`). The accept loop breaks, the queue closes, workers drain, every mounted DB is `flush()`ed, exit 0.
+- **Keep-alive** is transport-owned (`nhttp`): a socket ends on `Connection: close`, HTTP/1.0 without keep-alive, clean EOF, the 30 s idle bound, or a shutdown drain.
+- **Shutdown (M3):** `server::request_process_shutdown()` is set by the `ndb serve` OS signal hook (Windows `SetConsoleCtrlHandler`, Unix `signal`). The transport stops accepting, in-flight requests drain (10 s bound), every mounted DB is `flush()`ed, exit 0.
 - **`POST /compact` and `POST /index` hold the writer lock for minutes at 10 GB** — every write hangs until client timeouts fire. Return `202 Accepted` + expose completion via `/stats`, and document required client timeouts.
 - **Bucket endpoints use raw bytes, not base64-in-JSON** (33% overhead + full buffering defeats the purpose): `PUT /file/:bucket` with file body, `GET /file/:bucket/:hash.ext` with real `Content-Type`.
 - **Writes:** add `PUT /doc/:id` (full replace — maps to existing core `update()`) alongside insert + deltas. `PATCH` response includes per-op `applied: true/false` so wrong-path writes surface immediately.
