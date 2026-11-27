@@ -198,13 +198,14 @@ fn print_usage() {
     eprintln!("  --dir <root>     Mount every child folder holding data.jsonl or meta.json,");
     eprintln!("                     and allow POST /v2/dbs to create new databases under <root>");
     eprintln!("  --config <file>  JSON config (bind/port/token/persistence/scheduled_ms/");
-    eprintln!("                     dir/max_limit/default_limit/dbs)");
+    eprintln!("                     dir/max_limit/default_limit/logsDir/dbs)");
     eprintln!("  --persistence <immediate|scheduled|lazy>  Service default (immediate)");
     eprintln!("  --format <auto|v1|ram>  Format for databases created via POST /v2/dbs or a --db mount of a not-yet-existing path (default ram)");
     eprintln!("  --scheduled-ms <n>  Flush interval for persistence=scheduled (default 5000)");
     eprintln!("  --max-limit <n>     Hard cap for an explicit query limit (default 50000)");
     eprintln!("  --default-limit <n> Page size when a query omits limit (default 1000)");
-    eprintln!("  --threads <n>     Worker threads: connections + index builds (default: all cores)");
+    eprintln!("  --threads <n>     Runtime worker threads (default: one per core)");
+    eprintln!("  --logs-dir <dir>  nlogger output (main-0.log + session log; default ./logs)");
 }
 
 fn handle_serve(args: &[String]) {
@@ -259,6 +260,7 @@ fn handle_serve(args: &[String]) {
                 };
             }
             "--config" => config_file = Some(std::path::PathBuf::from(value("--config"))),
+            "--logs-dir" => config.logs_dir = Some(std::path::PathBuf::from(value("--logs-dir"))),
             "--db" => {
                 let raw = value("--db");
                 match raw.split_once('=') {
@@ -345,6 +347,12 @@ fn handle_serve(args: &[String]) {
             "default-limit {} exceeds max-limit {}",
             config.default_limit, config.max_limit
         ));
+    }
+
+    // `ndb serve` always writes structured logs; embedders and tests that build
+    // a ServerConfig directly stay silent unless they name a directory.
+    if config.logs_dir.is_none() {
+        config.logs_dir = Some(std::path::PathBuf::from("./logs"));
     }
 
     let persistence = cli_persistence

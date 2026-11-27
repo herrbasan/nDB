@@ -27,7 +27,7 @@ nDB is an **embeddable in-memory document database** built in Rust. It stores JS
 - **Append-only JSON Lines** persistence. Every write appends a line — payload + `\n` in one buffered `write_all`. On load the journal is streamed line by line; last write wins, tombstones mark deletions, delta patches are applied in order. A torn *final* line is truncated at the last good byte offset (with a warning); **mid-journal corruption fails loudly** (`Error::Corruption` naming the line) and is recovered with `ndb repair <path>`, which quarantines the file to `<file>.corrupt.<ts>.bak` and truncates at the last good line.
 - **Durable lineage + change feed.** `_meta` carries `source_epoch_uuid`, `last_seq`, `min_available_seq`; every committed line carries its `_seq`. `lineage()`, `snapshot_at()` and `changes_since(seq)` expose the journal as a replayable feed under the writer lock. `_seq` is engine-owned and stripped before any document reaches memory, so no read API returns it. `seq` never resets — not on compaction, not on restart.
 - **Database-as-a-Folder.** One directory per database: `data.jsonl` (documents — the file passed to `open()`), `_files/` (binary storage, created implicitly), `_trash/` (soft-deleted items), and `meta.json` (bucket declarations/policies — written by the CLI/migration, **read by the core at open**: `kind`, `onDocumentDelete`, `ttl_seconds`, `reserved_ttl_seconds`; the `schemas` block is still ignored).
-- **Zero dependencies beyond the Rust standard library plus `serde`, `serde_json`, `parking_lot`, `fastrand`, and `thiserror`.** No external crypto, no external DB engines. SHA-256 for file deduplication is hand-rolled.
+- **Zero dependencies beyond the Rust standard library plus `serde`, `serde_json`, `parking_lot`, `fastrand`, and `thiserror` — plus `nhttp` + `nlogger` + `tokio` in the HTTP edge only.** No external crypto, no external DB engines. SHA-256 for file deduplication is hand-rolled.
 
 ## Storage Backends (v1 JSONL / v3 RAM-first)
 
@@ -129,7 +129,7 @@ replaced is retired and preserved only in git history.
   /v2/dbs/{name}/snapshot` on a RAM database pages the pinned `Arc` set (only
   the requested page is converted to JSON), releases the pin as soon as it
   serves the completing page (`offset + count >= total`) and the registry's
-  reaper thread (2 s wake, exits on `request_process_shutdown`) releases expired
+  reaper thread (2 s wake, stopped when the serve loop drains) releases expired
   pins for every mounted DB, so an idle server never holds one.
 - **File references on the RAM engine (#18).** The v3 write path commits inside
   the engine, so `Database::file_refs` cannot be counted there: a RAM insert
@@ -241,16 +241,18 @@ On load, patches are replayed in memory. On compaction, patches are baked into a
 
 ## HTTP Service (`ndb serve`)
 
-Resident daemon (`src/server.rs`) — hand-rolled HTTP/1.1 on `std::net`, no async runtime. One process can now own **many databases**: `DbRegistry` maps name → `Arc<Database>`, with a canonical-path set preventing the same journal from being mounted twice, an optional `root_dir` for creation, and a service-wide persistence mode.
+Resident daemon (`src/server.rs`) — **`nhttp` transport** (tokio + hyper behind the shared lean facade). One process can own **many databases**: `DbRegistry` maps name → `Arc<Database>`, with a canonical-path set preventing the same journal from being mounted twice, an optional `root_dir` for creation, and a service-wide persistence mode. **The core stays synchronous**: every handler is a plain fn dispatched through `nhttp::spawn_blocking`, so a reactor thread never waits on a lock, an fsync, a compaction or a JSON serialization.
 
-- Mount sources: positional `<path>` (legacy, mounted as `default`), repeatable `--db <name>=<path>`, `--dir <root>` (auto-mounts child folders holding `data.jsonl` or `meta.json`), and `--config <file.json>` (`bind/port/token/persistence/scheduled_ms/dir/max_limit/default_limit/dbs`; unknown fields rejected).
+- Mount sources: positional `<path>` (legacy, mounted as `default`), repeatable `--db <name>=<path>`, `--dir <root>` (auto-mounts child folders holding `data.jsonl` or `meta.json`), and `--config <file.json>` (`bind/port/token/persistence/scheduled_ms/dir/max_limit/default_limit/logsDir/dbs`; unknown fields rejected).
 - Startup refuses: no source at all, an unopenable DB, a duplicate name or canonical path, an invalid DB name (`[a-zA-Z0-9._-]+`, not `.`/`..`), a missing `--dir`.
 - `GET /health`, `GET|POST /v2/dbs`, and per-DB `/v2/dbs/{name}/{stats,lineage,doc,docs/mget,query,search,find,facets,index,schema,profile/classification,compact,flush,changes,snapshot,files/...}`. `POST /v2/dbs` accepts only `{name, persistence?}` (never a path) and is `403 create_disabled` without `--dir`.
 - Legacy single-DB routes (`/stats`, `/doc`, `/query`, `/file/...`) keep working against `default`; `/v2/` errors are `{ok:false, error, message}`.
-- **Transport:** `TCP_NODELAY` on every accepted connection; one `write_all` per response frame (head+body for ≤64 KB), binary bodies move into the socket without a clone; `Content-Length` always exact and `Connection: keep-alive` / `close` always truthful.
-- **Keep-alive:** one `BufReader` persists across requests on a socket; the loop ends on `Connection: close`, HTTP/1.0 without keep-alive, clean EOF, a 5 s idle timeout between requests (30 s for a live request), or a shutdown flag.
-- **Worker pool:** `config.threads` workers (0 = logical cores, min 4) pull from a bounded queue (`max_connections` deep). A full queue answers `503` — bursts never spawn unbounded OS threads.
-- **Graceful shutdown (M3):** Ctrl-C / SIGINT (Windows `SetConsoleCtrlHandler`, Unix `signal`) sets `server::request_process_shutdown()`. The accept loop stops, the queue closes, workers drain, and every mounted database is `flush()`ed before the process exits 0. A second Ctrl-C falls through to OS termination.
+- **Transport:** `nhttp` — connection cap (`max_connections`, excess answers `503`), 30 s read/idle/write bounds, `max_body` → `413`, `TCP_NODELAY`, and `Connection: keep-alive` / `close` always truthful. Errors carry `{ok:false,error,message}` from the transport; the ndb route envelopes are unchanged.
+- **Auth:** a static bearer token when `--token` is set. **Every** path requires it — `/health` included (no auth-exempt path); the token is checked before the body is read.
+- **`GET /metrics`:** the transport's own counters (`active_connections`, `total_requests`, `rejected_503`, status classes, `uptime_ms`), served when no ndb route claims the path (and therefore also token-gated).
+- **Logging:** `nlogger` (`prefix = "ndb"`, `LOG_LEVEL` / `LOG_RETENTION_DAYS` honoured) writes `main-0.log` plus one session file into `--logs-dir` / config `logsDir`, default `./logs` for `ndb serve`. A `ServerConfig` built without `logs_dir` (embedders, tests) logs nothing to disk. Startup, shutdown, per-DB flush results and handler failures (5xx) are emitted.
+- **Graceful shutdown (M3):** Ctrl-C / SIGINT (Windows `SetConsoleCtrlHandler`, Unix `signal`) sets `server::request_process_shutdown()`; `ServeHandle::shutdown()` does the same for embedders. The accept loop stops, in-flight requests drain, the pin reaper joins, and every mounted database is `flush()`ed before the process exits 0. A second Ctrl-C falls through to OS termination.
+- `serve_listener` (pre-bound `std::net::TcpListener`) still works: it reads the address, releases the socket and hands the port to the transport. Note the hand-off window is not atomic — a connection queued on the caller's socket in that instant is lost. `serve_multi_in_background` binds itself and has no such window.
 - Contract and route list: `docs/ndb-serve-design.md`.
 
 ## Node.js Access

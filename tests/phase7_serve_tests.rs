@@ -1,26 +1,30 @@
 //! Integration tests for nDB Phase 7: HTTP server (`ndb serve`)
 //!
-//! Each test binds an ephemeral port, spawns the server on a background
-//! thread, and speaks raw HTTP/1.1 over TCP — the same wire a Node client
-//! would use. Design: docs/ndb-serve-design.md.
+//! Each test starts the daemon on an ephemeral port and speaks raw HTTP/1.1
+//! over TCP — the same wire a Node client would use. Design:
+//! docs/ndb-serve-design.md.
 
-use ndb::server::{serve_listener, ServerConfig};
+use ndb::server::{serve_multi_in_background, DbRegistry, PersistenceMode, ServerConfig};
 use ndb::Database;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use tempfile::TempDir;
 
 fn start_server(token: Option<String>) -> (u16, TempDir) {
     let dir = TempDir::new().unwrap();
     let db = Database::open(dir.path().join("serve.jsonl")).unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let cfg = ServerConfig { token, ..Default::default() };
-    std::thread::spawn(move || {
-        serve_listener(listener, db, cfg).unwrap();
-    });
-    (port, dir)
+    let registry = DbRegistry::new(None, PersistenceMode::Immediate, 5_000);
+    registry.add("default", db).unwrap();
+    let cfg = ServerConfig {
+        port: 0,
+        token,
+        ..Default::default()
+    };
+    // The transport owns the listening socket, so the port is known only after
+    // it binds — no pre-bound listener to adopt.
+    let handle = serve_multi_in_background(std::sync::Arc::new(registry), cfg).unwrap();
+    (handle.addr.port(), dir)
     // NOTE: the daemon owns the Database (and its exclusive writer lock), so
     // tests observe state through HTTP, never a second handle on the journal.
 }

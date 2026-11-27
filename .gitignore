@@ -1,3 +1,5 @@
 /target
 /bin
 ndb-serve.json
+/.cargo/config.toml
+/logs/

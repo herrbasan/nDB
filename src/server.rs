@@ -2,8 +2,11 @@
 //! embeddable Rust crate).
 //!
 //! Design: docs/ndb-serve-design.md (issue #2).
-//! Hand-rolled HTTP/1.1 on std::net — zero new crates. Thread-per-connection
-//! with a cap, keep-alive, read timeout, body cap, static bearer token.
+//! Transport is `nhttp` (tokio + hyper behind a shared lean facade): connection
+//! cap with honest 503, keep-alive, idle/read/write timeouts, body cap, static
+//! bearer token, graceful drain, and built-in `/metrics`. The database core is
+//! synchronous and every handler is dispatched through `spawn_blocking`, so a
+//! reactor thread never waits on a lock, an fsync or a JSON serialization.
 //! The daemon owns the database in memory; clients receive only results.
 
 use crate::bucket::mime_for_extension;
@@ -14,8 +17,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -41,8 +43,13 @@ pub struct ServerConfig {
     /// Hard cap for an explicit `limit`. Larger values are rejected (400),
     /// never silently truncated.
     pub max_limit: usize,
-    /// Threads for index (re)builds. 0 = all logical cores.
+    /// Threads for the serve runtime. 0 = tokio's default (one per core).
     pub threads: usize,
+    /// When set, structured logs are written here (`main-0.log` + a session
+    /// file). `None` keeps the server silent on disk — in-process tests and
+    /// embedders must not grow a `./logs` they never asked for. `ndb serve`
+    /// defaults it to `./logs`.
+    pub logs_dir: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -51,11 +58,12 @@ impl Default for ServerConfig {
             bind: "127.0.0.1".to_string(),
             port: 8323,
             token: None,
-            max_connections: 64,
+            max_connections: 1024,
             max_body: 64 * 1024 * 1024,
             default_limit: 1000,
             max_limit: 50_000,
             threads: 0,
+            logs_dir: None,
         }
     }
 }
@@ -616,6 +624,9 @@ pub struct ServiceConfig {
     pub dir: Option<PathBuf>,
     pub max_limit: Option<usize>,
     pub default_limit: Option<usize>,
+    /// Directory for `nlogger` output (`main-0.log` + a session file).
+    #[serde(rename = "logsDir", alias = "logs_dir")]
+    pub logs_dir: Option<PathBuf>,
     /// Storage format new databases are created with (`auto` | `v1` | `ram`).
     pub format: Option<String>,
     pub dbs: Option<HashMap<String, DbSpec>>,
@@ -672,6 +683,9 @@ impl ServiceConfig {
         if let Some(default_limit) = self.default_limit {
             config.default_limit = default_limit;
         }
+        if let Some(logs_dir) = &self.logs_dir {
+            config.logs_dir = Some(logs_dir.clone());
+        }
         if config.default_limit > config.max_limit {
             return Err(Error::invalid_arg(format!(
                 "default_limit {} exceeds max_limit {}",
@@ -719,7 +733,8 @@ impl ServiceConfig {
 
 // ─── Entry point ────────────────────────────────────────────────────
 
-/// Run the server. Blocks forever; each connection handled on its own thread.
+/// Run the server. Blocks until shutdown; every database call is dispatched on
+/// the blocking pool, never on a reactor thread.
 pub fn serve(db: Database, config: ServerConfig) -> Result<(), Error> {
     let registry = DbRegistry::new(None, PersistenceMode::Immediate, DEFAULT_SCHEDULED_MS);
     registry.add("default", db)?;
@@ -728,9 +743,8 @@ pub fn serve(db: Database, config: ServerConfig) -> Result<(), Error> {
 
 /// Bind and serve a whole registry (the multi-DB entry point). Blocks.
 pub fn serve_registry(registry: Arc<DbRegistry>, config: ServerConfig) -> Result<(), Error> {
-    let listener = TcpListener::bind((config.bind.as_str(), config.port))
-        .map_err(|e| Error::invalid_arg(format!("bind {}:{} failed: {}", config.bind, config.port, e)))?;
-    serve_multi_listener(listener, registry, config)
+    let prepared = prepare(registry, config)?;
+    run_prepared(prepared, Arc::new(AtomicBool::new(false)))
 }
 
 /// Serve one database on an already-bound listener (tests bind port 0 for an
@@ -749,8 +763,8 @@ pub struct ServeHandle {
 }
 
 impl ServeHandle {
-    /// Stop accepting connections. The serve loop observes the flag within one
-    /// accept poll, closes its queue and lets the workers drain what they hold
+    /// Ask the serve loop to stop: the accept loop ends, in-flight requests
+    /// drain, and every mounted database is flushed before the runtime returns
     /// (shutdown is idempotent).
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
@@ -767,18 +781,18 @@ pub fn serve_multi_in_background(
     registry: Arc<DbRegistry>,
     config: ServerConfig,
 ) -> Result<ServeHandle, Error> {
-    let listener = TcpListener::bind((config.bind.as_str(), config.port))
-        .map_err(|e| Error::invalid_arg(format!("bind {}:{} failed: {}", config.bind, config.port, e)))?;
-    let addr = listener
-        .local_addr()
-        .map_err(|e| Error::invalid_arg(format!("local_addr after bind: {e}")))?;
+    let prepared = prepare(registry, config)?;
+    let addr = prepared.bound.local_addr();
     let shutdown = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&shutdown);
-    std::thread::spawn(move || {
-        if let Err(e) = serve_multi_listener_shutdown(listener, registry, config, flag) {
-            eprintln!("ndb serve exited: {}", e);
-        }
-    });
+    std::thread::Builder::new()
+        .name("ndb-serve".to_string())
+        .spawn(move || {
+            if let Err(e) = run_prepared(prepared, flag) {
+                eprintln!("ndb serve exited: {}", e);
+            }
+        })
+        .map_err(|e| Error::invalid_arg(format!("spawn serve thread: {e}")))?;
     Ok(ServeHandle { addr, shutdown })
 }
 
@@ -788,14 +802,23 @@ pub fn serve_multi_listener(
     registry: Arc<DbRegistry>,
     config: ServerConfig,
 ) -> Result<(), Error> {
-    serve_multi_listener_shutdown(listener, registry, config, Arc::new(AtomicBool::new(false)))
+    let addr = listener
+        .local_addr()
+        .map_err(|e| Error::invalid_arg(format!("local_addr after bind: {e}")))?;
+    let mut config = config;
+    config.bind = addr.ip().to_string();
+    config.port = addr.port();
+    // The transport owns the listening socket; the caller's handle is retired
+    // so the address can pass to the new bind.
+    drop(listener);
+    serve_registry(registry, config)
 }
 
-// ─── Shutdown & Worker Pool ─────────────────────────────────────────
+// ─── Shutdown & serve loop ──────────────────────────────────────────
 
 /// Process-wide shutdown latch. Set by the OS signal handler that `ndb serve`
 /// installs; every serve loop in the process observes it, stops accepting,
-/// drains its workers and flushes every mounted database.
+/// drains in-flight requests and flushes every mounted database.
 static PROCESS_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Ask every serve loop in this process to drain and exit.
@@ -808,143 +831,188 @@ pub fn process_shutdown_requested() -> bool {
     PROCESS_SHUTDOWN.load(Ordering::SeqCst)
 }
 
-/// A live request may spend this long before its first byte (slow-loris).
-const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// Idle keep-alive wait between requests: short enough to reclaim workers from
-/// vanished clients and to let a shutdown drain promptly.
-const KEEP_ALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Accept-loop poll interval (the listener is non-blocking so the shutdown
-/// flag is observed without a self-connect wake-up).
-const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// How often the serve loop re-reads the shutdown latches. A `ServeHandle` is a
+/// sync API and cannot wake the executor, so the loop polls; 20 ms is below any
+/// observable shutdown latency.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(20);
 /// How often the pin reaper sweeps every mounted database.
 const PIN_REAP_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Worker count for the connection pool: `config.threads` when set, otherwise
-/// one per logical core (at least 4).
-fn worker_count(config: &ServerConfig) -> usize {
-    if config.threads > 0 {
-        return config.threads;
-    }
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .max(4)
+/// Everything a handler needs, cloned per request — two `Arc`s, no state.
+#[derive(Clone)]
+struct AppState {
+    registry: Arc<DbRegistry>,
+    config: Arc<ServerConfig>,
 }
 
-/// Bounded hand-off queue between the accept loop and the worker pool.
-///
-/// A burst of connections fills the queue instead of spawning an unbounded
-/// number of OS threads; a full queue is refused with `503` like the old
-/// connection cap. Closing the queue lets workers finish what they already
-/// hold — that is the drain.
-struct JobQueue {
-    state: Mutex<QueueState>,
-    ready: Condvar,
-}
-
-struct QueueState {
-    jobs: std::collections::VecDeque<TcpStream>,
-    closed: bool,
-    cap: usize,
-}
-
-impl JobQueue {
-    fn new(cap: usize) -> Arc<Self> {
-        Arc::new(JobQueue {
-            state: Mutex::new(QueueState {
-                jobs: std::collections::VecDeque::new(),
-                closed: false,
-                cap: cap.max(1),
-            }),
-            ready: Condvar::new(),
-        })
-    }
-
-    /// Hand a connection to the pool. `Err(stream)` when the queue is full (or
-    /// already closed): the caller answers `503` on that very stream.
-    fn push(&self, stream: TcpStream) -> std::result::Result<(), TcpStream> {
-        let mut state = self.state.lock();
-        if state.closed || state.jobs.len() >= state.cap {
-            return Err(stream);
-        }
-        state.jobs.push_back(stream);
-        self.ready.notify_one();
-        Ok(())
-    }
-
-    /// Next connection, or `None` once the queue is closed *and* drained.
-    fn pop(&self) -> Option<TcpStream> {
-        let mut state = self.state.lock();
-        loop {
-            if let Some(job) = state.jobs.pop_front() {
-                return Some(job);
-            }
-            if state.closed {
-                return None;
-            }
-            self.ready.wait(&mut state);
-        }
-    }
-
-    fn close(&self) {
-        let mut state = self.state.lock();
-        state.closed = true;
-        self.ready.notify_all();
-    }
-}
-
-fn serve_multi_listener_shutdown(
-    listener: TcpListener,
+/// A bound transport plus the pieces the serve loop must still own afterwards.
+struct Prepared {
+    bound: nhttp::BoundServer<AppState>,
     registry: Arc<DbRegistry>,
     config: ServerConfig,
-    shutdown: Arc<AtomicBool>,
-) -> Result<(), Error> {
-    let config = Arc::new(config);
-    let workers = worker_count(&config);
-    let queue = JobQueue::new(config.max_connections);
+    logger: Option<nlogger::Logger>,
+}
 
+/// Bind the transport and prepare logging. Nothing is served until
+/// `run_prepared` awaits.
+fn prepare(registry: Arc<DbRegistry>, config: ServerConfig) -> Result<Prepared, Error> {
+    let logger = match &config.logs_dir {
+        Some(dir) => Some(build_logger(dir)?),
+        None => None,
+    };
+    let state = AppState {
+        registry: Arc::clone(&registry),
+        config: Arc::new(config.clone()),
+    };
+    let transport = nhttp::ServerConfig {
+        bind: config.bind.clone(),
+        port: config.port,
+        token: config.token.clone(),
+        // `/health` is part of the authenticated surface: a token-gated nDB
+        // answers 401 there too (phase13 contract), so nothing is exempt.
+        auth_exempt_paths: Vec::new(),
+        max_connections: config.max_connections,
+        max_body_bytes: config.max_body,
+        read_timeout: Duration::from_secs(30),
+        idle_timeout: Duration::from_secs(30),
+        write_timeout: Duration::from_secs(30),
+        shutdown_drain_timeout: Duration::from_secs(10),
+        logger: logger.clone(),
+        // nDB owns `/health` (registry view); `/metrics` is the transport's.
+        built_in_health: false,
+        built_in_metrics: true,
+    };
+    let bound = nhttp::Server::bind(transport, router(), state).map_err(|e| {
+        Error::invalid_arg(format!(
+            "bind {}:{} failed: {e}",
+            config.bind, config.port
+        ))
+    })?;
+    Ok(Prepared {
+        bound,
+        registry,
+        config,
+        logger,
+    })
+}
+
+/// `prefix = "ndb"`; `LOG_LEVEL` / `LOG_RETENTION_DAYS` override the defaults.
+fn build_logger(logs_dir: &Path) -> Result<nlogger::Logger, Error> {
+    let config = nlogger::Config::new("ndb", logs_dir)
+        .with_env_overrides()
+        .map_err(|e| Error::invalid_arg(format!("logs dir {}: {e}", logs_dir.display())))?;
+    nlogger::Logger::new(config)
+        .map_err(|e| Error::invalid_arg(format!("logs dir {}: {e}", logs_dir.display())))
+}
+
+fn log_event(logger: &Option<nlogger::Logger>, level: nlogger::Level, message: &str) {
+    if let Some(logger) = logger {
+        logger.log(level, "serve", message, None);
+    }
+}
+
+/// Serve until `shutdown` flips, then drain (the transport's
+/// `shutdown_drain_timeout`), stop the pin reaper and fsync every mounted
+/// database.
+fn run_prepared(prepared: Prepared, shutdown: Arc<AtomicBool>) -> Result<(), Error> {
+    let Prepared {
+        bound,
+        registry,
+        config,
+        logger,
+    } = prepared;
+    let addr = bound.local_addr();
     eprintln!(
-        "ndb serve listening on {} ({} dbs, {} workers, {} connections max)",
-        listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+        "ndb serve listening on {} ({} dbs, {} connections max)",
+        addr,
         registry.len(),
-        workers,
         config.max_connections
     );
+    log_event(
+        &logger,
+        nlogger::Level::Info,
+        &format!(
+            "started on http://{addr} ({} dbs, {} connections max, logs={})",
+            registry.len(),
+            config.max_connections,
+            match &config.logs_dir {
+                Some(dir) => dir.display().to_string(),
+                None => "off".to_string(),
+            }
+        ),
+    );
 
-    let mut worker_handles = Vec::with_capacity(workers);
-    for index in 0..workers {
-        let queue = Arc::clone(&queue);
-        let registry = Arc::clone(&registry);
-        let config = Arc::clone(&config);
-        let shutdown = Arc::clone(&shutdown);
-        let handle = std::thread::Builder::new()
-            .name(format!("ndb-worker-{index}"))
-            .spawn(move || {
-                while let Some(stream) = queue.pop() {
-                    handle_connection(stream, &registry, &config, &shutdown);
-                }
-            })
-            .map_err(|e| Error::invalid_arg(format!("spawn worker thread: {e}")))?;
-        worker_handles.push(handle);
+    let reaper = PinReaper::start(&registry);
+    let result = build_runtime(config.threads).and_then(|runtime| {
+        runtime
+            .block_on(bound.serve_until(wait_for_shutdown(shutdown)))
+            .map_err(|e| Error::invalid_arg(format!("serve: {e}")))
+    });
+    reaper.stop();
+
+    // Zero data loss at exit: every mounted database is fsynced before the
+    // process is allowed to go, clean shutdown or not.
+    for (name, db) in registry.entries() {
+        match db.flush() {
+            Ok(()) => {
+                eprintln!("flushed database '{}'", name);
+                log_event(
+                    &logger,
+                    nlogger::Level::Info,
+                    &format!("flushed database '{name}'"),
+                );
+            }
+            Err(e) => {
+                eprintln!("flush of database '{}' on shutdown failed: {}", name, e);
+                log_event(
+                    &logger,
+                    nlogger::Level::Error,
+                    &format!("flush of database '{name}' on shutdown failed: {e}"),
+                );
+            }
+        }
     }
+    log_event(&logger, nlogger::Level::Info, "stopped");
+    result
+}
 
-    // Non-blocking accept: the shutdown flag is a plain atomic read, so a
-    // Ctrl-C needs no self-connect to wake the listener.
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| Error::invalid_arg(format!("set listener non-blocking: {e}")))?;
+fn build_runtime(threads: usize) -> Result<tokio::runtime::Runtime, Error> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all().thread_name("ndb-http");
+    if threads > 0 {
+        builder.worker_threads(threads);
+    }
+    builder
+        .build()
+        .map_err(|e| Error::invalid_arg(format!("tokio runtime: {e}")))
+}
 
-    // Expired snapshot pins are released by a timer, not by the next request:
-    // an idle server must never hold a forgotten pin's RAM or its change-ring
-    // reservation. The thread holds only a `Weak`, and is joined below.
-    let reaper_stop = Arc::new((Mutex::new(false), Condvar::new()));
-    let reaper = {
-        let stop = Arc::clone(&reaper_stop);
-        let registry = Arc::downgrade(&registry);
-        std::thread::Builder::new()
+async fn wait_for_shutdown(shutdown: Arc<AtomicBool>) {
+    loop {
+        if shutdown.load(Ordering::SeqCst) || process_shutdown_requested() {
+            return;
+        }
+        tokio::time::sleep(SHUTDOWN_POLL).await;
+    }
+}
+
+/// The expired-snapshot sweeper. An idle server must never hold a forgotten
+/// pin's RAM or its change-ring reservation, so the sweep is a timer rather
+/// than a side effect of the next request.
+struct PinReaper {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PinReaper {
+    fn start(registry: &Arc<DbRegistry>) -> Self {
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let signal = Arc::clone(&stop);
+        let registry = Arc::downgrade(registry);
+        let handle = std::thread::Builder::new()
             .name("ndb-pin-reaper".to_string())
             .spawn(move || loop {
-                let (flag, wake) = &*stop;
+                let (flag, wake) = &*signal;
                 let mut stopped = flag.lock();
                 if *stopped {
                     return;
@@ -959,135 +1027,106 @@ fn serve_multi_listener_shutdown(
                 };
                 registry.reap_expired_pins();
             })
-            .map_err(|e| Error::invalid_arg(format!("spawn pin reaper thread: {e}")))?
-    };
-
-    loop {
-        if shutdown.load(Ordering::SeqCst) || process_shutdown_requested() {
-            break;
+            .expect("spawn pin reaper thread");
+        Self {
+            stop,
+            handle: Some(handle),
         }
-        match listener.accept() {
-            Ok((stream, _peer)) => {
-                if let Err(e) = stream.set_nodelay(true) {
-                    report::suppressed("serve: set nodelay", e);
-                }
-                if let Err(mut stream) = queue.push(stream) {
-                    // Over cap: 503 and close. Fail loud, no queueing. A failed
-                    // notice to a client that already vanished changes nothing.
-                    let _ = write_response(
-                        &mut stream,
-                        Response::Json(503, json!({"error": "connection cap exceeded"})),
-                        false,
-                    );
-                }
+    }
+
+    fn stop(mut self) {
+        *self.stop.0.lock() = true;
+        self.stop.1.notify_all();
+        if let Some(handle) = self.handle.take() {
+            if handle.join().is_err() {
+                eprintln!("warning: the pin reaper thread panicked");
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(ACCEPT_POLL_INTERVAL);
-            }
-            Err(e) => eprintln!("accept error: {}", e),
         }
     }
-
-    // Drain: no new work enters, workers finish the connections they hold.
-    queue.close();
-    *reaper_stop.0.lock() = true;
-    reaper_stop.1.notify_all();
-    if reaper.join().is_err() {
-        eprintln!("warning: the pin reaper thread panicked");
-    }
-    for handle in worker_handles {
-        if handle.join().is_err() {
-            eprintln!("warning: a worker thread panicked during shutdown");
-        }
-    }
-
-    // Zero data loss at exit: every mounted database is flushed (fsynced)
-    // before the process is allowed to go.
-    for (name, db) in registry.entries() {
-        match db.flush() {
-            Ok(()) => eprintln!("flushed database '{}'", name),
-            Err(e) => eprintln!("flush of database '{}' on shutdown failed: {}", name, e),
-        }
-    }
-    Ok(())
 }
 
-// ─── Connection handling ────────────────────────────────────────────
+// ─── Transport wiring ───────────────────────────────────────────────
 
-fn handle_connection(
-    stream: TcpStream,
-    registry: &Arc<DbRegistry>,
-    config: &ServerConfig,
-    stop: &AtomicBool,
-) {
-    // Accepted sockets may inherit the listener's non-blocking mode; requests
-    // are answered synchronously on this worker, so force blocking.
-    if let Err(e) = stream.set_nonblocking(false) {
-        report::suppressed("serve: set connection blocking", e);
-        return;
+/// The exact routing table `route`/`route_v2` dispatch against, expressed as
+/// nhttp patterns so the transport's mux is the only thing replaced.
+///
+/// `/v2` is registered by depth (2..=6 segments) instead of one pattern per
+/// endpoint: `route_v2` already owns that dispatch, and a depth pattern cannot
+/// fall out of sync with it. `/metrics` is deliberately absent — it is the
+/// transport's built-in counter view, served when no route claims the path.
+fn router() -> nhttp::Router<AppState> {
+    let mut router = nhttp::Router::new();
+    for (method, pattern) in [
+        (nhttp::Method::GET, "/health"),
+        (nhttp::Method::GET, "/stats"),
+        (nhttp::Method::POST, "/query"),
+        (nhttp::Method::POST, "/find"),
+        (nhttp::Method::POST, "/facets"),
+        (nhttp::Method::GET, "/doc/:id"),
+        (nhttp::Method::PUT, "/doc"),
+        (nhttp::Method::PUT, "/doc/:id"),
+        (nhttp::Method::PATCH, "/doc/:id"),
+        (nhttp::Method::DELETE, "/doc/:id"),
+        (nhttp::Method::POST, "/index"),
+        (nhttp::Method::POST, "/compact"),
+        (nhttp::Method::PUT, "/file/:bucket"),
+        (nhttp::Method::GET, "/file/:bucket/:name"),
+    ] {
+        router = router.route(method, pattern, dispatch);
     }
-    // Read timeout: kills slow-loris and reclaims threads from dead clients.
-    if stream.set_read_timeout(Some(REQUEST_READ_TIMEOUT)).is_err() {
-        return;
-    }
-    // A stream without a write timeout can hold a thread forever on a client
-    // that stops reading, so failing to set it is reported, not passed over.
-    if let Err(e) = stream.set_write_timeout(Some(Duration::from_secs(30))) {
-        report::suppressed("serve: set write timeout", e);
-    }
-    let mut reader = BufReader::new(match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    });
-    let mut stream = stream;
-
-    loop {
-        if stop.load(Ordering::SeqCst) || process_shutdown_requested() {
-            return;
-        }
-        let req = match read_request(&mut reader, &mut stream, config) {
-            Ok(Some(r)) => r,
-            Ok(None) => return, // clean EOF / idle timeout between requests
-            Err(e) => {
-                // Malformed request or rejected (auth/size): respond, then close.
-                // read_request signals auth/size rejections as "401"/"413".
-                let status = match e.as_str() {
-                    "401" => 401,
-                    "413" => 413,
-                    _ => 400,
-                };
-                let body = if status == 401 {
-                    json!({"error": "unauthorized"})
-                } else if status == 413 {
-                    json!({"error": "payload too large"})
-                } else {
-                    json!({"error": e})
-                };
-                // The connection is closed immediately after this line on
-                // every path, so a failed write to a client that is already
-                // gone is not a suppressed failure — there is no later state
-                // it could have corrupted.
-                let _ = write_response(&mut stream, Response::Json(status, body), false);
-                return;
+    for method in [
+        nhttp::Method::GET,
+        nhttp::Method::POST,
+        nhttp::Method::PUT,
+        nhttp::Method::PATCH,
+        nhttp::Method::DELETE,
+    ] {
+        router = router.route(method.clone(), "/v2", dispatch);
+        for depth in 1..=5usize {
+            let mut pattern = String::from("/v2");
+            for _ in 0..depth {
+                pattern.push_str("/:seg");
             }
-        };
+            router = router.route(method.clone(), &pattern, dispatch);
+        }
+    }
+    router
+}
 
-        let resp = route(registry, config, &req);
-        // A shutdown in progress closes the connection after this response.
-        let keep_alive = req.keep_alive
-            && !(stop.load(Ordering::SeqCst) || process_shutdown_requested());
-        let ok = write_response(&mut stream, resp, keep_alive).is_ok();
-        if !ok || !keep_alive {
-            return;
-        }
-        // Waiting for the next request is an idle wait, not a live request:
-        // bound it tighter so vanished clients release their worker.
-        if stream
-            .set_read_timeout(Some(KEEP_ALIVE_IDLE_TIMEOUT))
-            .is_err()
-        {
-            return;
-        }
+/// Hand one request to the blocking pool. The router and every handler stay
+/// synchronous; the transport thread only ever moves bytes.
+async fn dispatch(state: AppState, request: nhttp::Request) -> nhttp::Response {
+    let keep_alive = !request
+        .headers
+        .get("connection")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.eq_ignore_ascii_case("close"))
+        .unwrap_or(false);
+    let request = Request {
+        method: request.method.as_str().to_string(),
+        path: request.path.clone(),
+        query: request.query.clone().unwrap_or_default(),
+        headers: request
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
+            })
+            .collect(),
+        body: request.body.to_vec(),
+    };
+    let registry = state.registry;
+    let config = state.config;
+    match nhttp::spawn_blocking(move || route(&registry, &config, &request)).await {
+        Ok(response) => response.into_http(keep_alive),
+        Err(e) => nhttp::Response::error(
+            nhttp::StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &format!("request handler failed: {e}"),
+        ),
     }
 }
 
@@ -1097,7 +1136,6 @@ struct Request {
     query: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
-    keep_alive: bool,
 }
 
 impl Request {
@@ -1109,120 +1147,6 @@ impl Request {
     }
 }
 
-/// Read one HTTP/1.1 request. Returns Ok(None) on clean EOF before a request.
-fn read_request(
-    reader: &mut BufReader<TcpStream>,
-    stream: &mut TcpStream,
-    config: &ServerConfig,
-) -> Result<Option<Request>, String> {
-    // Request line
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) => return Ok(None),
-        Ok(_) => {}
-        Err(_) => return Ok(None), // timeout / reset between requests
-    }
-    let line = line.trim_end();
-    if line.is_empty() {
-        return Ok(None);
-    }
-    let mut parts = line.split_whitespace();
-    let method = parts.next().ok_or("missing method")?.to_string();
-    let target = parts.next().ok_or("missing path")?.to_string();
-    let version = parts.next().unwrap_or("HTTP/1.1");
-    let (path, query) = match target.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (target, String::new()),
-    };
-
-    // Headers
-    let mut headers = Vec::new();
-    loop {
-        let mut hline = String::new();
-        reader
-            .read_line(&mut hline)
-            .map_err(|e| format!("header read error: {}", e))?;
-        let hline = hline.trim_end();
-        if hline.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = hline.split_once(':') {
-            headers.push((k.trim().to_string(), v.trim().to_string()));
-        }
-    }
-
-    let mut req = Request {
-        method,
-        path,
-        query,
-        headers,
-        body: Vec::new(),
-        keep_alive: !version.eq_ignore_ascii_case("HTTP/1.0"),
-    };
-    for (k, v) in &req.headers {
-        if k.eq_ignore_ascii_case("connection") {
-            if v.eq_ignore_ascii_case("close") {
-                req.keep_alive = false;
-            } else if v.eq_ignore_ascii_case("keep-alive") {
-                req.keep_alive = true;
-            }
-        }
-    }
-
-    // Auth BEFORE reading the body — bad tokens never cost us the transfer.
-    if let Some(expected) = &config.token {
-        let authorized = req
-            .header("authorization")
-            .and_then(|got| got.strip_prefix("Bearer "))
-            .map(|bearer| constant_time_eq(bearer.as_bytes(), expected.as_bytes()))
-            .unwrap_or(false);
-        if !authorized {
-            return Err("401".to_string());
-        }
-    }
-
-    let content_length: usize = req
-        .header("content-length")
-        .map(|v| v.trim().parse::<usize>())
-        .transpose()
-        .map_err(|e| format!("invalid content-length: {}", e))?
-        .unwrap_or(0);
-
-    if content_length > config.max_body {
-        return Err("413".to_string());
-    }
-
-    // curl sends this for bodies > ~1KB; not answering stalls the client.
-    if let Some(expect) = req.header("expect") {
-        if expect.eq_ignore_ascii_case("100-continue") {
-            stream
-                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
-                .map_err(|e| format!("continue write error: {}", e))?;
-        }
-    }
-
-    if content_length > 0 {
-        req.body.resize(content_length, 0);
-        reader
-            .read_exact(&mut req.body)
-            .map_err(|e| format!("body read error: {}", e))?;
-    }
-
-    Ok(Some(req))
-}
-
-/// Length-independent comparison so token checks don't leak timing info.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 // ─── Routing ────────────────────────────────────────────────────────
 
 enum Response {
@@ -1231,7 +1155,38 @@ enum Response {
     /// bytes straight into the response instead of re-encoding each hit.
     JsonRaw(u16, Vec<u8>),
     /// Raw bytes with a real content type — bucket files never ride in JSON.
-    Binary(u16, String, Vec<u8>),
+    Binary(u16, &'static str, Vec<u8>),
+}
+
+impl Response {
+    /// The transport form. The JSON envelopes are already built here, so only
+    /// status, content type and bytes cross into `nhttp`.
+    ///
+    /// `keep_alive` mirrors the old wire: nDB always announced the connection
+    /// disposition, and phase15 reads it. hyper appends its own `close` when the
+    /// client asked to close, so the header is added only on the staying open.
+    fn into_http(self, keep_alive: bool) -> nhttp::Response {
+        let (status, content_type, payload): (u16, &'static str, Vec<u8>) = match self {
+            Response::Json(status, body) => (
+                status,
+                "application/json",
+                serde_json::to_vec(&body)
+                    .unwrap_or_else(|_| b"{\"error\":\"serialization failed\"}".to_vec()),
+            ),
+            Response::JsonRaw(status, body) => (status, "application/json", body),
+            Response::Binary(status, content_type, data) => (status, content_type, data),
+        };
+        let response = nhttp::Response::bytes(
+            nhttp::StatusCode::from_u16(status).expect("ndb answered with an invalid status"),
+            content_type,
+            payload,
+        );
+        if keep_alive {
+            response.with_header("connection", "keep-alive")
+        } else {
+            response
+        }
+    }
 }
 
 fn route(registry: &Arc<DbRegistry>, config: &ServerConfig, req: &Request) -> Response {
@@ -1790,8 +1745,8 @@ fn handle_get_file(db: &Database, bucket: &str, name: &str) -> Response {
     }
 }
 
-fn content_type_for(ext: &str) -> String {
-    mime_for_extension(ext).to_string()
+fn content_type_for(ext: &str) -> &'static str {
+    mime_for_extension(ext)
 }
 
 // ─── Multi-DB HTTP API (/health, /v2/dbs) ──────────────────────────
@@ -3171,7 +3126,7 @@ fn handle_v2_get_file(db: &Database, bucket: &str, name: &str) -> Response {
         None => return Response::Json(400, json!({"ok": false, "error": "invalid_filename", "message": "file name must be hash.ext"})),
     };
     match db.bucket(bucket).get_by_hash(hash, ext) {
-        Ok(data) => Response::Binary(200, mime_for_extension(ext).to_string(), data),
+        Ok(data) => Response::Binary(200, mime_for_extension(ext), data),
         Err(e) => {
             let (status, body) = map_file_error(e);
             Response::Json(status, body)
@@ -3199,64 +3154,3 @@ fn handle_v2_delete_file(db: &Database, req: &Request, bucket: &str, filename: &
     }
 }
 
-// ─── HTTP response ──────────────────────────────────────────────────
-
-fn reason(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        201 => "Created",
-        202 => "Accepted",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        409 => "Conflict",
-        413 => "Payload Too Large",
-        500 => "Internal Server Error",
-        503 => "Service Unavailable",
-        _ => "OK",
-    }
-}
-
-/// Write one HTTP/1.1 response frame. `resp` is taken by value so a binary
-/// body moves straight into the socket without a clone.
-///
-/// Headers and body go out in a single `write_all` for ordinary (JSON/small)
-/// payloads — one syscall per response — and as head-then-body for a large
-/// binary body, which is still one copy less than buffering it.
-fn write_response(
-    stream: &mut TcpStream,
-    resp: Response,
-    keep_alive: bool,
-) -> std::io::Result<()> {
-    let (status, content_type, payload): (u16, String, Vec<u8>) = match resp {
-        Response::Json(status, body) => (
-            status,
-            "application/json".to_string(),
-            serde_json::to_vec(&body)
-                .unwrap_or_else(|_| b"{\"error\":\"serialization failed\"}".to_vec()),
-        ),
-        Response::JsonRaw(status, body) => (status, "application/json".to_string(), body),
-        Response::Binary(status, ctype, data) => (status, ctype, data),
-    };
-    let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
-        status,
-        reason(status),
-        content_type,
-        payload.len(),
-        if keep_alive { "keep-alive" } else { "close" }
-    );
-
-    const SINGLE_WRITE_LIMIT: usize = 64 * 1024;
-    if payload.len() <= SINGLE_WRITE_LIMIT {
-        let mut frame = Vec::with_capacity(head.len() + payload.len());
-        frame.extend_from_slice(head.as_bytes());
-        frame.extend_from_slice(&payload);
-        stream.write_all(&frame)?;
-    } else {
-        stream.write_all(head.as_bytes())?;
-        stream.write_all(&payload)?;
-    }
-    stream.flush()
-}
